@@ -1,0 +1,16 @@
+{
+  "name": "cattery",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Toolchain for extensions/cattery.ts, the pi extension. The kitty files, the state writer and the picker need none of this.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/cattery_extension_test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
