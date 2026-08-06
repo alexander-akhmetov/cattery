@@ -6,10 +6,15 @@
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
+# What `cattery -version` prints. A checkout without tags, and a build from a
+# source tree with no .git at all, both fall back to a string rather than
+# failing the build. The Homebrew formula passes the version it installed.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 all: build
 
 build:
-	go build -o cattery ./cmd/cattery
+	go build -ldflags "-X main.version=$(VERSION)" -o cattery ./cmd/cattery
 
 test: test-go test-python test-ts
 

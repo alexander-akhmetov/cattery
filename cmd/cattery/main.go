@@ -4,6 +4,7 @@
 //	cattery                  the picker, a full-screen list kitty runs in an
 //	                         overlay window
 //	cattery -print           the same inventory without the TUI
+//	cattery -version         print the version and exit
 //	cattery setup            install the kitty files and the config they need
 //	cattery state <x>        publish this window's agent state
 //	cattery save [path]      snapshot the kitty tab tree
@@ -27,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -48,7 +50,24 @@ const (
 	cmdState   = "state"
 	cmdSave    = "save"
 	cmdRestore = "restore"
+	cmdVersion = "version"
 )
+
+// version is the release this binary was built from. `make build` passes the
+// output of `git describe`, goreleaser passes the tag, and the Homebrew formula
+// passes the version it installed. None of them runs for `go install`, which
+// records the module version in the build info instead.
+var version string
+
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return info.Main.Version
+	}
+	return "dev"
+}
 
 // command is what one argv asks for. Routing is separate from running, so a
 // test can check it without launching the TUI or writing to a kitty window.
@@ -72,6 +91,9 @@ func run(args []string) int {
 	}
 
 	switch cmd.name {
+	case cmdVersion:
+		fmt.Println(versionString())
+		return 0
 	case cmdState:
 		// Never fails: a hook error would surface in the agent's transcript.
 		state.Run(cmd.args)
@@ -113,13 +135,18 @@ func route(args []string, out io.Writer) (command, error) {
 	flags := flag.NewFlagSet("cattery", flag.ContinueOnError)
 	flags.SetOutput(out)
 	printOnly := flags.Bool("print", false, "list agent windows and exit (no TUI); useful for debugging")
+	showVersion := flags.Bool("version", false, "print the version and exit")
 	if err := flags.Parse(args); err != nil {
 		return command{}, err
 	}
-	if *printOnly {
+	switch {
+	case *showVersion:
+		return command{name: cmdVersion}, nil
+	case *printOnly:
 		return command{name: cmdPrint}, nil
+	default:
+		return command{name: cmdPicker}, nil
 	}
-	return command{name: cmdPicker}, nil
 }
 
 func runSetup(args []string) int {

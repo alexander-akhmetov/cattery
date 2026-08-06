@@ -10,8 +10,10 @@ class Cattery < Formula
 
   depends_on "go" => :build
 
+  # Homebrew stages the checkout without a .git directory, so the Makefile
+  # cannot read the version from git. Pass the one Homebrew installed.
   def install
-    system "make", "build"
+    system "make", "build", "VERSION=#{version}"
     bin.install "cattery"
   end
 
@@ -30,6 +32,7 @@ class Cattery < Formula
   end
 
   test do
+    assert_match version.to_s, shell_output("#{bin}/cattery -version")
     assert_match "list agent windows", shell_output("#{bin}/cattery --help 2>&1")
   end
 end

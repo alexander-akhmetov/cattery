@@ -28,6 +28,9 @@ func TestRoute(t *testing.T) {
 		{name: "print", args: []string{"-print"}, want: cmdPrint},
 		{name: "print, long form", args: []string{"--print"}, want: cmdPrint},
 		{name: "print=false is still the picker", args: []string{"-print=false"}, want: cmdPicker},
+		{name: "version", args: []string{"-version"}, want: cmdVersion},
+		{name: "version, long form", args: []string{"--version"}, want: cmdVersion},
+		{name: "version=false is still the picker", args: []string{"-version=false"}, want: cmdPicker},
 
 		{name: "state working", args: []string{"state", "working"}, want: cmdState, wantArgs: []string{"working"}},
 		{name: "state blocked", args: []string{"state", "blocked"}, want: cmdState, wantArgs: []string{"blocked"}},
@@ -84,6 +87,29 @@ func TestRouteHelp(t *testing.T) {
 	if !strings.Contains(out.String(), "-print") {
 		t.Fatalf("usage does not mention -print:\n%s", out.String())
 	}
+}
+
+// A build that nobody stamped still has to print something. `go install` leaves
+// the module version in the build info, and a plain `go build` leaves nothing.
+func TestVersionString(t *testing.T) {
+	previous := version
+	t.Cleanup(func() { version = previous })
+
+	t.Run("the stamped value wins", func(t *testing.T) {
+		version = "v1.2.3"
+
+		if got := versionString(); got != "v1.2.3" {
+			t.Fatalf("got %q, want %q", got, "v1.2.3")
+		}
+	})
+
+	t.Run("an unstamped build prints something", func(t *testing.T) {
+		version = ""
+
+		if got := versionString(); got == "" {
+			t.Fatal("got an empty version")
+		}
+	})
 }
 
 // --- save and restore -----------------------------------------------------
