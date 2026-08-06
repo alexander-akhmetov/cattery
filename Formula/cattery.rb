@@ -3,7 +3,7 @@ class Cattery < Formula
   homepage "https://github.com/alexander-akhmetov/cattery"
   url "https://github.com/alexander-akhmetov/cattery.git",
       tag:      "v0.1.0",
-      revision: "20e87810ed1221d24a36b1e80696afb7e431e3d4",
+      revision: "7f027c1736ed61b1859ea70de0997985a86dc605",
       using:    :git
   license "MIT"
   head "https://github.com/alexander-akhmetov/cattery.git", branch: "main", using: :git
