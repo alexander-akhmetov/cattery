@@ -1,5 +1,5 @@
 """
-cattery_tab: the agent-state glyph for a kitty tab.
+cattery_tab: the agent-state marker for a kitty tab.
 
 kitty loads `tab_bar.py` from its config directory through `runpy.run_path`,
 which does not extend `sys.path`, so a `tab_bar.py` that wants this module has
@@ -15,27 +15,26 @@ to add its own directory first:
         def agent_prefix(data):
             return ""
 
-The guard matters: an ImportError raised at module scope happens before
-`draw_title` is defined and disables the whole tab bar, not only the glyph.
+Guard that import. An ImportError at module scope runs before `draw_title` is
+defined and disables the whole tab bar.
 
-This module reads two user variables that cattery_watcher.py writes,
-AGENT_DISPLAY and AGENT_SINCE. Without the watcher loaded there is no
-AGENT_DISPLAY and every call returns "".
+This module reads AGENT_DISPLAY and AGENT_SINCE, which cattery_watcher.py
+writes. Without the watcher loaded there is no AGENT_DISPLAY, and every call
+returns "".
 """
 
 import time
 
-# Tuple of (color_name, glyph, urgency_rank). Lower rank wins the rollup, so a
-# tab holding one blocked agent and three working ones shows blocked. A seen
-# idle agent is absent from the table: it draws no glyph, so ranking it would
-# change no outcome.
+# (color_name, glyph, urgency_rank). The lower rank wins, so a tab holding one
+# blocked agent and three working ones shows blocked. A seen idle agent is
+# missing from the table, because it draws nothing.
 _AGENT_STATE_STYLE = {
     "blocked": ("red", "◆", 0),     # ◆ needs input
     "done":    ("green", "●", 1),   # ● finished, unseen
     "working": ("yellow", "●", 2),  # ● working
 }
 
-# Displays that carry an elapsed time. A finished agent is timestamped too, but
+# Displays that carry an elapsed time. A finished agent has a timestamp too, and
 # the tab bar leaves that to the picker, which phrases it as "… ago".
 _TIMED = ("working", "blocked")
 
@@ -56,7 +55,7 @@ def _collect_agent_display(tab):
 
 
 def _agent_elapsed(window):
-    """Minutes since the window's last AGENT_DISPLAY transition, or empty string."""
+    """Minutes since the window's last AGENT_DISPLAY change, or an empty string."""
     raw = window.user_vars.get("AGENT_SINCE")
     if not raw:
         return ""
@@ -71,11 +70,10 @@ def _agent_elapsed(window):
 
 def agent_prefix(data):
     """
-    Build the colored agent-state glyph for this tab, or empty string.
+    Build the coloured agent-state marker for this tab, or an empty string.
 
-    `data` is the dict kitty hands to `draw_title`. Wrapped in a try/except so
-    any internal error here falls back to plain rendering rather than breaking
-    the whole tab bar.
+    `data` is the dict kitty hands to `draw_title`. Every error is caught, so a
+    failure here falls back to plain rendering instead of breaking the tab bar.
     """
     try:
         from kitty.fast_data_types import get_boss  # type: ignore

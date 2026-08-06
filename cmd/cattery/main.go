@@ -6,16 +6,18 @@
 //	cattery -print           the same inventory without the TUI
 //	cattery setup            install the kitty files and the config they need
 //	cattery state <x>        publish this window's agent state
+//	cattery save [path]      snapshot the kitty tab tree
+//	cattery restore [path]   put a snapshot back
 //
-// The picker reads the live kitty window inventory and shows every window
-// carrying AGENT_DISPLAY, which the kitty watcher derives from the agent's own
-// AGENT_STATE, so a window that sets AGENT_STATE with no watcher loaded does
-// not appear. `cattery setup` binds it in kitty.conf as:
+// The picker shows every kitty window carrying AGENT_DISPLAY. The watcher
+// derives that variable from the agent's AGENT_STATE, so a window that sets
+// AGENT_STATE without a watcher loaded does not appear. `cattery setup` binds
+// the picker in kitty.conf as:
 //
 //	map opt+a>opt+a launch --type=overlay --cwd=current --copy-colors /path/to/cattery
 //
 // That overlay is a normal kitty window, so the picker inherits KITTY_LISTEN_ON
-// and `kitten @` remote control works against the same instance.
+// and drives the same kitty instance over remote control.
 package main
 
 import (
@@ -32,21 +34,24 @@ import (
 
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/overlay"
+	"github.com/alexander-akhmetov/cattery/internal/session"
 	"github.com/alexander-akhmetov/cattery/internal/setup"
 	"github.com/alexander-akhmetov/cattery/internal/state"
 )
 
-// The names route returns. They are plain strings rather than a defined type so
-// the switch that runs them does not have to be exhaustive over every one.
+// The names route returns. Plain strings, so the switch that runs them need not
+// be exhaustive.
 const (
-	cmdPicker = "picker"
-	cmdPrint  = "print"
-	cmdSetup  = "setup"
-	cmdState  = "state"
+	cmdPicker  = "picker"
+	cmdPrint   = "print"
+	cmdSetup   = "setup"
+	cmdState   = "state"
+	cmdSave    = "save"
+	cmdRestore = "restore"
 )
 
-// command is what one argv asks for. Routing is separate from running so it can
-// be tested without launching the TUI or writing to a kitty window.
+// command is what one argv asks for. Routing is separate from running, so a
+// test can check it without launching the TUI or writing to a kitty window.
 type command struct {
 	name string
 	args []string
@@ -68,12 +73,15 @@ func run(args []string) int {
 
 	switch cmd.name {
 	case cmdState:
-		// Never fails: a hook that reported an error would surface it in the
-		// agent's transcript, and a state write is not worth that.
+		// Never fails: a hook error would surface in the agent's transcript.
 		state.Run(cmd.args)
 		return 0
 	case cmdSetup:
 		return runSetup(cmd.args)
+	case cmdSave:
+		return runSave(kitty.NewClient(), os.Stdout, cmd.args)
+	case cmdRestore:
+		return runRestore(kitty.NewClient(), os.Stdout, cmd.args)
 	case cmdPrint:
 		if err := printAgents(kitty.NewClient()); err != nil {
 			fmt.Fprintln(os.Stderr, "cattery:", err)
@@ -95,10 +103,10 @@ func run(args []string) int {
 func route(args []string, out io.Writer) (command, error) {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
-		case cmdSetup, cmdState:
+		case cmdSetup, cmdState, cmdSave, cmdRestore:
 			return command{name: args[0], args: args[1:]}, nil
 		default:
-			return command{}, fmt.Errorf("unknown command %q (try setup, state, or no argument for the picker)", args[0])
+			return command{}, fmt.Errorf("unknown command %q (try setup, state, save, restore, or no argument for the picker)", args[0])
 		}
 	}
 
@@ -128,8 +136,8 @@ func runSetup(args []string) int {
 	}
 
 	opts := setup.Options{DryRun: *dryRun, Yes: *yes, KittyDir: *kittyDir}
-	// Only a terminal can answer a question. A piped stdin reaches setup with
-	// nobody behind it, and the agent steps are skipped rather than guessed at.
+	// Only a terminal can answer a question. Behind a pipe there is nobody to
+	// ask, so setup skips the agent steps instead of guessing.
 	if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
 		opts.In = os.Stdin
 	}
@@ -138,6 +146,113 @@ func runSetup(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// Save runs one kitty action. Restore adds the wait for restored windows to
+// draw a prompt, plus one send-text per resumable agent.
+const (
+	saveTimeout    = 15 * time.Second
+	restoreTimeout = 60 * time.Second
+)
+
+func runSave(client session.Client, out io.Writer, args []string) int {
+	flags := flag.NewFlagSet("cattery save", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	path, err := parseSessionArgs(flags, args)
+	if err != nil {
+		return flagExit(err)
+	}
+	if err := session.EnsureDir(path); err != nil {
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), saveTimeout)
+	defer cancel()
+	stats, err := session.Save(ctx, client, path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return 1
+	}
+	fmt.Fprintln(out, stats.Saved(path))
+	return 0
+}
+
+func runRestore(client session.Client, out io.Writer, args []string) int {
+	flags := flag.NewFlagSet("cattery restore", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	// Off by default. Resuming every agent starts one process each, and a
+	// resume command can point at a session that no longer exists.
+	run := flags.Bool("run", false, "press return on each resume command instead of leaving it at the prompt")
+	path, err := parseSessionArgs(flags, args)
+	if err != nil {
+		return flagExit(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), restoreTimeout)
+	defer cancel()
+	stats, err := session.Restore(ctx, client, path, *run)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return 1
+	}
+	fmt.Fprintln(out, stats.Restored(*run))
+	return 0
+}
+
+// parseSessionArgs reads the flags and the optional snapshot path in either
+// order, because Go's flag package stops at the first argument that is not a
+// flag and `restore path -run` is natural to type.
+//
+// With no path the snapshot comes from CATTERY_SESSION_FILE, else the default
+// under kitty's sessions directory. A given path is used as given, and made
+// absolute: kitty resolves a relative path against directories of its own.
+func parseSessionArgs(flags *flag.FlagSet, args []string) (string, error) {
+	var positional []string
+	for rest := args; ; {
+		if err := flags.Parse(rest); err != nil {
+			return "", err
+		}
+		rest = flags.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+	switch len(positional) {
+	case 0:
+		path, err := session.DefaultPath()
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", errBadPath, err)
+		}
+		return path, nil
+	case 1:
+		path, err := session.Abs(positional[0])
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", errBadPath, err)
+		}
+		return path, nil
+	default:
+		return "", fmt.Errorf("%w: one snapshot path at most, got %d", errBadPath, len(positional))
+	}
+}
+
+// errBadPath marks the argument problems this file finds itself. The flag
+// package has already written its own to stderr.
+var errBadPath = errors.New("bad snapshot path")
+
+// flagExit turns a bad command line into an exit status. Asking for the usage
+// text and getting it is a success, and the parser has already explained any
+// flag it rejected.
+func flagExit(err error) int {
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	if errors.Is(err, errBadPath) {
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+	}
+	return 2
 }
 
 func printAgents(client *kitty.Client) error {

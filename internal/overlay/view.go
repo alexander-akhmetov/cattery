@@ -49,11 +49,11 @@ const (
 	maxCwd    = 40
 
 	// A project heading needs its label plus a stub of rule to read as a
-	// heading; below this width it is only the label.
+	// heading. Below this width it is only the label.
 	minGroupRuleWidth = 4
 
-	// A project heading occupies its own line plus the blank separating it
-	// from its first row; a row occupies two.
+	// A project heading takes its own line plus the blank before its first
+	// row. A row takes two lines.
 	headerBlockLines = 2
 	rowContentLines  = 2
 
@@ -84,9 +84,9 @@ func statusColor(display string) lipgloss.Color {
 	}
 }
 
-// statusGlyph matches _AGENT_STATE_STYLE in kitty/cattery_tab.py, so a green dot
-// means the same thing in the tab bar and in the picker. Only idle differs: the
-// tab bar draws nothing, the picker draws a middot to hold the column.
+// statusGlyph matches _AGENT_STATE_STYLE in kitty/cattery_tab.py, so a green
+// dot means the same thing in the tab bar and in the picker. Only idle differs:
+// the tab bar draws nothing, the picker draws a middot to hold the column.
 func statusGlyph(display string) string {
 	switch display {
 	case "blocked":
@@ -122,9 +122,9 @@ func activityColor(display string) lipgloss.Color {
 	}
 }
 
-// activityGlyph leads the line-2 task: a steady status glyph, except a working
-// agent shows the animated braille spinner. An idle agent gets none: its glyph
-// is the same middot as the separator before it, which reads as a typo.
+// activityGlyph leads the line-2 task with a steady status glyph. A working
+// agent shows the animated braille spinner instead. An idle agent gets none,
+// because its middot repeats the separator before it and reads as a typo.
 func activityGlyph(a kitty.Agent, spin int) string {
 	switch a.Display {
 	case "working":
@@ -153,8 +153,8 @@ func activity(a kitty.Agent) string {
 	case "working":
 		return "working"
 	default:
-		// An idle agent has nothing to report and the row already says "idle";
-		// line 2 drops the whole activity clause rather than repeating it.
+		// An idle agent has nothing to report, and line 1 already says "idle",
+		// so line 2 drops the activity clause.
 		return ""
 	}
 }
@@ -250,8 +250,8 @@ func truncate(s string, width int) string {
 	return ansi.Truncate(s, width, "…")
 }
 
-// span is one styled run of text on a line. bg overrides the row background
-// for that run (used for the model chip); an empty bg inherits the row's.
+// span is one styled run of text on a line. bg overrides the row background for
+// that run, as the model chip does. An empty bg inherits the row's.
 type span struct {
 	text string
 	fg   lipgloss.Color
@@ -289,9 +289,9 @@ func fitSpans(spans []span, width int) []span {
 	return fitted
 }
 
-// renderSpans renders runs left-to-right; bg (when set) is applied to every run
-// so a highlighted row reads as one continuous band (a terminal reset would
-// otherwise drop a background applied only to the outer string).
+// renderSpans renders runs left to right. It applies bg, when set, to every
+// run, so a highlighted row reads as one continuous band. A terminal reset
+// would drop a background applied only to the outer string.
 func renderSpans(spans []span, bg lipgloss.Color) string {
 	var b strings.Builder
 	for _, s := range spans {
@@ -319,8 +319,8 @@ func bgSpaces(n int, bg lipgloss.Color) string {
 }
 
 // composeLine joins left and right span groups without exceeding inner cells.
-// The right group keeps at most one third of narrow lines so status and agent
-// identity remain visible.
+// The right group keeps at most one third of a narrow line, so the status and
+// the agent's identity stay visible.
 func composeLine(left, right []span, inner int, bg lipgloss.Color) string {
 	if inner <= 0 {
 		return ""
@@ -389,10 +389,9 @@ func (m Model) View() string {
 	return strings.Join(lines, "\n")
 }
 
-// headerLines is the top chrome: title bar, filter tabs, the search field when
-// there is a query, and a rule. The title sits in the bar instead of on its own
-// line, and the search row appears only once it has a query, so an untouched
-// picker spends those lines on agents.
+// headerLines is the top chrome: title bar, filter tabs, the search field once
+// it has a query, and a rule. The title shares the bar and the search row
+// appears only when used, so an untouched picker spends those lines on agents.
 func (m Model) headerLines(width, inner int, roomy bool, pad lipgloss.Style) []string {
 	lines := []string{m.renderTitleBar(width)}
 	if roomy {
@@ -436,9 +435,9 @@ func fullWidth(content string, width int) string {
 	return "  " + content + strings.Repeat(" ", gap)
 }
 
-// fitPair picks the richest label pair that fits on one line, degrading the
+// fitPair picks the richest label pair that fits on one line. It degrades the
 // right side first and the left side only when it must. A truncated fragment
-// ("esc clo…") carries no information, so a shorter complete label beats it.
+// ("esc clo…") carries no information, so a shorter complete label wins.
 func fitPair(left, right []string, inner int) (string, string) {
 	for _, l := range left {
 		for _, r := range right {
@@ -450,8 +449,8 @@ func fitPair(left, right []string, inner int) (string, string) {
 	return left[len(left)-1], right[len(right)-1]
 }
 
-// renderTitleBar names the picker and the key that leaves it. Counts live in
-// the filter tabs and the footer summary, so they stay out of here.
+// renderTitleBar names the picker and the key that leaves it. The counts live
+// in the filter tabs and the footer summary.
 func (m Model) renderTitleBar(width int) string {
 	rightTiers := []string{"esc close"}
 	switch {
@@ -478,9 +477,9 @@ func styleFB(fg, bg lipgloss.Color) lipgloss.Style {
 	return st
 }
 
-// renderTabs shows every status tab when the row fits. When it does not, the
-// tabs collapse to the active filter alone plus the key that cycles them, so a
-// narrow terminal never hides which filter is hiding rows.
+// renderTabs shows every status tab when the row fits. Otherwise the tabs
+// collapse to the active filter plus the key that cycles them, so a narrow
+// terminal still shows which filter is hiding rows.
 func (m Model) renderTabs(inner int) string {
 	if full := m.renderAllTabs(); ansi.StringWidth(full) <= inner {
 		return full
@@ -545,22 +544,22 @@ func renderGroupHeader(label string, count, inner int) string {
 }
 
 // block is one unit of the scrollable body: a project heading, or an agent's
-// two lines. Blocks scroll whole, so a row is never split across the top or
-// bottom edge. Separators trail their block rather than leading the next one,
-// which keeps the viewport from ever opening on a blank line.
+// two lines. Blocks scroll whole, so the viewport edge never splits a row.
+// Separators trail their block instead of leading the next one, so the viewport
+// never opens on a blank line.
 //
-// A block knows its height without drawing anything, and windowBlocks needs
-// only heights to pick the run that fits, so render runs for the blocks that
-// reach the screen and not for the rest of the list.
+// A block knows its height without drawing anything, and windowBlocks picks the
+// run that fits from heights alone. Only the blocks that reach the screen are
+// rendered.
 type block struct {
 	render func() []string
 	// count is the block's height, trailing separators included. content is the
-	// height without them, which may be dropped at the bottom of the viewport
-	// without losing anything.
+	// height without them, and the bottom of the viewport can drop the
+	// difference without losing anything.
 	count   int
 	content int
 	// header is the project heading this block sits under, empty for a heading
-	// itself. The picker re-draws it at the top of the viewport when the real
+	// itself. The picker redraws it at the top of the viewport once the real
 	// heading has scrolled away.
 	header string
 }
@@ -584,8 +583,8 @@ func (m Model) blocks(vis []kitty.Agent, inner int) ([]block, int) {
 		if i == m.selected {
 			selected = len(out)
 		}
-		// Close the last row of a group with a second blank, so the gap before
-		// the next heading is wider than the gap between two rows.
+		// Close the last row of a group with a second blank, so the gap before a
+		// heading is wider than the gap between two rows.
 		trailing := 1
 		if i+1 < len(vis) && !sameProject(vis[i+1], a) {
 			trailing = 2
@@ -609,12 +608,11 @@ func (m Model) blocks(vis []kitty.Agent, inner int) ([]block, int) {
 }
 
 // windowBlocks renders the run of blocks that fits in avail lines. It scrolls
-// the selected block to the bottom edge, so the newest rows a user scrolls into
-// arrive from below, and keeps the project heading on screen by re-drawing it
-// when the viewport starts mid-group.
+// the selected block to the bottom edge, so rows arrive from below, and it
+// redraws the project heading when the viewport starts mid-group.
 //
 // listLines calls this only with room for a heading and a row, so the selected
-// block always fits and at least one agent row is always drawn.
+// block always fits and one agent row is always drawn.
 func windowBlocks(blocks []block, selected, avail int) []string {
 	if len(blocks) == 0 || avail <= 0 {
 		return nil
@@ -624,7 +622,7 @@ func windowBlocks(blocks []block, selected, avail int) []string {
 	}
 
 	// A viewport starting mid-group spends a heading's worth of lines on
-	// re-drawing it.
+	// redrawing it.
 	pin := func(i int) int {
 		if i > 0 && blocks[i].header != "" {
 			return headerBlockLines
@@ -649,9 +647,8 @@ func windowBlocks(blocks []block, selected, avail int) []string {
 	}
 	for i := start; i < len(blocks); i++ {
 		need := blocks[i].content
-		// A heading at the bottom edge with no room for its first row is noise,
-		// so it draws only when a row fits under it. Its own blank line counts
-		// here, unlike a trailing one, because the row follows it.
+		// A heading draws only when a row fits under it. Its own blank line
+		// counts here, unlike a trailing one, because the row follows it.
 		if blocks[i].header == "" && i+1 < len(blocks) {
 			need = headerBlockLines + blocks[i+1].content
 		}
@@ -685,8 +682,21 @@ func (m Model) listLines(inner, avail int) []string {
 		banner := "jump failed: " + oneLine(m.focusErr.Error()) + " · press enter to retry"
 		lines = append(lines, lipgloss.NewStyle().Foreground(cRed).Render(truncate(banner, inner)))
 	}
-	// One warning row, and a failed refresh owns it: it explains the rows on
-	// screen right now, while stale kitty files are a background chore.
+	// What "s" or "R" just did, until its tick clears it.
+	if m.notice != "" {
+		var colour lipgloss.Color
+		switch m.noticeLevel {
+		case noticeOK:
+			colour = cGreen
+		case noticeShort:
+			colour = cYellow
+		case noticeErr:
+			colour = cRed
+		}
+		lines = append(lines, lipgloss.NewStyle().Foreground(colour).Render(truncate(m.notice, inner)))
+	}
+	// One warning row, and a failed refresh owns it. A failed refresh explains
+	// the rows on screen now; stale kitty files are a background chore.
 	if warning := m.warning(); warning != "" {
 		lines = append(lines, lipgloss.NewStyle().Foreground(cYellow).Render(truncate(warning, inner)))
 	}
@@ -703,9 +713,8 @@ func (m Model) listLines(inner, avail int) []string {
 	if m.selected < 0 || m.selected >= len(vis) {
 		return append(lines, m.emptyState(inner, remaining)...)
 	}
-	// Too short for a project heading and a row together, so the list drops to
-	// the selected row alone, which names itself by directory instead of
-	// relying on a heading.
+	// Too short for a project heading and a row together. The list drops to the
+	// selected row alone, which names itself by directory.
 	if remaining < headerBlockLines+rowContentLines {
 		l1, l2 := m.renderRow(m.selected, vis[m.selected], inner, false)
 		lines = append(lines, l1)
@@ -720,7 +729,7 @@ func (m Model) listLines(inner, avail int) []string {
 }
 
 // warning is the yellow line above the list, or empty. A stale install is worth
-// saying once, but not at the cost of hiding why the list is out of date.
+// one line, and never worth hiding why the list is out of date.
 func (m Model) warning() string {
 	switch {
 	case m.reloadErr != nil:
@@ -732,11 +741,10 @@ func (m Model) warning() string {
 	}
 }
 
-// emptyState explains why the list is empty in the scope the emptiness comes
-// from: no inventory at all, a filter that excludes everything, a query that
-// matches nothing, or both. The filter and query cases name the key that
-// recovers; nothing recovers from an empty inventory, so that case says what is
-// missing instead.
+// emptyState explains why the list is empty: no inventory at all, a filter that
+// excludes everything, a query that matches nothing, or both. The filter and
+// query cases name the key that recovers. No key recovers from an empty
+// inventory, so that case says what is missing.
 func (m Model) emptyState(inner, avail int) []string {
 	q := strings.TrimSpace(m.search.Value())
 	filtered := m.filter != "all"
@@ -757,7 +765,7 @@ func (m Model) emptyState(inner, avail int) []string {
 }
 
 // oneLine collapses text to a single terminal line. Errors reach the banners
-// from several sources, and an embedded newline would push the view past its
+// from several sources, and one embedded newline would push the view past its
 // height budget.
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
@@ -808,8 +816,8 @@ func (m Model) renderRow(i int, a kitty.Agent, inner int, grouped bool) (string,
 		{statusGlyph(a.Display), sc, false, ""},
 		{" ", cText, false, ""},
 	}
-	// The glyph already carries the status, so a very narrow row drops the
-	// padded status word instead of crowding out the agent's name.
+	// The glyph already carries the status, so a narrow row drops the padded
+	// status word instead of crowding out the agent's name.
 	if inner >= minStatusWordWidth {
 		left1 = append(left1,
 			span{fmt.Sprintf("%-*s", colStatus, a.Display), sc, true, ""},
@@ -817,8 +825,8 @@ func (m Model) renderRow(i int, a kitty.Agent, inner int, grouped bool) (string,
 		)
 	}
 	if grouped {
-		// The heading above already names the project, so the row only has to
-		// identify itself within it.
+		// The heading above names the project, so the row only has to identify
+		// itself within that group.
 		left1 = append(left1,
 			span{truncate(rowLabel(a), maxName), cText, true, ""},
 			span{" ", cText, false, ""},
@@ -838,14 +846,14 @@ func (m Model) renderRow(i int, a kitty.Agent, inner int, grouped bool) (string,
 	case selected && m.focusing:
 		right1 = []span{{"focusing…", cLavender, false, ""}}
 	case selected && inner < minJumpHintWidth:
-		//nolint:prealloc // every branch here holds at most three spans, so a
-		// preallocated capacity would be a guess, not a saving.
+		//nolint:prealloc // every branch holds at most three spans, so a
+		// preallocated capacity would be a guess.
 		right1 = []span{{jumpHint, cLavender, false, ""}}
 	case selected:
 		right1 = append(right1, span{"  ", cText, false, ""}, span{jumpHint, cLavender, false, ""})
 	case inner >= minJumpHintWidth:
-		// Reserve the hint's cells on every other row so the time column holds
-		// still while the cursor moves through the list.
+		// Reserve the hint's cells on every other row, so the time column holds
+		// still while the cursor moves.
 		right1 = append(right1, span{strings.Repeat(" ", lipgloss.Width(jumpHint)+2), cText, false, ""})
 	}
 	line1 := composeLine(left1, right1, inner, bg)
@@ -907,17 +915,22 @@ func (m Model) renderSummary(width int) string {
 }
 
 // hintTiers are the footer keybinds from fullest to barest. Truncating the
-// longest list would cut the close key on exactly the narrow terminals that
-// need it, so a shorter complete list wins.
+// longest list would cut the close key on the narrow terminals that need it, so
+// a shorter complete list wins.
 func (m Model) hintTiers() []string {
 	switch {
 	case m.focusing:
 		return []string{"focusing selected agent…", "focusing…"}
 	case m.searching:
 		return []string{"↑↓ move · ⏎ jump · esc clear · ^c close", "⏎ jump · esc clear", "esc clear"}
+	case m.sessionBusy:
+		// The verb names which key is running. "R" restores a snapshot; "s"
+		// makes one.
+		return []string{m.sessionVerb + " the session snapshot…", m.sessionVerb + "…"}
 	default:
 		return []string{
-			"↑↓ / j k move · 1-9 select · ⏎ jump · / search · f filter · esc close",
+			"↑↓ / j k move · 1-9 select · ⏎ jump · / search · f filter · s save · R restore · esc close",
+			"j k move · ⏎ jump · / search · f filter · s save · R restore · esc close",
 			"j k move · ⏎ jump · / search · f filter · esc close",
 			"⏎ jump · / search · esc close",
 			"esc close",
@@ -945,8 +958,8 @@ func (m Model) renderHints(width int) string {
 	inner := width - 4
 	c := m.counts()
 
-	// Position leads the summary: truncation takes the right side first, and
-	// knowing where the cursor sits matters most while scrolling.
+	// Position leads the summary. Truncation takes the right side first, and
+	// the cursor position matters most while scrolling.
 	summary := fmt.Sprintf("%d active · %d agents", c["working"]+c["blocked"], c["all"])
 	vis := m.visible()
 	if len(vis) > 0 && m.selected >= 0 && m.selected < len(vis) {

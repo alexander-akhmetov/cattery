@@ -14,8 +14,8 @@ import (
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 )
 
-// recorder stands in for a kitty window: it keeps the batches a writer sent so
-// a test can assert the update order without a terminal or a live kitty.
+// recorder stands in for a kitty window. It keeps the batches a writer sent, so
+// a test can check the update order without a terminal or a live kitty.
 type recorder struct {
 	batches [][]Var
 	err     error
@@ -37,8 +37,8 @@ func (r *recorder) sent() []Var {
 	return out
 }
 
-// charDevice is stdin attached to a terminal. It fails the test if anything
-// reads it, which is what a manual `cattery state idle` must never do.
+// charDevice is stdin attached to a terminal. It fails the test when anything
+// reads it, which a manual `cattery state idle` must never do.
 type charDevice struct{ t *testing.T }
 
 func (c charDevice) Read([]byte) (int, error) {
@@ -53,7 +53,7 @@ type charDeviceInfo struct{ fs.FileInfo }
 func (charDeviceInfo) Mode() fs.FileMode { return fs.ModeCharDevice | 0o620 }
 
 // blockingPipe is the open pipe a fish wrapper can hand to `cattery state
-// clear`: it never produces data and never closes.
+// clear`. It produces no data and never closes.
 type blockingPipe struct{}
 
 func (blockingPipe) Read([]byte) (int, error) {
@@ -80,7 +80,7 @@ func TestWriteUpdateOrder(t *testing.T) {
 			name:  "working without a prompt leaves AGENT_MSG alone",
 			state: "working",
 			stdin: strings.NewReader(`{"session_id":"abc"}`),
-			want:  []Var{set(varKind, "claude"), set(varState, "working")},
+			want:  []Var{set(varKind, "claude"), set(varState, "working"), set(varResume, "claude --resume abc")},
 		},
 		{
 			name:  "working with no stdin at all",
@@ -136,8 +136,8 @@ func TestWriteUpdateOrder(t *testing.T) {
 }
 
 // A crashed agent's cleanup runs through a shell wrapper, which passes on
-// whatever stdin it inherited. Reading that first would hang the shell after
-// every agent exit, so clear must publish and return without touching it.
+// whatever stdin it inherited. Reading that would hang the shell after every
+// agent exit, so clear publishes and returns without touching it.
 func TestClearReturnsBeforeReadingStdin(t *testing.T) {
 	rec := &recorder{}
 	done := make(chan struct{})
@@ -159,8 +159,8 @@ func TestWriteWithoutAWayToPublish(t *testing.T) {
 		writer Writer
 	}{
 		{
-			// KITTY_WINDOW_ID is set on every child shell inside kitty, so an
-			// empty one means the caller is somewhere else entirely.
+			// kitty sets KITTY_WINDOW_ID on every child shell, so an empty one
+			// means the caller is somewhere else.
 			name:   "outside kitty",
 			writer: Writer{Stdin: strings.NewReader(`{"prompt":"x"}`), Transport: &recorder{}},
 		},
@@ -181,8 +181,160 @@ func TestWriteWithoutAWayToPublish(t *testing.T) {
 	}
 }
 
-// A transport that cannot reach kitty is not the agent's problem: the writer
-// swallows it, so the hook exits 0 either way.
+// AGENT_RESUME tells a snapshot how to reopen this Claude session. Every hook
+// payload carries session_id, so every live state publishes it.
+func TestWriteResumeCommand(t *testing.T) {
+	cases := []struct {
+		name   string
+		state  string
+		prefix string
+		stdin  io.Reader
+		want   string // the AGENT_RESUME value, or "" for no AGENT_RESUME at all
+	}{
+		{
+			name:  "a session id becomes a resume command",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"abc-123"}`),
+			want:  "claude --resume abc-123",
+		},
+		{
+			name:   "the prefix override carries the wrapper and the profile flag",
+			state:  "working",
+			prefix: "nono run claude --profile personal",
+			stdin:  strings.NewReader(`{"session_id":"abc-123"}`),
+			want:   "nono run claude --profile personal --resume abc-123",
+		},
+		{
+			name:  "blocked publishes it too",
+			state: "blocked",
+			stdin: strings.NewReader(`{"session_id":"abc-123"}`),
+			want:  "claude --resume abc-123",
+		},
+		{
+			name:  "idle publishes it too",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"abc-123"}`),
+			want:  "claude --resume abc-123",
+		},
+		{
+			name:  "a payload with no session id publishes nothing",
+			state: "working",
+			stdin: strings.NewReader(`{"prompt":"fix the picker"}`),
+		},
+		{
+			name:  "no payload at all publishes nothing",
+			state: "working",
+		},
+		{
+			name:  "a payload that is not json publishes nothing",
+			state: "working",
+			stdin: strings.NewReader(`not json`),
+		},
+		{
+			// The id is Claude's own UUID, so this never happens in practice.
+			// Quoting stays, because restore types the value at a shell prompt
+			// where an unquoted space would split the command.
+			name:  "an id needing quotes gets them",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"weird id"}`),
+			want:  "claude --resume 'weird id'",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			Writer{WindowID: "7", Stdin: tc.stdin, Transport: rec, ResumePrefix: tc.prefix}.Write(tc.state)
+
+			got, found := "", false
+			for _, v := range rec.sent() {
+				if v.Name == varResume {
+					got, found = v.Value, true
+				}
+			}
+			if tc.want == "" {
+				if found {
+					t.Fatalf("published %s=%q, want none", varResume, got)
+				}
+				return
+			}
+			if !found {
+				t.Fatalf("no %s published, want %q", varResume, tc.want)
+			}
+			if got != tc.want {
+				t.Fatalf("%s: got %q, want %q", varResume, got, tc.want)
+			}
+		})
+	}
+}
+
+// A shell wrapper runs clear after any agent exits, and the window can outlive
+// several agents. The resume command makes that window worth restoring, so
+// clear leaves it and forgets everything live.
+func TestClearKeepsTheResumeCommand(t *testing.T) {
+	rec := &recorder{}
+	Writer{WindowID: "7", Transport: rec}.Write("clear")
+
+	for _, v := range rec.sent() {
+		if v.Name == varResume {
+			t.Fatalf("clear touched %s: %+v", varResume, v)
+		}
+	}
+	// The live variables still go, or a dead agent keeps its tab marker.
+	assertVars(t, rec.sent(), []Var{del(varState), del(varKind), del(varMsg)})
+}
+
+// New reads the override from the environment, where a shell wrapper sets it.
+// The Claude-only name wins, because pi's writer appends different arguments to
+// the same prefix. An exported CATTERY_RESUME_PREFIX aimed at one agent would
+// otherwise publish that agent's command for the other.
+func TestNewReadsTheResumePrefix(t *testing.T) {
+	cases := []struct {
+		name         string
+		shared       string
+		claude       string
+		want         string
+		wantResumeIn string
+	}{
+		{
+			name:         "the shared name",
+			shared:       "nono run claude",
+			want:         "nono run claude",
+			wantResumeIn: "nono run claude --resume abc",
+		},
+		{
+			name:         "the Claude name wins over the shared one",
+			shared:       "nono run pi",
+			claude:       "nono run claude --profile personal",
+			want:         "nono run claude --profile personal",
+			wantResumeIn: "nono run claude --profile personal --resume abc",
+		},
+		{
+			name:         "an empty value is not an override",
+			shared:       "",
+			claude:       "",
+			want:         "",
+			wantResumeIn: "claude --resume abc",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KITTY_WINDOW_ID", "7")
+			t.Setenv(envResumePrefix, tc.shared)
+			t.Setenv(envResumePrefixClaude, tc.claude)
+
+			w := New()
+			if w.ResumePrefix != tc.want {
+				t.Fatalf("ResumePrefix: got %q, want %q", w.ResumePrefix, tc.want)
+			}
+			if got := w.resumeCommand("abc"); got != tc.wantResumeIn {
+				t.Fatalf("resumeCommand: got %q, want %q", got, tc.wantResumeIn)
+			}
+		})
+	}
+}
+
+// A transport that cannot reach kitty is not the agent's problem. The writer
+// swallows the error, so the hook exits 0 either way.
 func TestPublishFailureIsSwallowed(t *testing.T) {
 	rec := &recorder{err: errors.New("kitty socket unavailable")}
 	Writer{WindowID: "7", Stdin: strings.NewReader(`{"prompt":"x"}`), Transport: rec}.Write("working")
@@ -216,9 +368,9 @@ func TestNormalizePrompt(t *testing.T) {
 			want: strings.Repeat("日", promptLimit),
 		},
 		{
-			// A two-byte rune sitting on the limit: the cut must fall between
-			// runes, because the picker parses `kitten @ ls` output as JSON and
-			// a partial encoding there breaks the parse.
+			// A two-byte rune sitting on the limit. The cut must fall between
+			// runes: the picker parses `kitten @ ls` output as JSON, and a
+			// partial encoding breaks that parse.
 			name: "a cut lands between runes",
 			hook: `{"prompt":"` + strings.Repeat("é", 300) + `"}`,
 			want: strings.Repeat("é", promptLimit),
@@ -226,7 +378,7 @@ func TestNormalizePrompt(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizePrompt([]byte(tc.hook))
+			got := normalizePrompt(parseHook([]byte(tc.hook)).Prompt)
 			if got != tc.want {
 				t.Fatalf("normalizePrompt: got %q, want %q", got, tc.want)
 			}
@@ -272,7 +424,7 @@ func TestOSC(t *testing.T) {
 	}
 }
 
-// The chain is what makes a Claude hook work: /dev/tty fails there, and the
+// The chain is what makes a Claude hook work. /dev/tty fails there, and the
 // kitten socket behind it carries the state.
 func TestChainFallsBackToTheNextTransport(t *testing.T) {
 	failing := &recorder{err: errors.New("no controlling terminal")}
@@ -296,8 +448,8 @@ func TestChainFallsBackToTheNextTransport(t *testing.T) {
 		t.Fatalf("second transport ran after the first succeeded: %v", second.batches)
 	}
 
-	// Every transport failing reports the last reason, which nothing above
-	// acts on but which keeps the chain honest.
+	// Every transport failing reports the last reason. Nothing above acts on
+	// it, and it keeps the chain honest.
 	if err := (chain{failing, failing}).Publish(vars); err == nil {
 		t.Fatal("chain with no working transport: got nil error")
 	}
@@ -312,8 +464,8 @@ func TestRunWithoutAState(_ *testing.T) {
 // --- transports -------------------------------------------------------------
 
 // New wires the transports from the kitty environment: the terminal always, and
-// the remote-control socket behind it when kitty published one and the window id
-// is a number that socket can match on.
+// the remote-control socket behind it when kitty published one and the window
+// id is a number that socket can match on.
 func TestNewBuildsTheTransportChain(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -357,7 +509,7 @@ func TestNewBuildsTheTransportChain(t *testing.T) {
 }
 
 // The terminal transport sends the whole batch in one write, and reports the
-// open failure that every Claude command hook hits: those run without a
+// open failure every Claude command hook hits. Those hooks run without a
 // controlling terminal, which is what sends the batch to the kitten socket.
 func TestTTYTransport(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tty")
@@ -383,8 +535,8 @@ func TestTTYTransport(t *testing.T) {
 	}
 }
 
-// A kitten that cannot reach kitty has to say so, or the chain would count the
-// update as published and stop.
+// A kitten that cannot reach kitty must say so, or the chain counts the update
+// as published and stops.
 func TestKittenTransportReportsAFailure(t *testing.T) {
 	dir := t.TempDir()
 	writeFakeKitten(t, dir, `printf 'no listening socket\n' >&2; exit 1`)

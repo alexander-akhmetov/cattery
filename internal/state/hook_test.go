@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-// subprocessState turns the test binary into `cattery state <x>`: the child
+// subprocessState turns the test binary into `cattery state <x>`. The child
 // reads the word from here, publishes it, and exits before the test framework
 // runs anything.
 const subprocessState = "CATTERY_TEST_STATE"
@@ -23,14 +23,13 @@ const argvFile = "CATTERY_TEST_ARGV"
 
 // The path a Claude command hook really takes. Those hooks run without a
 // controlling terminal, so the OSC write to /dev/tty fails and the batch goes
-// over kitty remote control instead. Only a separate process can be without a
-// terminal, so the test re-execs itself in a new session, which is how the shell
-// state writer was tested before this code moved into Go.
+// over kitty remote control. Only a separate process can be without a terminal,
+// so the test re-execs itself in a new session.
 func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 	if word := os.Getenv(subprocessState); word != "" {
 		Run([]string{word})
-		// Exit before the test framework prints its own result: Claude captures
-		// a hook's stdout into the transcript, so it has to stay empty.
+		// Exit before the test framework prints its own result. Claude captures
+		// a hook's stdout into the transcript, which has to stay empty.
 		os.Exit(0)
 	}
 
@@ -55,8 +54,8 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 				"AGENT_KIND=claude", "AGENT_STATE=blocked"},
 		},
 		{
-			// Bare names, not empty values: that is how both kitty and the OSC
-			// escape spell "remove this variable".
+			// Bare names. That is how both kitty and the OSC escape spell
+			// "remove this variable"; an empty value means something else.
 			name:  "clear deletes the three variables, in order",
 			state: "clear",
 			want: []string{"@", "set-user-vars", "--match", "id:7",
@@ -88,9 +87,9 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			// opened and nothing reaches the terminal running the tests.
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-			// Stdout only: under `go test -cover` the child's coverage runtime
-			// writes a warning to stderr when it exits without GOCOVERDIR, and
-			// stdout is the stream that matters here anyway.
+			// Stdout only. Under `go test -cover` the child's coverage runtime
+			// warns on stderr when it exits without GOCOVERDIR, and stdout is
+			// the stream that matters here.
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
 			stdout, err := cmd.Output()

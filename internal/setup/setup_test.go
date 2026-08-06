@@ -15,8 +15,8 @@ import (
 
 const testBinary = "/opt/bin/cattery"
 
-// harness is one setup run against temporary directories, with pi faked so
-// nothing is launched.
+// harness is one setup run against temporary directories, with pi faked so it
+// launches nothing.
 type harness struct {
 	t         *testing.T
 	kittyDir  string
@@ -129,9 +129,9 @@ func TestFreshInstall(t *testing.T) {
 	}
 }
 
-// A second run must leave the same bytes behind: the kitty files match the
-// embedded copies again, and the managed block is replaced in place rather than
-// added a second time.
+// A second run leaves the same bytes behind. The kitty files match the embedded
+// copies again, and the managed block is replaced in place instead of added a
+// second time.
 func TestRerunIsIdempotent(t *testing.T) {
 	h := newHarness(t)
 	h.run()
@@ -161,7 +161,7 @@ func TestRerunIsIdempotent(t *testing.T) {
 }
 
 // install.sh left symlinks into a checkout. Writing through one would edit the
-// checkout instead of the install, so setup removes the link first.
+// checkout, so setup removes the link first.
 func TestSymlinkTargetIsReplacedByACopy(t *testing.T) {
 	h := newHarness(t)
 	checkout := t.TempDir()
@@ -191,10 +191,10 @@ func TestSymlinkTargetIsReplacedByACopy(t *testing.T) {
 	}
 }
 
-// kitty.conf and Claude's settings.json are the user's own files, and both are
-// often symlinks into a dotfiles checkout. Setup edits the file the link points
-// at: replacing the link with a regular file would detach both from the
-// checkout, silently, while `git status` there stayed clean.
+// kitty.conf and Claude's settings.json belong to the user, and both are often
+// symlinks into a dotfiles checkout. Setup edits the file the link points at.
+// Replacing the link with a regular file would detach both from the checkout in
+// silence, while `git status` there stayed clean.
 func TestSymlinkedUserFilesAreEditedThroughTheLink(t *testing.T) {
 	h := newHarness(t)
 	dotfiles := t.TempDir()
@@ -239,8 +239,8 @@ func TestSymlinkedUserFilesAreEditedThroughTheLink(t *testing.T) {
 	if got := h.perm(settings); got != 0o600 {
 		t.Errorf("settings.json mode: got %o, want %o", got, 0o600)
 	}
-	// The backup stays beside the link: the checkout is a git repository, and an
-	// untracked copy of settings.json does not belong in it.
+	// The backup stays beside the link. The checkout is a git repository, and
+	// an untracked copy of settings.json does not belong in it.
 	if _, err := os.Stat(settings + ".cattery-bak"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a backup was written into the checkout: %v", err)
 	}
@@ -307,9 +307,9 @@ func TestTabBarBranches(t *testing.T) {
 func TestKittyConfKeepsEverythingOutsideTheBlock(t *testing.T) {
 	h := newHarness(t)
 	head := "font_size 13.0\nshell fish\n"
-	// Two blank lines below the block, which are the user's. A run that ate one
-	// of them would change a file whose managed block did not change, and the
-	// run after that would do it again.
+	// Two blank lines below the block, which belong to the user. A run that ate
+	// one would change a file whose managed block did not change, and the next
+	// run would do it again.
 	below := "\n\ncursor_shape beam\n"
 	h.write(h.kittyPath("kitty.conf"), head+blockStart+"\nstale line\n"+blockEnd+"\n"+below)
 
@@ -362,7 +362,7 @@ func TestMergeBlock(t *testing.T) {
 			want: block + "b 2\n",
 		},
 		{
-			// The blank lines are outside the block, so they are the user's.
+			// The blank lines sit outside the block, so they are the user's.
 			name: "keeps blank lines below the block",
 			conf: "a 1\n" + blockStart + "\nold\n" + blockEnd + "\n\n\nb 2\n",
 			want: "a 1\n" + block + "\n\nb 2\n",
@@ -400,7 +400,7 @@ func TestMergeBlock(t *testing.T) {
 	}
 }
 
-// Unpaired markers are reported, not guessed at: repairing them means choosing
+// Unpaired markers are reported and left alone. Repairing them means choosing
 // which half of the file the user meant to keep.
 func TestKittyConfWithBrokenMarkersIsLeftAlone(t *testing.T) {
 	h := newHarness(t)
@@ -541,8 +541,8 @@ func TestLegacyLeftoversAreReportedNotDeleted(t *testing.T) {
 
 // --- Claude -----------------------------------------------------------------
 
-// unrelatedSettings mirrors a real file: hooks that belong to other tools sit
-// in the same arrays cattery writes into, and keys around them must not move.
+// unrelatedSettings mirrors a real file. Other tools' hooks sit in the same
+// arrays cattery writes into, and the keys around them must not move.
 const unrelatedSettings = `{
   "model": "opus",
   "hooks": {
@@ -607,17 +607,16 @@ func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
 			wantGroups: 1,
 		},
 		{
-			// What setup itself writes when the binary sits in a directory whose
-			// name holds a space.
+			// What setup writes when the binary sits in a directory whose name
+			// holds a space.
 			name:       "a quoted binary path",
 			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/opt/my apps/cattery' state idle"}]}]}}`,
 			gone:       "/opt/my apps/cattery",
 			wantGroups: 1,
 		},
 		{
-			// The group belongs to the user, not to cattery: it can carry a
-			// matcher and another tool's command, and only cattery's own entry
-			// may change.
+			// The group belongs to the user. It can carry a matcher and another
+			// tool's command, and only cattery's own entry may change.
 			name: "a group cattery shares with another tool",
 			existing: `{"hooks":{"Stop":[{"matcher":"*","hooks":[` +
 				`{"type":"command","command":"/old/bin/cattery state idle"},` +
@@ -627,8 +626,8 @@ func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
 			wantGroups: 1,
 		},
 		{
-			// A command that only mentions cattery is somebody else's. The && is
-			// here too: json.MarshalIndent would rewrite it as an escape.
+			// A command that only mentions cattery belongs to somebody else. The
+			// && is here too, because json.MarshalIndent would escape it.
 			name:       "a command that names cattery without running it",
 			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cd ~/projects/cattery && make lint"}]}]}}`,
 			kept:       []string{"cd ~/projects/cattery && make lint"},
@@ -680,7 +679,8 @@ func TestClaudeBackupIsWrittenOnce(t *testing.T) {
 		t.Errorf("backup mode: got %o, want %o", got, 0o600)
 	}
 
-	// A later run must not overwrite the only copy of the pre-cattery file.
+	// A later run must not overwrite the only copy of the file from before
+	// cattery.
 	h.write(path, `{"model":"sonnet"}`)
 	h.run()
 	if got := h.read(backup); got != unrelatedSettings {
@@ -757,7 +757,7 @@ func TestConsent(t *testing.T) {
 			if ran := len(h.piRuns) > 0; ran != tc.wantPi {
 				t.Errorf("pi install ran=%v, want %v; output:\n%s", ran, tc.wantPi, out)
 			}
-			// A skipped step has to say what to run by hand.
+			// A skipped step says what to run by hand.
 			if !tc.wantClaude {
 				for _, hook := range claudeHooks {
 					if !strings.Contains(out, hook.Event) || !strings.Contains(out, testBinary+" state "+hook.State) {
@@ -768,7 +768,7 @@ func TestConsent(t *testing.T) {
 			if !tc.wantPi && !strings.Contains(out, "pi install "+piPackage) {
 				t.Errorf("report missing the manual pi command, got:\n%s", out)
 			}
-			// The kitty side never asks: it is the install itself.
+			// The kitty side never asks, because it is the install itself.
 			if _, err := os.Stat(h.kittyPath("cattery_tab.py")); err != nil {
 				t.Errorf("kitty files were skipped: %v", err)
 			}
@@ -805,8 +805,8 @@ func TestPiMissingFromPath(t *testing.T) {
 	}
 }
 
-// A pi install that fails is reported; the kitty install it follows still
-// stands, so setup itself does not fail.
+// A pi install that fails is reported. The kitty install before it still
+// stands, so setup does not fail.
 func TestPiInstallFailureIsReported(t *testing.T) {
 	h := newHarness(t)
 	h.opts.RunCommand = func(string, ...string) error { return errors.New("network unreachable") }
@@ -859,7 +859,7 @@ func TestStale(t *testing.T) {
 			want: true,
 		},
 		{
-			// Nothing was installed here, so there is nothing to be behind.
+			// Nothing was installed here, so nothing can be behind.
 			name: "an empty directory is not stale",
 		},
 	}

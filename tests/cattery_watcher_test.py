@@ -1,16 +1,15 @@
 """Unit tests for kitty/cattery_watcher.py, the kitty agent-state watcher.
 
-The watcher imports kitty internals that only exist inside a running kitty, so
+The watcher imports kitty internals that exist only inside a running kitty, so
 this stubs `kitty.boss`, `kitty.window`, and `kitty.fast_data_types` before
-loading it. Everything under test runs outside kitty: `_derive_display` is a
-function of state plus bookkeeping, `_update_os_title` only walks the tab
-manager and calls one C function, which the stub records and, inside
-`FAIL_TITLE_WRITES`, refuses, and `_apply` plus the watcher entry points drive
-`FakeWindow`, which records the user variables the watcher writes the way kitty
-stores them.
+loading it. Everything under test then runs outside kitty. `_derive_display` is
+a function of state plus bookkeeping. `_update_os_title` walks the tab manager
+and calls one C function, which the stub records and refuses inside
+`FAIL_TITLE_WRITES`. `_apply` and the watcher entry points drive `FakeWindow`,
+which stores user variables the way kitty does.
 
 Notifications go through `subprocess.Popen`, which `WatcherTestCase` replaces
-with a recorder, so no test spawns terminal-notifier.
+with a recorder, so no test starts terminal-notifier.
 
 Run with `make test-python`.
 """
@@ -87,8 +86,8 @@ class FakeWindow:
         self.title = title
         self.is_focused = focused
         self.user_vars = {}
-        # Every write the watcher made, as (key, value), including the deletions
-        # it performs by passing None.
+        # Every write the watcher made, as (key, value), including the
+        # deletions it makes by passing None.
         self.var_calls = []
         if display is not None:
             self.user_vars["AGENT_DISPLAY"] = display
@@ -98,7 +97,7 @@ class FakeWindow:
             self.user_vars["AGENT_KIND"] = kind
 
     def set_user_var(self, key, val=None):
-        # kitty drops the key first and stores the value only when there is one,
+        # kitty drops the key first and stores a value only when there is one,
         # so set_user_var(key, None) deletes the variable.
         self.var_calls.append((key, val))
         self.user_vars.pop(key, None)
@@ -141,7 +140,7 @@ def boss_for(windows, active=None):
 
 
 class RecordingPopen:
-    """Stand-in for subprocess.Popen that records argv, or raises `error`."""
+    """Stand-in for subprocess.Popen. It records argv, or raises `error`."""
 
     def __init__(self):
         self.calls = []
@@ -155,7 +154,7 @@ class RecordingPopen:
 
 
 class WatcherTestCase(unittest.TestCase):
-    """Base for the tests that reach side effects: titles and notifications."""
+    """Base for the tests that reach titles and notifications."""
 
     def setUp(self):
         TITLE_CALLS.clear()
@@ -178,8 +177,8 @@ class DeriveDisplayTest(unittest.TestCase):
             ("stays done until seen", "idle", "done", False, False, "done", False),
             ("finished while watched", "idle", "working", True, False, "idle", True),
             ("already acknowledged", "idle", "working", False, True, "idle", True),
-            # An agent that announces idle at startup has not finished
-            # anything, so it must not become "done".
+            # An agent that announces idle at startup has finished nothing, so
+            # it must not become "done".
             ("idle before any work", "idle", None, False, False, "idle", False),
             ("idle stays idle", "idle", "idle", False, False, "idle", False),
             ("no state", None, "working", False, False, None, False),
@@ -244,8 +243,8 @@ class UpdateOsTitleTest(unittest.TestCase):
         )
 
     def test_ignores_the_window_being_closed(self):
-        # kitty calls the close watcher while the window is still in its tab, so
-        # the count has to leave it out or the prefix outlives the agent.
+        # kitty calls the close watcher while the window is still in its tab.
+        # The count has to leave it out, or the prefix outlives the agent.
         closing = FakeWindow(1, "blocked", title="agent")
         other = FakeWindow(2, "working")
         boss = FakeBoss(FakeTabManager([closing, other], active=other))
@@ -290,7 +289,7 @@ class ApplyTest(WatcherTestCase):
         self.assertEqual(boss.os_window_map[1].dirty, 1, "the tab bar has to be redrawn")
 
     def test_the_same_state_written_again_changes_nothing(self):
-        # Claude's hooks re-send AGENT_KIND on every call, so _apply runs again
+        # Claude's hooks resend AGENT_KIND on every call, so _apply runs again
         # with the display it already published. A second write would move
         # AGENT_SINCE and restart the tab bar's elapsed counter.
         window = FakeWindow(1, state="blocked", kind="claude")
@@ -353,12 +352,13 @@ class ApplyTest(WatcherTestCase):
         self.assertEqual(argv[0], "terminal-notifier")
         self.assertIn("Agent finished (pi)", argv)
         self.assertIn("~/projects/cattery", argv)
-        # One group per window and state, so repeats replace instead of stacking.
+        # One group per window and state, so a repeat replaces instead of
+        # stacking.
         self.assertIn("kitty-agent-1-done", argv)
 
     def test_a_missing_notifier_still_leaves_the_state_published(self):
         # Linux has no terminal-notifier, and a sandbox can block it. The tab
-        # bar glyph is the part that must survive.
+        # marker is the part that has to survive.
         self.popen.error = FileNotFoundError("terminal-notifier")
         window = FakeWindow(1, display="working", state="idle", kind="claude")
         boss = boss_for([window])
@@ -375,8 +375,8 @@ class EntryPointTest(WatcherTestCase):
         cases = [
             ("AGENT_STATE", True),
             ("AGENT_KIND", True),
-            # The watcher's own writes come back through this callback; applying
-            # them would recurse.
+            # The watcher's own writes come back through this callback, and
+            # applying them would recurse.
             ("AGENT_DISPLAY", False),
             ("AGENT_SINCE", False),
             ("SOMETHING_ELSE", False),
@@ -392,11 +392,11 @@ class EntryPointTest(WatcherTestCase):
                 self.assertEqual(bool(window.var_calls), want_applied)
 
     def test_focus_marks_the_window_seen_and_drops_done(self):
-        # The event says the window is focused; window.is_focused is the
-        # watcher's other source for the same fact, and the callback may run
-        # before kitty flips it. The glyph has to clear either way, which is
-        # what the explicit bookkeeping in on_focus_change buys: _apply alone
-        # would read is_focused, see False, and keep the window unseen.
+        # The event says the window is focused. window.is_focused is the
+        # watcher's other source for the same fact, and the callback can run
+        # before kitty flips it. The marker has to clear either way, which is
+        # what the bookkeeping in on_focus_change buys: _apply alone would read
+        # is_focused, see False, and keep the window unseen.
         for name, is_focused in (("attribute already flipped", True), ("attribute not flipped yet", False)):
             with self.subTest(name):
                 window = FakeWindow(1, display="done", state="idle", kind="claude", focused=is_focused)
@@ -417,8 +417,8 @@ class EntryPointTest(WatcherTestCase):
         self.assertEqual(boss._agent_seen, set())
 
     def test_focusing_a_shell_only_refreshes_the_title(self):
-        # The prefix quotes whichever window is active, so a focus change in a
-        # window with no agent still leaves it naming the wrong one.
+        # The prefix quotes the active window, so a focus change in a window
+        # with no agent still leaves it naming the wrong one.
         shell = FakeWindow(2, title="fish", focused=True)
         blocked = FakeWindow(1, "blocked")
         boss = boss_for([blocked, shell], active=shell)

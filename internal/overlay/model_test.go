@@ -23,6 +23,15 @@ type fakeClient struct {
 	agents   []kitty.Agent
 	focused  []int
 	focusErr error
+
+	// The session half of the interface. actionErr makes save or restore fail
+	// without a kitty. windows is what goto_session produced, so it stays empty
+	// until then and the duplicate guard sees nothing.
+	actions   []string
+	actionErr error
+	windows   []kitty.Window
+	restored  bool
+	sent      []string
 }
 
 func (f *fakeClient) ListAgents(context.Context) ([]kitty.Agent, error) { return f.agents, nil }
@@ -32,8 +41,35 @@ func (f *fakeClient) FocusWindow(_ context.Context, id int) error {
 	return f.focusErr
 }
 
-// checkout builds an agent in the primary checkout of its own project, the
-// shape ListAgents produces for a plain `cd ~/projects/x` session.
+func (f *fakeClient) Action(_ context.Context, arg string) error {
+	f.actions = append(f.actions, arg)
+	if f.actionErr != nil {
+		return f.actionErr
+	}
+	// Stand in for kitty's save_as_session, which writes the file it is given.
+	if path, ok := strings.CutPrefix(arg, "save_as_session --save-only "); ok {
+		return os.WriteFile(strings.Trim(path, "'"), []byte("\nnew_tab\ncd /tmp\nlaunch\n"), 0o600)
+	}
+	if strings.HasPrefix(arg, "goto_session ") {
+		f.restored = true
+	}
+	return nil
+}
+
+func (f *fakeClient) SendText(_ context.Context, _ int, text string) error {
+	f.sent = append(f.sent, text)
+	return nil
+}
+
+func (f *fakeClient) Windows(context.Context) ([]kitty.Window, error) {
+	if !f.restored {
+		return nil, nil
+	}
+	return f.windows, nil
+}
+
+// checkout builds an agent in the primary checkout of its project, the shape
+// ListAgents produces for a plain `cd ~/projects/x` session.
 func checkout(id int, kind, display, project, branch string) kitty.Agent {
 	root := "/p/" + project
 	return kitty.Agent{
@@ -56,8 +92,8 @@ func sampleModel() Model {
 	return m
 }
 
-// The status filter and the query both narrow the same list, and the query
-// searches inside the filter, not beside it.
+// The status filter and the query narrow the same list. The query searches
+// inside the filter.
 func TestVisible(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -212,8 +248,8 @@ func TestCounts(t *testing.T) {
 	}
 }
 
-// The spinner tick is the only thing that redraws a still list, so it must stop
-// when no agent is working and start again when one shows up.
+// The spinner tick is the only thing that redraws a still list. It stops when
+// no agent is working and starts again when one appears.
 func TestSpinTickFollowsWorkingAgents(t *testing.T) {
 	idle := []kitty.Agent{{ID: 1, Display: "idle"}}
 	working := []kitty.Agent{{ID: 1, Display: "working"}}
@@ -285,10 +321,10 @@ func TestActivity(t *testing.T) {
 	}
 }
 
-// The glyphs must stay in step with _AGENT_STATE_STYLE in kitty/cattery_tab.py:
-// a dot means the same thing in the tab bar and in the picker, and only the
-// color separates a finished agent from a running one. Idle is picker-only,
-// because the tab bar draws nothing for it.
+// The glyphs stay in step with _AGENT_STATE_STYLE in kitty/cattery_tab.py, so a
+// dot means the same thing in the tab bar and in the picker and only the colour
+// separates a finished agent from a running one. Idle is picker-only, because
+// the tab bar draws nothing for it.
 func TestStatusGlyph(t *testing.T) {
 	cases := map[string]string{
 		"working": "●",
@@ -311,8 +347,8 @@ func TestActivityGlyph(t *testing.T) {
 	cases := map[string]string{
 		"blocked": "◆",
 		"done":    "●",
-		// Idle's status glyph is the same middot as the separator in front of
-		// it, so the row leaves it out.
+		// Idle's status glyph repeats the middot separator in front of it, so
+		// the row leaves it out.
 		"idle": "",
 	}
 	for display, want := range cases {
@@ -369,8 +405,8 @@ func TestAgentName(t *testing.T) {
 	}
 }
 
-// Inside a project group the row has to say which checkout it is. The branch
-// does that until there is no branch to show.
+// Inside a project group the row says which checkout it is. The branch does
+// that until there is no branch to show.
 func TestRowLabel(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -425,7 +461,7 @@ func TestGroupSize(t *testing.T) {
 	agents := []kitty.Agent{
 		{ID: 1, Project: "a", ProjectKey: "/a/.git"},
 		{ID: 2, Project: "a", ProjectKey: "/a/.git"},
-		// Same label, different repository: a separate group.
+		// The same label from another repository, so a separate group.
 		{ID: 3, Project: "a", ProjectKey: "/other/a/.git"},
 		{ID: 4, Project: "b", ProjectKey: "/b/.git"},
 	}
@@ -436,8 +472,8 @@ func TestGroupSize(t *testing.T) {
 	}
 }
 
-// The point of grouping: several worktrees of one repository sit under a
-// single heading, each identified by its own branch.
+// Grouping puts several worktrees of one repository under a single heading,
+// each identified by its branch.
 func TestViewGroupsWorktreesUnderOneHeading(t *testing.T) {
 	m := sampleModel()
 	m.width, m.height = 100, 40
@@ -464,7 +500,8 @@ func TestViewGroupsWorktreesUnderOneHeading(t *testing.T) {
 	if got := strings.Count(out, "dotfiles 3"); got != 1 {
 		t.Errorf("dotfiles should head exactly one group, headed %d:\n%s", got, out)
 	}
-	// Each worktree names itself: two branches and the detached one's directory.
+	// Each worktree names itself: two branches, then the detached one's
+	// directory.
 	for _, want := range []string{"feat/oauth", "dotfiles-review"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing row label %q, got:\n%s", want, out)
@@ -472,8 +509,8 @@ func TestViewGroupsWorktreesUnderOneHeading(t *testing.T) {
 	}
 }
 
-// A heading draws only when a row fits under it, and a viewport that starts
-// mid-group re-draws the heading it scrolled past.
+// A heading draws only when a row fits under it. A viewport that starts
+// mid-group redraws the heading it scrolled past.
 func TestViewGroupHeadingsSurviveScrolling(t *testing.T) {
 	heading := func(project string, count int) string { return fmt.Sprintf("%s %d", project, count) }
 
@@ -509,7 +546,7 @@ func TestViewGroupHeadingsSurviveScrolling(t *testing.T) {
 				checkout(4, "pi", "working", "zulu", "topic"),
 			}
 			// Two rows of one project cannot share a ProjectKey built from the
-			// branch, so give the pair the same repo explicitly.
+			// branch, so name the same repo for both.
 			m.agents[1].ProjectKey, m.agents[1].CWD = m.agents[0].ProjectKey, "/p/alpha-wt"
 			m.agents[3].ProjectKey, m.agents[3].CWD = m.agents[2].ProjectKey, "/p/zulu-wt"
 			m.selected = tc.selected
@@ -548,9 +585,8 @@ func TestViewRenders(t *testing.T) {
 	}
 }
 
-// Every chrome line costs the list a line, so the top chrome draws only what
-// is in use: the title sits in the title bar, and the search row waits for a
-// query.
+// Every chrome line costs the list a line, so the top chrome draws only what is
+// in use. The title shares the title bar, and the search row waits for a query.
 func TestHeaderLines(t *testing.T) {
 	pad := lipgloss.NewStyle().PaddingLeft(2)
 	cases := []struct {
@@ -636,8 +672,8 @@ func TestTitleBarStates(t *testing.T) {
 	}
 }
 
-// Selecting a row must not slide the time column: holding j would otherwise
-// shuffle the whole right edge on every keypress.
+// Selecting a row must not slide the time column, or holding j shuffles the
+// whole right edge on every keypress.
 func TestRowTimeColumnHoldsStill(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	agent := kitty.Agent{
@@ -677,7 +713,8 @@ func TestRowTimeColumnHoldsStill(t *testing.T) {
 				}
 				return
 			}
-			// Compare terminal cells, not bytes: the selection bar is a wide rune.
+			// Compare terminal cells. The selection bar is a wide rune, so byte
+			// counts differ from what the terminal shows.
 			column := func(line string) int {
 				before, _, found := strings.Cut(line, label)
 				if !found {
@@ -692,8 +729,8 @@ func TestRowTimeColumnHoldsStill(t *testing.T) {
 	}
 }
 
-// Line 2 of an idle row: nothing to report means the row stops after the path,
-// and a title or message is printed without the redundant middot glyph.
+// Line 2 of an idle row. With nothing to report the row stops after the path,
+// and a title or message prints without the repeated middot.
 func TestIdleRowLine2(t *testing.T) {
 	indent := strings.Repeat(" ", rowIndent)
 	cases := []struct {
@@ -877,8 +914,8 @@ func TestPendingFocusCancelsOnClose(t *testing.T) {
 }
 
 // A jump error names one agent, so it must not outlive a move to another. It is
-// keyed on the selected window, not on keystrokes, so a key that leaves the
-// cursor where it was keeps the retry hint on screen.
+// keyed on the selected window rather than on keystrokes, so a key that leaves
+// the cursor in place keeps the retry hint on screen.
 func TestFocusErrClearsWhenSelectionChanges(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -891,8 +928,8 @@ func TestFocusErrClearsWhenSelectionChanges(t *testing.T) {
 		{name: "number select", selected: 1, key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}}, cleared: true},
 		{name: "jump to top", selected: 1, key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}}, cleared: true},
 		{name: "jump to end", selected: 1, key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}}, cleared: true},
-		// all -> working drops the blocked agent and resets to row 0, moving the
-		// cursor off window 1.
+		// all -> working drops the blocked agent and resets to row 0, which
+		// moves the cursor off window 1.
 		{name: "cycle filter onto another agent", selected: 2, key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}}, cleared: true},
 		// all -> working keeps window 3 on row 0, so the retry stands.
 		{name: "cycle filter onto the same agent", selected: 0, key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}}},
@@ -1022,8 +1059,8 @@ func TestSearchCtrlCQuits(t *testing.T) {
 	}
 }
 
-// The one-shot check has to look at the directory setup installs into, or the
-// warning it raises names a fix that changes nothing.
+// The one-shot check reads the directory setup installs into. Any other
+// directory makes the warning name a fix that changes nothing.
 func TestCheckAssetsReadsTheKittyDirectory(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1062,7 +1099,7 @@ func TestStaleMsgSetsTheFlag(t *testing.T) {
 		if got := updated.(Model).staleAssets; got != stale {
 			t.Errorf("staleAssets after staleMsg{%v}: got %v", stale, got)
 		}
-		// One shot: the check does not reschedule itself.
+		// One shot. The check does not reschedule itself.
 		if cmd != nil {
 			t.Errorf("staleMsg{%v} returned a command", stale)
 		}
@@ -1093,7 +1130,7 @@ func TestViewLoadStates(t *testing.T) {
 			absent: []string{"loading agents", "showing cached agents", "remote control unavailable"},
 		},
 		{
-			// A first load that fails is fatal: there is nothing cached to show.
+			// A failed first load is fatal, because nothing is cached to show.
 			name:   "fatal first load",
 			set:    func(m *Model) { m.agents = nil; m.reloadErr = errors.New("socket unavailable") },
 			want:   "kitty remote control unavailable",
@@ -1122,7 +1159,7 @@ func TestViewLoadStates(t *testing.T) {
 		},
 		{
 			// A binary upgraded without a second `cattery setup` leaves the
-			// installed kitty files behind, and nothing else would say so.
+			// installed kitty files behind, and nothing else reports it.
 			name:   "stale kitty files",
 			set:    func(m *Model) { m.staleAssets = true },
 			want:   "kitty files are out of date · run cattery setup",
@@ -1135,8 +1172,8 @@ func TestViewLoadStates(t *testing.T) {
 			want:   "astra-l", // a normal list, with no warning row
 		},
 		{
-			// One warning row, and the failed refresh owns it: it explains the
-			// rows on screen, while stale files are a background chore.
+			// One warning row, and the failed refresh owns it. It explains the
+			// rows on screen; stale files are a background chore.
 			name:   "a failed refresh outranks stale files",
 			set:    func(m *Model) { m.staleAssets = true; m.reloadErr = errors.New("socket unavailable") },
 			want:   "showing cached agents",
@@ -1237,7 +1274,7 @@ func TestViewFitsTerminal(t *testing.T) {
 	}
 }
 
-// wideAgents exercises cell-width truncation: CJK, emoji ZWJ sequences, and
+// wideAgents exercises cell-width truncation with CJK, emoji ZWJ sequences, and
 // combining marks in every field the row renders.
 func wideAgents() []kitty.Agent {
 	return []kitty.Agent{
@@ -1391,8 +1428,8 @@ func TestSearchMatchTextNamesFilterScope(t *testing.T) {
 	}
 }
 
-// Position leads the footer summary, because truncation takes the right side
-// first and a scrolled list is where the position matters most.
+// Position leads the footer summary. Truncation takes the right side first, and
+// the position matters most in a scrolled list.
 func TestFooterKeepsPositionWhenScrolled(t *testing.T) {
 	for _, width := range []int{40, 80} {
 		t.Run(fmt.Sprintf("%d columns", width), func(t *testing.T) {
@@ -1414,8 +1451,8 @@ func TestFooterKeepsPositionWhenScrolled(t *testing.T) {
 	}
 }
 
-// The compact boundary must keep the four things needed to act: which filter
-// is applied, which row is selected, where it sits, and how to get out.
+// The compact boundary keeps the four things needed to act: which filter is
+// applied, which row is selected, where it sits, and how to get out.
 func TestViewKeepsEssentialsWhenCompact(t *testing.T) {
 	sizes := []struct{ width, height int }{
 		{20, 7},
@@ -1509,7 +1546,7 @@ func TestComposeLine(t *testing.T) {
 		{name: "negative width", left: sp("abc"), inner: -3, want: ""},
 		{name: "single cell", left: sp("abc"), inner: 1, want: "…"},
 		{name: "wide runes fit", left: sp("界界"), inner: 4, want: "界界"},
-		// The ellipsis cannot split a wide rune, so the line pads to inner.
+		// The ellipsis cannot split a wide rune, so the line pads out to inner.
 		{name: "wide runes truncate", left: sp("界界界"), inner: 4, want: "界… "},
 		{name: "wide runes pad odd width", left: sp("界"), inner: 3, want: "界 "},
 	}
@@ -1571,5 +1608,246 @@ func TestShortenHomeRequiresPathBoundary(t *testing.T) {
 	path := home + "-other/project"
 	if got := shortenHome(path); got != path {
 		t.Fatalf("shortenHome(%q): got %q", path, got)
+	}
+}
+
+// --- session keys ---------------------------------------------------------
+
+// runes builds the key press for a single character.
+func runes(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
+
+// sessionModel points the snapshot path at a scratch file, so pressing "s" in a
+// test cannot touch the real one. It puts a snapshot there for restore to read.
+func sessionModel(t *testing.T, client *fakeClient) Model {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "agents.kitty-session")
+	body := "\nnew_tab\ncd /tmp\nlaunch '--var=AGENT_RESUME=pi --session /tmp/a.jsonl'\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CATTERY_SESSION_FILE", path)
+	m := sampleModel()
+	m.client = client
+	return m
+}
+
+// press sends one key and runs whatever command it produced, so the test sees
+// the result the way Bubble Tea would deliver it.
+func press(t *testing.T, m Model, key tea.KeyMsg) (Model, tea.Msg) {
+	t.Helper()
+	updated, cmd := m.handleKey(key)
+	got := updated.(Model)
+	if cmd == nil {
+		return got, nil
+	}
+	return got, cmd()
+}
+
+func TestSessionKeys(t *testing.T) {
+	cases := []struct {
+		name    string
+		key     tea.KeyMsg
+		action  string
+		summary string
+	}{
+		{name: "s saves", key: runes('s'), action: "save_as_session", summary: "saved 1 tab, 0 resumable agents"},
+		{name: "R restores", key: runes('R'), action: "goto_session", summary: "restored 1 tab, typed 1 of 1 resume commands"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The window restore expects to find. Without it, restore waits out
+			// its readiness deadline for a window that never appears.
+			client := &fakeClient{windows: []kitty.Window{
+				{ID: 9, SessionName: "agents", AtPrompt: true, UserVars: map[string]string{"AGENT_RESUME": "pi --session /tmp/a.jsonl"}},
+			}}
+			m := sessionModel(t, client)
+
+			started, msg := press(t, m, tc.key)
+			if !started.sessionBusy {
+				t.Fatal("the key did not start a snapshot")
+			}
+			result, ok := msg.(sessionMsg)
+			if !ok {
+				t.Fatalf("got %T, want a sessionMsg", msg)
+			}
+			if result.err != nil {
+				t.Fatalf("session failed: %v", result.err)
+			}
+			if len(client.actions) != 1 || !strings.HasPrefix(client.actions[0], tc.action) {
+				t.Fatalf("actions: got %v, want one %s", client.actions, tc.action)
+			}
+
+			// Delivering the result shows the notice and stops the busy flag.
+			done, _ := started.Update(result)
+			final := done.(Model)
+			if final.sessionBusy {
+				t.Error("still busy after the result arrived")
+			}
+			if final.noticeLevel != noticeOK {
+				t.Errorf("notice level %d for %q, want a plain success", final.noticeLevel, final.notice)
+			}
+			if !strings.Contains(final.notice, tc.summary) {
+				t.Errorf("notice %q does not contain %q", final.notice, tc.summary)
+			}
+		})
+	}
+}
+
+// Restore from the picker never presses return. One keystroke is easy to hit by
+// accident, and a resume command can point at a session that is gone.
+func TestPickerRestoreDoesNotRunAgents(t *testing.T) {
+	client := &fakeClient{
+		windows: []kitty.Window{
+			{ID: 9, SessionName: "agents", AtPrompt: true, UserVars: map[string]string{"AGENT_RESUME": "pi --session /tmp/a.jsonl"}},
+		},
+	}
+	m := sessionModel(t, client)
+
+	_, msg := press(t, m, runes('R'))
+	result, ok := msg.(sessionMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("restore: %v (%T)", result.err, msg)
+	}
+	if len(client.sent) != 1 {
+		t.Fatalf("sent %v, want one resume command", client.sent)
+	}
+	if strings.HasSuffix(client.sent[0], "\r") {
+		t.Errorf("the picker ran the agent: %q", client.sent[0])
+	}
+	if client.sent[0] != "pi --session /tmp/a.jsonl" {
+		t.Errorf("typed %q", client.sent[0])
+	}
+}
+
+func TestSessionKeyReportsFailure(t *testing.T) {
+	client := &fakeClient{actionErr: errors.New("no listening socket")}
+	m := sessionModel(t, client)
+
+	_, msg := press(t, m, runes('s'))
+	result := msg.(sessionMsg)
+	if result.err == nil {
+		t.Fatal("expected the kitty failure to come back")
+	}
+
+	done, cmd := m.Update(result)
+	final := done.(Model)
+	if final.noticeLevel != noticeErr {
+		t.Error("the notice is not marked an error")
+	}
+	if !strings.Contains(final.notice, "no listening socket") {
+		t.Errorf("notice %q lost kitty's reason", final.notice)
+	}
+	if cmd == nil {
+		t.Fatal("an error notice still needs a tick to clear it")
+	}
+}
+
+// A notice is temporary. Its tick clears the notice it belongs to and no other,
+// so a second action before the first tick keeps its own message.
+func TestNoticeExpiry(t *testing.T) {
+	m := sampleModel()
+
+	shown, _ := m.Update(sessionMsg{summary: "saved 3 tabs"})
+	first := shown.(Model)
+	if first.notice == "" {
+		t.Fatal("no notice after a result")
+	}
+
+	cleared, _ := first.Update(noticeExpiredMsg{id: first.noticeID})
+	if got := cleared.(Model); got.notice != "" {
+		t.Errorf("the tick did not clear the notice: %q", got.notice)
+	}
+
+	replaced, _ := first.Update(sessionMsg{summary: "restored 3 tabs"})
+	second := replaced.(Model)
+	stale, _ := second.Update(noticeExpiredMsg{id: first.noticeID})
+	if got := stale.(Model); got.notice != "restored 3 tabs" {
+		t.Errorf("an old tick cleared a newer notice: %q", got.notice)
+	}
+}
+
+// A snapshot in flight must not stop the list refreshing, and must not queue a
+// second one behind it.
+func TestSessionDoesNotBlockTheReloadLoop(t *testing.T) {
+	client := &fakeClient{}
+	m := sessionModel(t, client)
+	busy, _ := m.handleKey(runes('s'))
+	model := busy.(Model)
+
+	ticked, cmd := model.Update(tickMsg(time.Now()))
+	if cmd == nil {
+		t.Fatal("the reload tick stopped while a snapshot was running")
+	}
+	if !ticked.(Model).loading {
+		t.Error("the tick did not start a reload")
+	}
+
+	// A second press while busy is dropped, never queued.
+	before := len(client.actions)
+	again, cmd2 := model.handleKey(runes('s'))
+	if cmd2 != nil {
+		t.Error("a second press started another snapshot")
+	}
+	if !again.(Model).sessionBusy {
+		t.Error("the busy flag was lost")
+	}
+	if len(client.actions) != before {
+		t.Errorf("actions grew to %v", client.actions)
+	}
+}
+
+// The footer has to name the two keys, or nobody finds them.
+func TestHintsNameTheSessionKeys(t *testing.T) {
+	m := sampleModel()
+	m.width, m.height = 160, 40
+	hints := m.renderHints(m.width)
+	for _, want := range []string{"s save", "R restore"} {
+		if !strings.Contains(ansi.Strip(hints), want) {
+			t.Errorf("the footer does not mention %q: %s", want, ansi.Strip(hints))
+		}
+	}
+}
+
+// A restore that passed its readiness deadline types fewer commands than the
+// snapshot holds and returns no error. Green with no denominator would read as
+// a complete restore.
+func TestPartialRestoreNoticeIsNotASuccess(t *testing.T) {
+	m := sampleModel()
+
+	shown, _ := m.Update(sessionMsg{summary: "restored 11 tabs, typed 3 of 7 resume commands", short: true})
+	partial := shown.(Model)
+	if partial.noticeLevel != noticeShort {
+		t.Errorf("notice level %d, want the shortfall level", partial.noticeLevel)
+	}
+	if !strings.Contains(partial.notice, "3 of 7") {
+		t.Errorf("notice %q drops the denominator", partial.notice)
+	}
+
+	full, _ := m.Update(sessionMsg{summary: "restored 11 tabs, typed 7 of 7 resume commands"})
+	if got := full.(Model).noticeLevel; got != noticeOK {
+		t.Errorf("a complete restore got level %d", got)
+	}
+}
+
+// The footer names which key is running. "R" restores a snapshot; "s" makes
+// one.
+func TestSessionHintNamesTheOperation(t *testing.T) {
+	cases := []struct {
+		key  tea.KeyMsg
+		want string
+	}{
+		{key: runes('s'), want: "saving"},
+		{key: runes('R'), want: "restoring"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			m := sessionModel(t, &fakeClient{})
+			started, _ := m.handleKey(tc.key)
+			for _, tier := range started.(Model).hintTiers() {
+				if !strings.Contains(tier, tc.want) {
+					t.Errorf("hint %q does not say %q", tier, tc.want)
+				}
+			}
+		})
 	}
 }

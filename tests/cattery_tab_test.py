@@ -1,8 +1,8 @@
-"""Unit tests for kitty/cattery_tab.py, the tab-bar glyph module.
+"""Unit tests for kitty/cattery_tab.py, the tab-bar marker module.
 
-`agent_prefix` imports `get_boss` from kitty at call time, so the stub is
-installed before every test rather than once at import: the watcher tests
-replace the same `kitty.fast_data_types` module.
+`agent_prefix` imports `get_boss` from kitty at call time, so the stub goes in
+before every test instead of once at import. The watcher tests replace the same
+`kitty.fast_data_types` module.
 
 Run with `make test-python`.
 """
@@ -39,7 +39,7 @@ class FakeWindow:
 
 
 class FakeFg:
-    """Stand-in for kitty's color accessor: returns a marker per color name."""
+    """Stand-in for kitty's colour accessor. It returns one tag per name."""
 
     tab = "<tab>"
     red = "<red>"
@@ -72,7 +72,7 @@ class AgentPrefixTest(unittest.TestCase):
             ("working", [FakeWindow(1, "working", str(now))], "<yellow>● <tab>"),
             ("blocked wins over working", [FakeWindow(1, "working"), FakeWindow(2, "blocked")], "<red>◆ <tab>"),
             ("done wins over working", [FakeWindow(1, "working"), FakeWindow(2, "done")], "<green>● <tab>"),
-            # Only a live agent shows minutes; a finished one is the picker's job.
+            # Only a live agent shows minutes. The picker times a finished one.
             ("working carries elapsed minutes", [FakeWindow(1, "working", str(now - 185))], "<yellow>● 3m <tab>"),
             ("done carries no elapsed", [FakeWindow(1, "done", str(now - 185))], "<green>● <tab>"),
             ("under a minute stays bare", [FakeWindow(1, "blocked", str(now - 5))], "<red>◆ <tab>"),

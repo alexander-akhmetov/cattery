@@ -15,17 +15,22 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
+	"github.com/alexander-akhmetov/cattery/internal/session"
 	"github.com/alexander-akhmetov/cattery/internal/setup"
 )
 
 // filters are the status tabs, in cycle order for the "f" key.
 var filters = []string{"all", "working", "blocked", "done", "idle"}
 
-// KittyClient is the part of kitty remote control the picker needs. It is an
-// interface so the model can be tested without a live kitty instance.
+// KittyClient is the part of kitty remote control the picker needs. An
+// interface, so a test can drive the model without a live kitty instance.
+//
+// It embeds session.Client because "s" and "R" snapshot and restore the tab
+// tree from inside the picker.
 type KittyClient interface {
 	ListAgents(context.Context) ([]kitty.Agent, error)
 	FocusWindow(context.Context, int) error
+	session.Client
 }
 
 type (
@@ -41,13 +46,45 @@ type (
 	staleMsg struct{ stale bool }
 	tickMsg  time.Time
 	spinMsg  struct{}
+
+	// sessionMsg is the result of a save or a restore started from the picker.
+	// A restore that typed fewer commands than the snapshot holds sets short,
+	// because that shortfall carries no error.
+	sessionMsg struct {
+		summary string
+		short   bool
+		err     error
+	}
+	// noticeExpiredMsg clears only the notice it was scheduled for. A second
+	// action before the first tick arrives keeps its own message.
+	noticeExpiredMsg struct{ id uint64 }
 )
 
-// spinInterval drives the braille activity spinner on working agents. It is
-// faster than the data reload so the animation stays smooth without re-running
+// noticeLife is how long a save or restore result stays on screen: long enough
+// to read a path, short enough to look temporary.
+const noticeLife = 4 * time.Second
+
+// saveTimeout and restoreTimeout bound a save or a restore started from the
+// picker. Restore waits for restored windows to draw a prompt, so it gets more
+// time.
+const (
+	saveTimeout    = 15 * time.Second
+	restoreTimeout = 60 * time.Second
+)
+
+// noticeLevel decides how a save or restore result is coloured.
+type noticeLevel int
+
+const (
+	noticeOK noticeLevel = iota
+	noticeShort
+	noticeErr
+)
+
+// spinInterval drives the braille activity spinner on working agents. It runs
+// faster than the data reload, so the animation stays smooth without re-running
 // `kitten @ ls` and git on every frame. The tick runs only while an agent is
-// working: with nothing to animate it would redraw the whole view nine times a
-// second to produce the same frame.
+// working, or it would redraw the same frame nine times a second.
 const spinInterval = 110 * time.Millisecond
 
 // Model is the Bubble Tea model for the picker.
@@ -68,9 +105,20 @@ type Model struct {
 	focusCancel      context.CancelFunc
 
 	// staleAssets is set when the installed kitty files no longer match the
-	// copies this binary carries, which means the user upgraded the binary and
-	// has not re-run setup.
+	// copies this binary carries, which means the binary was upgraded and setup
+	// has not run since.
 	staleAssets bool
+
+	// notice reports what "s" or "R" just did. It clears itself on a tick, so
+	// the result does not sit above the list for the rest of the session.
+	notice      string
+	noticeLevel noticeLevel
+	noticeID    uint64
+
+	// sessionBusy is a save or restore in flight. s and R do nothing until it
+	// finishes, and sessionVerb is what the footer calls it meanwhile.
+	sessionBusy bool
+	sessionVerb string
 
 	width    int
 	height   int
@@ -105,8 +153,8 @@ func (m Model) Init() tea.Cmd {
 }
 
 // checkAssets compares the installed kitty files with the copies embedded in
-// this binary, once. It is a command rather than part of New so the constructor
-// does no file I/O.
+// this binary, once. A command rather than part of New, so the constructor does
+// no file I/O.
 func checkAssets() tea.Cmd {
 	return func() tea.Msg {
 		dir, err := setup.KittyDir()
@@ -142,6 +190,50 @@ func focusCmd(ctx context.Context, client KittyClient, id int) tea.Cmd {
 	return func() tea.Msg {
 		return focusMsg{err: client.FocusWindow(ctx, id)}
 	}
+}
+
+// saveCmd snapshots the tab tree to the default snapshot path. The key is a
+// shortcut; `cattery save <path>` is how to name a path.
+func saveCmd(client KittyClient) tea.Cmd {
+	return func() tea.Msg {
+		path, err := session.DefaultPath()
+		if err != nil {
+			return sessionMsg{err: err}
+		}
+		if err := session.EnsureDir(path); err != nil {
+			return sessionMsg{err: err}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), saveTimeout)
+		defer cancel()
+		stats, err := session.Save(ctx, client, path)
+		if err != nil {
+			return sessionMsg{err: err}
+		}
+		return sessionMsg{summary: stats.Saved(path)}
+	}
+}
+
+// restoreCmd puts the default snapshot back. It never runs the resumed agents,
+// because one keypress in the picker is easy to hit by accident.
+// `cattery restore -run` is how to ask for that on purpose.
+func restoreCmd(client KittyClient) tea.Cmd {
+	return func() tea.Msg {
+		path, err := session.DefaultPath()
+		if err != nil {
+			return sessionMsg{err: err}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), restoreTimeout)
+		defer cancel()
+		stats, err := session.Restore(ctx, client, path, false)
+		if err != nil {
+			return sessionMsg{err: err}
+		}
+		return sessionMsg{summary: stats.Restored(false), short: stats.Incomplete()}
+	}
+}
+
+func expireNotice(id uint64) tea.Cmd {
+	return tea.Tick(noticeLife, func(time.Time) tea.Msg { return noticeExpiredMsg{id: id} })
 }
 
 // Update handles messages and key input.
@@ -191,6 +283,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case staleMsg:
 		m.staleAssets = msg.stale
 		return m, nil
+	case sessionMsg:
+		m.sessionBusy = false
+		m.noticeID++
+		switch {
+		case msg.err != nil:
+			m.notice, m.noticeLevel = oneLine(msg.err.Error()), noticeErr
+		case msg.short:
+			m.notice, m.noticeLevel = msg.summary, noticeShort
+		default:
+			m.notice, m.noticeLevel = msg.summary, noticeOK
+		}
+		return m, expireNotice(m.noticeID)
+	case noticeExpiredMsg:
+		// A newer notice replaced this one and owns its own tick.
+		if msg.id == m.noticeID {
+			m.notice = ""
+			m.noticeLevel = noticeOK
+		}
+		return m, nil
 	case focusMsg:
 		m.cancelFocus()
 		m.focusing = false
@@ -230,7 +341,7 @@ func (m Model) searchFieldWidth(inner int) int {
 }
 
 // searchMatchText is the count shown beside the query. Matches are counted
-// inside the active filter, so the scope is named whenever it is not "all".
+// inside the active filter, so the text names that filter unless it is "all".
 func (m Model) searchMatchText() string {
 	if strings.TrimSpace(m.search.Value()) == "" {
 		return ""
@@ -247,14 +358,14 @@ func (m Model) searchMatchText() string {
 }
 
 // searchActive reports whether the search field belongs on screen: while the
-// user is typing, and for as long as a query keeps narrowing the list.
+// user types, and for as long as a query keeps narrowing the list.
 func (m Model) searchActive() bool {
 	return m.searching || strings.TrimSpace(m.search.Value()) != ""
 }
 
 // selectedID is the kitty window under the cursor, or 0 when nothing is
-// visible. It identifies the selection across filter, search, and inventory
-// changes, where the row index alone does not.
+// visible. The window id survives filter, search, and inventory changes; a row
+// index does not.
 func (m Model) selectedID() int {
 	vis := m.visible()
 	if m.selected < 0 || m.selected >= len(vis) {
@@ -278,10 +389,10 @@ func (m *Model) replaceAgents(agents []kitty.Agent) {
 	m.clampSelection()
 }
 
-// handleKey dispatches a key press. While a focus command is in flight only the
-// close keys act; every other key waits for the result. With no focus in flight,
-// a stale jump error is dropped as soon as the selection moves, so "press enter
-// to retry" always names the agent the cursor is on.
+// handleKey dispatches a key press. While a focus command is in flight, only
+// the close keys act and every other key waits for the result. Moving the
+// selection drops a stale jump error, so "press enter to retry" always names
+// the agent under the cursor.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.focusing {
 		switch msg.String() {
@@ -358,6 +469,12 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		return m.focusSelected()
+	case "s":
+		return m.startSession("saving", saveCmd(m.client))
+	case "R":
+		// Shift-only, because it creates tabs. Lowercase "r" sits close to the
+		// movement keys and is easy to hit by accident.
+		return m.startSession("restoring", restoreCmd(m.client))
 	}
 
 	if len(msg.Runes) == 1 && msg.Runes[0] >= '1' && msg.Runes[0] <= '9' {
@@ -366,6 +483,18 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// startSession runs a snapshot command unless one is already running, and names
+// it for the footer. It leaves the reload loop alone, so the list keeps
+// refreshing while kitty works.
+func (m Model) startSession(verb string, cmd tea.Cmd) (Model, tea.Cmd) {
+	if m.sessionBusy {
+		return m, nil
+	}
+	m.sessionBusy = true
+	m.sessionVerb = verb
+	return m, cmd
 }
 
 func (m Model) focusSelected() (Model, tea.Cmd) {
@@ -451,8 +580,8 @@ func matches(a kitty.Agent, q string) bool {
 	return strings.Contains(hay, q)
 }
 
-// groupLabel names a project group. An agent in a directory git knows nothing
-// about is grouped by that folder, so only a window with no cwd has no label.
+// groupLabel names a project group. An agent in a directory outside git is
+// grouped by that folder, so only a window with no cwd has no label.
 func groupLabel(a kitty.Agent) string {
 	if a.Project != "" {
 		return a.Project
@@ -460,10 +589,10 @@ func groupLabel(a kitty.Agent) string {
 	return "unknown"
 }
 
-// rowLabel identifies an agent inside its project group, where the heading
-// already names the project. The branch does that in a normal checkout and in
-// most worktrees. A detached HEAD has no branch, so the row falls back to the
-// worktree directory, which is what separates it from its siblings.
+// rowLabel identifies an agent inside its project group, whose heading already
+// names the project. The branch does that for a normal checkout and for most
+// worktrees. A detached HEAD has no branch, so the row falls back to the
+// worktree directory, which still separates it from its siblings.
 func rowLabel(a kitty.Agent) string {
 	if a.Branch != "" {
 		return a.Branch
@@ -474,8 +603,8 @@ func rowLabel(a kitty.Agent) string {
 	return agentName(a)
 }
 
-// agentName is the agent's full identity, for rows with no project heading above
-// them: the cwd basename, or the title when cwd is empty.
+// agentName is the agent's full identity, for a row with no project heading
+// above it: the cwd basename, or the title when cwd is empty.
 func agentName(a kitty.Agent) string {
 	if a.CWD != "" {
 		return filepath.Base(a.CWD)
@@ -497,8 +626,8 @@ func sameProject(a, b kitty.Agent) bool {
 	return a.ProjectKey == b.ProjectKey && a.Project == b.Project
 }
 
-// counts is the number of agents per status, plus "all". The keys are the
-// filter names, so the status tabs and the footer index it directly.
+// counts is the number of agents per status, plus "all". The keys are filter
+// names, so the status tabs and the footer index it directly.
 func (m Model) counts() map[string]int {
 	c := map[string]int{"all": len(m.agents)}
 	for _, a := range m.agents {

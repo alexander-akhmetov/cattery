@@ -1,6 +1,10 @@
 # cattery
 
-Coding agents overlay for [Kitty](https://sw.kovidgoyal.net/kitty/).
+Coding agents management overlay for [Kitty](https://sw.kovidgoyal.net/kitty/).
+
+Coding agents run for minutes in windows you are not watching. Cattery marks
+each tab with what its agent is doing, notifies you when one needs an answer,
+and lists them all in a picker.
 
 ## Install
 
@@ -9,4 +13,27 @@ go install github.com/alexander-akhmetov/cattery/cmd/cattery@latest
 cattery setup
 ```
 
-Then restart Kitty and your coding agents. Press `opt+a` two times to open agents overlay.
+Reload kitty afterwards. Press `opt+a` twice to open the picker.
+
+## Tab markers
+
+| Display state | Marker | Meaning |
+|---|---:|---|
+| `blocked` | red `◆` | the agent needs input |
+| `done` | green `●` | the agent finished while you were elsewhere |
+| `working` | yellow `●` | the agent is running |
+| `idle` | none | nothing to report |
+
+A `working` or `blocked` tab also shows elapsed minutes. An OS window holding a
+`blocked` or `done` agent gets a `(N need you)` title prefix, which the Dock and
+the ⌘-Tab switcher pick up. A notification fires on entry to `blocked` or
+`done`, unless that window has focus.
+
+No agent writes `done`. The watcher derives it when the agent goes idle after
+working and you have not focused the window since. Focusing the window marks it
+seen and drops the marker.
+
+## Overlay
+
+`opt+a` `opt+a` opens the management overlay. It lists all running agents, grouped 
+by git repository.

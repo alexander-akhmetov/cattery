@@ -29,9 +29,9 @@ type hookEntry struct {
 }
 
 // object is a JSON object that remembers the order its keys arrived in, and
-// keeps every value it does not need as raw bytes. Claude's settings.json is
-// the user's file: a merge that reshuffled its keys, or rewrote the text of a
-// command it never touched, would make the diff unreadable.
+// keeps every value it does not need as raw bytes. Claude's settings.json
+// belongs to the user. A merge that reshuffled its keys, or rewrote a command
+// it never touched, would make the diff unreadable.
 type object struct {
 	keys   []string
 	values map[string]json.RawMessage
@@ -100,8 +100,8 @@ func (o *object) set(key string, value json.RawMessage) {
 }
 
 // child decodes one nested object, returning an empty one when the key is
-// absent. A key holding something that is not an object is an error: replacing
-// it would throw the user's value away.
+// absent. A key holding anything other than an object is an error, because
+// replacing it would throw the user's value away.
 func (o object) child(key string) (object, error) {
 	raw, ok := o.values[key]
 	if !ok {
@@ -115,10 +115,10 @@ func (o object) child(key string) (object, error) {
 }
 
 // mergeClaudeHooks adds cattery's four hooks to Claude's settings and returns
-// the whole file. Existing entries stay: the arrays under hooks.<Event> hold
-// unrelated tools too, so the merge appends rather than replaces, and it
-// rewrites only the one command cattery already owns, so a re-run updates the
-// binary path instead of adding a second copy.
+// the whole file. Existing entries stay, because the arrays under hooks.<Event>
+// hold other tools' commands. The merge appends, and it rewrites only the
+// command cattery already owns, so a re-run updates the binary path instead of
+// adding a second copy.
 func mergeClaudeHooks(settings []byte, binary string) ([]byte, error) {
 	root := object{}
 	if len(bytes.TrimSpace(settings)) > 0 {
@@ -144,7 +144,7 @@ func mergeClaudeHooks(settings []byte, binary string) ([]byte, error) {
 			return nil, fmt.Errorf("hooks.%s: %w", h.Event, err)
 		}
 		if !updated {
-			// A struct, not a map: a map's keys are sorted, which would write
+			// A struct, because a map's keys are sorted. That would write
 			// "command" before "type" and read as a different shape from every
 			// hook already in the file.
 			group, err := encode(struct {
@@ -179,11 +179,10 @@ func mergeClaudeHooks(settings []byte, binary string) ([]byte, error) {
 }
 
 // encode is json.Marshal with HTML escaping off. Marshal rewrites <, > and & as
-// their \u escapes, even inside a value it was handed to copy, which would
-// change the text of a command cattery never touched: `make fmt && make lint`
-// and `2>/dev/null` would come back as something the user did not type. Every
-// step of the merge goes through this, because the escaping happens wherever a
-// raw value is copied, not only at the end.
+// \u escapes, even inside a value handed to it for copying, so
+// `make fmt && make lint` and `2>/dev/null` would come back as something the
+// user did not type. Every step of the merge goes through this, because the
+// escaping happens wherever a raw value is copied.
 func encode(v any) (json.RawMessage, error) {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
@@ -195,9 +194,9 @@ func encode(v any) (json.RawMessage, error) {
 }
 
 // updateCatteryHook points the hook cattery already owns at the current binary,
-// and reports whether it found one. Only that one command string changes: the
-// group around it is the user's, holding a matcher and other tools' commands,
-// and replacing the whole group would delete them.
+// and reports whether it found one. Only that command string changes. The group
+// around it belongs to the user and holds a matcher and other tools' commands,
+// which replacing the group would delete.
 func updateCatteryHook(groups []json.RawMessage, state, command string) (bool, error) {
 	encoded, err := encode(command)
 	if err != nil {
@@ -244,9 +243,9 @@ func updateCatteryHook(groups []json.RawMessage, state, command string) (bool, e
 
 // catteryCommand reports whether a hook command is one cattery wrote for the
 // given state: the current `<binary> state <x>` form, or the `cattery-state <x>`
-// an older install has. It reads the end of the command instead of looking for
-// "cattery" anywhere in it, because a hook like
-// `cd ~/projects/cattery && make lint` is not cattery's to rewrite.
+// of an older install. It reads the end of the command instead of searching for
+// "cattery" anywhere in it, or it would rewrite a hook like
+// `cd ~/projects/cattery && make lint`.
 func catteryCommand(command, state string) bool {
 	fields := strings.Fields(command)
 	if len(fields) < 2 || fields[len(fields)-1] != state {
@@ -258,8 +257,8 @@ func catteryCommand(command, state string) bool {
 	return len(fields) > 2 && binaryName(fields[len(fields)-3]) == "cattery"
 }
 
-// binaryName is the command a hook field names, without its directory or the
-// quotes shellQuote puts around a path holding a space.
+// binaryName is the command a hook field names, without its directory and
+// without the quotes shellQuote puts around a path holding a space.
 func binaryName(field string) string {
 	return filepath.Base(strings.Trim(field, `'"`))
 }

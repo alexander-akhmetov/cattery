@@ -2,15 +2,15 @@
 
 kitty loads `tab_bar.py` with `runpy.run_path`, which does not extend
 `sys.path`, so the file adds its own directory before importing `cattery_tab`.
-Both outcomes of that import have to leave a working `draw_title`: an
-ImportError raised at module scope runs before `draw_title` is defined and
-disables the whole tab bar, not only the agent glyph.
+Both outcomes of that import have to leave a working `draw_title`. An
+ImportError at module scope runs before `draw_title` is defined and disables the
+whole tab bar.
 
-Each case copies `tab_bar.py` into a temporary directory and loads it from
-there, because that is what decides whether `cattery_tab` is importable: the
-copy that sits beside `cattery_tab.py` finds it, and the copy that sits alone
-does not. `sys.modules` and `sys.path` are restored after every load, so a
-successful import in one case cannot satisfy the next one from cache.
+Each case copies `tab_bar.py` into a temporary directory and loads it there,
+because the directory decides whether `cattery_tab` is importable: the copy
+beside `cattery_tab.py` finds it, and the copy alone does not. `sys.modules` and
+`sys.path` are restored after every load, so a successful import in one case
+cannot satisfy the next one from cache.
 
 Run with `make test-python`.
 """
@@ -39,7 +39,7 @@ class FakeFmt:
 
 class TabBarTest(unittest.TestCase):
     def load(self, *names):
-        """Copy the named kitty files into a fresh directory and load tab_bar.py."""
+        """Copy the named kitty files into a fresh directory, load tab_bar.py."""
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory)
         for name in ("tab_bar.py",) + names:
@@ -64,7 +64,7 @@ class TabBarTest(unittest.TestCase):
         module = self.load("cattery_tab.py")
         self.assertEqual(module.agent_prefix.__module__, "cattery_tab")
         self.assertTrue(callable(module.draw_title))
-        # No AGENT_DISPLAY on this tab, so the glyph is empty and the title
+        # No AGENT_DISPLAY on this tab, so the marker is empty and the title
         # renders as it would without cattery.
         self.assertEqual(module.draw_title({"fmt": None, "title": "zsh", "index": 1}), " 1: zsh")
 

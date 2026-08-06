@@ -1,11 +1,10 @@
-// Package setup installs cattery: it writes the embedded kitty files into the
+// Package setup installs cattery. It writes the embedded kitty files into the
 // kitty config directory, keeps a marked block in kitty.conf, and offers to
 // wire up Claude Code and pi. It backs `cattery setup`.
 //
-// Installed kitty files are copies, not symlinks into a checkout, so an install
-// does not depend on where the source lives. The cost is that a copy does not
-// follow a binary upgrade, so the picker compares the two and says when they
-// have drifted apart.
+// The installed kitty files are copies, so an install does not depend on where
+// the source lives. A copy does not follow a binary upgrade, so the picker
+// compares the two and warns.
 package setup
 
 import (
@@ -22,17 +21,17 @@ import (
 	"github.com/alexander-akhmetov/cattery"
 )
 
-// piPackage is the cattery pi package. pi fetches it from git, so nothing here
+// piPackage is the cattery pi package. pi fetches it from git, so setup never
 // parses pi's settings file.
 const piPackage = "git:github.com/alexander-akhmetov/cattery"
 
-// assetMode is what the installed kitty files get: readable by kitty, writable
-// only by their owner. None of them is executed.
+// assetMode makes the installed kitty files readable by kitty and writable only
+// by their owner. None of them is executed.
 const assetMode fs.FileMode = 0o644
 
-// preserveMode tells writeFile to keep the mode a file already has, which is
-// what kitty.conf and Claude's settings.json need: they are the user's files
-// and setup only edits part of them.
+// preserveMode tells writeFile to keep the mode a file already has. kitty.conf
+// and Claude's settings.json belong to the user, and setup edits only part of
+// them.
 const preserveMode fs.FileMode = 0
 
 // Options configures one `cattery setup` run.
@@ -41,8 +40,8 @@ type Options struct {
 	// $KITTY_CONFIG_DIRECTORY, then ~/.config/kitty.
 	KittyDir string
 
-	// DryRun reports every action and changes nothing: no file is written, no
-	// backup is made, and no external command runs.
+	// DryRun reports every action and changes nothing. It writes no file, makes
+	// no backup, and runs no external command.
 	DryRun bool
 
 	// Yes answers the Claude and pi questions without asking.
@@ -61,15 +60,15 @@ type Options struct {
 	LegacyPaths []string
 
 	// In is the reader the yes/no questions are answered on. Nil means nobody
-	// is there to answer, which is how a non-terminal stdin arrives here, and
-	// the agent steps are skipped unless Yes is set.
+	// is there to answer, which is how a non-terminal stdin arrives. The agent
+	// steps are then skipped unless Yes is set.
 	In io.Reader
 
 	// Out receives the report. Nil means os.Stdout.
 	Out io.Writer
 
-	// LookPath and RunCommand find and run pi. Tests replace them to record the
-	// install command without launching anything.
+	// LookPath and RunCommand find and run pi. A test replaces them to record
+	// the install command without launching anything.
 	LookPath   func(file string) (string, error)
 	RunCommand func(name string, args ...string) error
 }
@@ -77,9 +76,9 @@ type Options struct {
 // Run installs cattery and reports what it did.
 //
 // It fails only on the kitty side, which is the install itself. The Claude and
-// pi steps belong to other tools: when one of them cannot be done, setup says
-// so, prints the command to run by hand, and still reports success for the part
-// it owns.
+// pi steps belong to other tools. When one of them cannot be done, setup says
+// so, prints the command to run by hand, and still reports success for its own
+// part.
 func Run(opts Options) error {
 	s, err := newSession(opts)
 	if err != nil {
@@ -141,7 +140,7 @@ func newSession(opts Options) (*session, error) {
 		lookPath:  opts.LookPath,
 		run:       opts.RunCommand,
 	}
-	// One reader for both questions: a fresh bufio.Reader per question would
+	// One reader for both questions. A fresh bufio.Reader per question would
 	// buffer past the first answer and swallow the second.
 	if opts.In != nil {
 		s.answers = bufio.NewReader(opts.In)
@@ -184,16 +183,13 @@ func KittyDir() (string, error) {
 }
 
 // Stale reports whether the kitty files installed in dir have fallen behind the
-// copies embedded in this binary, which happens when an upgrade changes one of
-// them and setup has not run since. A symlink into a checkout followed a
-// `git pull` on its own; a copy does not, so something has to say when the two
-// have drifted apart.
+// copies embedded in this binary. That happens when an upgrade changes one of
+// them and setup has not run since.
 //
-// A directory holding none of the files is not stale: cattery may simply not be
-// installed there, and warning about a file the user never asked for names a
-// fix they do not need. A directory holding some of them is: an install that
-// predates a file the binary now ships is exactly the case this catches. A file
-// that cannot be read counts as missing.
+// A directory holding none of the files is not stale: cattery may not be
+// installed there at all. A directory holding some of them is stale, which
+// catches an install predating a file the binary now ships. A file that cannot
+// be read counts as missing.
 func Stale(dir string) bool {
 	assets := cattery.KittyFiles()
 	installed, missing := 0, 0
@@ -249,9 +245,9 @@ func (s *session) kitty() error {
 	return s.kittyConf()
 }
 
-// install writes one embedded file as a regular file, replacing a symlink
-// rather than following it: the shell installer left symlinks into a checkout,
-// and writing through one would edit the checkout instead of the install.
+// install writes one embedded file as a regular file. It replaces a symlink
+// instead of following it: the shell installer left links into a checkout, and
+// writing through one would edit the checkout.
 func (s *session) install(path string, content []byte) error {
 	info, err := os.Lstat(path)
 	if err == nil && info.Mode()&fs.ModeSymlink != 0 {
@@ -274,8 +270,8 @@ func (s *session) install(path string, content []byte) error {
 	return writeFile(path, content, assetMode)
 }
 
-// tabBar handles kitty's tab title renderer. An existing one is the user's, and
-// editing somebody else's Python is worse than printing the changes it needs.
+// tabBar handles kitty's tab title renderer. An existing one belongs to the
+// user, so setup prints the changes it needs instead of editing it.
 func (s *session) tabBar(assets fs.FS) error {
 	path := filepath.Join(s.kittyDir, cattery.TabBarFile)
 	existing, err := os.ReadFile(path)
@@ -298,11 +294,11 @@ func (s *session) tabBar(assets fs.FS) error {
 	}
 }
 
-// tabBarInstructions is what an existing tab_bar.py needs to draw the glyph.
+// tabBarInstructions is what an existing tab_bar.py needs to draw the marker.
 // kitty loads that file with runpy.run_path, which does not extend sys.path, so
-// it has to add its own directory first, and the import has to be guarded: an
+// the file has to add its own directory first and guard the import. An
 // ImportError at module scope runs before draw_title is defined and disables
-// the whole tab bar, not only the glyph.
+// the whole tab bar.
 const tabBarInstructions = `    import os
     import sys
 
@@ -327,9 +323,9 @@ func (s *session) kittyConf() error {
 	target := resolveLink(path)
 	switch {
 	case mergeErr != nil:
-		// Markers that do not pair up are reported, not repaired: fixing them
-		// means deciding which half of the file the user meant to keep. The
-		// install still stands, so this is a report rather than a failure.
+		// Markers that do not pair up are reported and left alone. Repairing
+		// them means deciding which half of the file the user meant to keep. The
+		// install still stands, so this is a report and not a failure.
 		s.out.plain("kept", shorten(path)+": "+mergeErr.Error())
 		s.out.block(block)
 	case merged == string(current):
@@ -373,7 +369,7 @@ func (s *session) claude() {
 	}
 
 	// One backup, kept forever. A second run would otherwise overwrite the only
-	// copy of the settings the user had before cattery touched them.
+	// copy of the settings from before cattery.
 	backup := path + ".cattery-bak"
 	target := resolveLink(path)
 	detail := fmt.Sprintf("%s (%d hooks)", label(path, target), len(claudeHooks))
@@ -392,12 +388,11 @@ func (s *session) claude() {
 		return
 	}
 	if writeBackup {
-		// The backup goes beside the link rather than beside the file it points
-		// at, so a settings.json kept in a dotfiles checkout does not get an
-		// untracked copy dropped into that repository. Its mode comes from the
-		// file being copied, not from the backup path, which cannot exist yet:
-		// settings.json can hold an API key, and a 0644 copy of a 0600 file
-		// hands it to everyone on the machine.
+		// The backup goes beside the link, not beside the file it points at, so
+		// a settings.json in a dotfiles checkout gets no untracked copy dropped
+		// into that repository. Its mode comes from the file being copied, since
+		// the backup path does not exist yet: settings.json can hold an API key,
+		// and a 0644 copy of a 0600 file hands it to everyone on the machine.
 		if err := writeFile(backup, current, modeOf(path)); err != nil {
 			s.out.plain("failed", shorten(backup)+": "+err.Error())
 			return
@@ -441,8 +436,8 @@ func (s *session) pi() {
 	}
 }
 
-// legacyLeftovers reports what the shell installer left behind. Setup does not
-// delete them: a file it did not write is not its to remove.
+// legacyLeftovers reports what the shell installer left behind. Setup never
+// deletes them, because it did not write them.
 func (s *session) legacyLeftovers() []string {
 	var found []string
 	for _, path := range s.legacy {
@@ -467,12 +462,11 @@ func (s *session) reportLegacy() {
 
 // consent asks a yes/no question with yes as the default.
 //
-// --yes answers every question. Without a reader nobody is there to answer,
-// which is what a piped stdin means, so the step is skipped and the command to
-// run by hand is printed instead. That check comes before the dry-run one, so a
-// dry run with nobody there reports the skip a real run would take rather than a
-// "would update" it would never do. A dry run with somebody there asks nothing,
-// because it changes nothing and a question it does not act on is noise.
+// --yes answers every question. A nil reader means nobody is there, which is
+// what a piped stdin gives, so setup skips the step and prints the command to
+// run by hand. That check comes before the dry-run check, so a dry run with
+// nobody there reports the skip a real run would take. A dry run with somebody
+// there asks nothing, because it changes nothing.
 func (s *session) consent(question string) bool {
 	if s.opts.Yes {
 		return true
@@ -500,7 +494,7 @@ func (s *session) consent(question string) bool {
 // --- output and files -------------------------------------------------------
 
 // reporter prints one line per action, in the order the actions happen. A dry
-// run says "would" so no line can be read as something that happened.
+// run says "would", so no line reads as something that happened.
 type reporter struct {
 	w   io.Writer
 	dry bool
@@ -530,11 +524,11 @@ func (r *reporter) block(s string) {
 }
 
 // writeFile replaces path atomically, so an interrupted run cannot leave a
-// half-written kitty.conf or settings.json behind. The temporary file goes in
-// the same directory because a rename across filesystems fails.
+// half-written kitty.conf or settings.json behind. The temporary file shares
+// the directory, because a rename across filesystems fails.
 //
-// The rename replaces whatever path is, symlink included, so a caller with a
-// link in hand passes the file it points at: see resolveLink.
+// The rename replaces whatever path is, symlink included. A caller holding a
+// link passes the file it points at; see resolveLink.
 func writeFile(path string, content []byte, mode fs.FileMode) error {
 	if mode == preserveMode {
 		mode = modeOf(path)
@@ -566,10 +560,10 @@ func modeOf(path string) fs.FileMode {
 	return assetMode
 }
 
-// resolveLink follows a symlink to the file it points at, so an edit lands on
-// that file instead of replacing the link with a regular one. kitty.conf and
-// Claude's settings.json are often links into a dotfiles checkout: detaching
-// them would stop later edits in the checkout from reaching kitty and Claude,
+// resolveLink follows a symlink to the file it points at, so an edit reaches
+// that file instead of replacing the link with a regular file. kitty.conf and
+// Claude's settings.json are often links into a dotfiles checkout. Detaching
+// one would stop later edits in the checkout from reaching kitty and Claude,
 // while `git status` there stayed clean. A path that is not a link, and a link
 // pointing nowhere, come back unchanged.
 func resolveLink(path string) string {
@@ -584,8 +578,8 @@ func resolveLink(path string) string {
 	return resolved
 }
 
-// label names the file a write lands on. Both ends of a symlink are named,
-// because a report that said only kitty.conf would hide which file changed.
+// label names the file a write reaches. It names both ends of a symlink,
+// because a report saying only kitty.conf would hide which file changed.
 func label(path, target string) string {
 	if target == path {
 		return shorten(path)
@@ -593,7 +587,7 @@ func label(path, target string) string {
 	return shorten(path) + " -> " + shorten(target)
 }
 
-// shorten replaces the home directory with ~, so the report stays readable on a
+// shorten replaces the home directory with ~, to keep the report readable on a
 // narrow terminal.
 func shorten(path string) string {
 	home, err := os.UserHomeDir()

@@ -5,18 +5,18 @@ import (
 	"strings"
 )
 
-// The managed block's fences. Everything between them belongs to setup and is
-// replaced on every run; everything outside them is the user's. A marked block
-// is used instead of rewriting kitty.conf because it stays visible, survives a
-// re-run without duplicating itself, and leaves the rest of the file alone.
+// The managed block's fences. Setup owns everything between them and replaces
+// it on every run. Everything outside them belongs to the user. A marked block
+// stays visible, survives a re-run without duplicating itself, and leaves the
+// rest of kitty.conf alone.
 const (
 	blockStart = "# >>> cattery >>>"
 	blockEnd   = "# <<< cattery <<<"
 )
 
-// renderBlock builds the managed kitty.conf block. The picker is launched by
-// absolute path rather than through a shell script, so nothing outside the
-// binary has to be installed.
+// renderBlock builds the managed kitty.conf block. It launches the picker by
+// absolute path instead of through a shell script, so an install needs nothing
+// outside the binary.
 func renderBlock(binary string) string {
 	return strings.Join([]string{
 		blockStart,
@@ -32,13 +32,12 @@ func renderBlock(binary string) string {
 	}, "\n") + "\n"
 }
 
-// mergeBlock puts block into conf: replacing the existing managed block when
-// there is one, appending it otherwise. Every byte outside the two markers is
-// left alone.
+// mergeBlock puts block into conf. It replaces an existing managed block, or
+// appends when there is none. Every byte outside the two markers stays.
 //
 // Markers that do not pair up are reported instead of guessed at. Repairing
 // them means deciding which half of the file the user meant to keep, and
-// appending a second block would leave kitty applying two of them.
+// appending a second block would leave kitty applying two.
 func mergeBlock(conf, block string) (string, error) {
 	lines := strings.Split(conf, "\n")
 	var starts, ends []int
@@ -56,9 +55,9 @@ func mergeBlock(conf, block string) (string, error) {
 		return appendBlock(conf, block), nil
 	case len(starts) == 1 && len(ends) == 1 && starts[0] < ends[0]:
 		// The block carries its own trailing newline, and the split already ate
-		// the one that ended the marker line, so head and tail go back on either
-		// side untouched. Trimming a newline off the tail here would eat a blank
-		// line the user left below the block, one per run.
+		// the one ending the marker line, so head and tail go back untouched.
+		// Trimming a newline off the tail would eat one blank line the user left
+		// below the block, on every run.
 		head := strings.Join(lines[:starts[0]], "\n")
 		tail := strings.Join(lines[ends[0]+1:], "\n")
 		if head != "" {
@@ -81,8 +80,8 @@ func appendBlock(conf, block string) string {
 }
 
 // shellQuote makes a path safe to embed in a command line. kitty's `launch` and
-// Claude's hook command both split their string shell-style, so a path holding
-// a space or a quote has to be quoted.
+// Claude's hook command both split their string shell-style, so a path with a
+// space or a quote needs quoting.
 func shellQuote(s string) string {
 	const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:@+,="
 	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !strings.ContainsRune(safe, r) }) < 0 {
