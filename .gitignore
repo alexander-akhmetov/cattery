@@ -34,6 +34,9 @@ go.work.sum
 # Built binary
 /cattery
 
+# goreleaser output
+/dist/
+
 # Python bytecode from the watcher tests
 __pycache__/
 *.py[cod]

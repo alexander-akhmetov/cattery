@@ -8,12 +8,25 @@ and lists them all in a picker.
 
 ## Install
 
+With Homebrew:
+
+```bash
+brew tap alexander-akhmetov/cattery https://github.com/alexander-akhmetov/cattery
+brew install cattery
+cattery setup
+```
+
+Or with Go:
+
 ```bash
 go install github.com/alexander-akhmetov/cattery/cmd/cattery@latest
 cattery setup
 ```
 
 Reload kitty afterwards. Press `opt+a` twice to open the picker.
+
+`cattery setup` installs copies of the kitty files, and an upgrade of the binary
+does not update those copies. Run it again after every upgrade.
 
 ## Tab markers
 

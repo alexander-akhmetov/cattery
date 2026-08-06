@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          install-only: true
+
+      - name: Build
+        run: goreleaser build --single-target --clean --snapshot
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+
+      - name: Package binary
+        run: |
+          cd dist/cattery_*/
+          tar czf ../../cattery_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz cattery
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cattery_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: cattery_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "$REF_NAME" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..${REF_NAME}"
+          fi
+          {
+            echo 'CHANGELOG<<EOF'
+            git log --pretty=format:"- %s (%h)" --no-merges "$RANGE"
+            echo ''
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          CHANGELOG: ${{ steps.changelog.outputs.CHANGELOG }}
+        run: gh release create "$REF_NAME" artifacts/*.tar.gz --title "$REF_NAME" --notes "$CHANGELOG"
+
+  # The formula builds from the git tag, so a release is not usable through
+  # Homebrew until the tag and the revision in Formula/cattery.rb point at it.
+  update-formula:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Update Homebrew formula
+        env:
+          TAG: ${{ github.ref_name }}
+          REVISION: ${{ github.sha }}
+        # Only the quoted value changes. `brew style` aligns the values of the
+        # url hash, and a pattern that ate the padding would misalign them.
+        run: |
+          sed -i "s|\(tag: *\)\"v[^\"]*\"|\1\"${TAG}\"|" Formula/cattery.rb
+          sed -i "s|\(revision: *\)\"[^\"]*\"|\1\"${REVISION}\"|" Formula/cattery.rb
+
+      - name: Create PR
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git add Formula/cattery.rb
+          git diff --cached --quiet && exit 0
+          BRANCH="update-formula-${TAG}"
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+          git checkout -b "$BRANCH"
+          git commit -m "Update Homebrew formula to ${TAG}"
+          git push -u origin "$BRANCH"
+          if ! gh pr view "$BRANCH" &>/dev/null; then
+            gh pr create --title "Update Homebrew formula to ${TAG}" --body "Automated formula update for release ${TAG}." --base main
+          fi
+          gh pr merge --squash --delete-branch
