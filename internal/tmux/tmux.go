@@ -283,6 +283,30 @@ func (c *Client) Alive(ctx context.Context, target string) (bool, error) {
 	return false, err
 }
 
+// Capture returns what one pane is showing right now, with its colours.
+//
+// It addresses the pane id alone, as Alive does: a bare pane id is a valid tmux
+// target and survives the pane moving to another window. -e keeps the colours,
+// and -J is deliberately absent, because joining wrapped lines would reflow a
+// frame drawn for the pane's own width.
+//
+// A stopped server means the pane is gone, which is nothing to preview and not
+// a failure worth a banner.
+func (c *Client) Capture(ctx context.Context, target string) (string, error) {
+	_, _, pane, err := splitTarget(target)
+	if err != nil {
+		return "", err
+	}
+	out, err := exec.CommandContext(ctx, c.tmux, "capture-pane", "-e", "-p", "-t", pane).Output()
+	if err != nil {
+		if noServer(err) {
+			return "", nil
+		}
+		return "", commandError(err)
+	}
+	return string(out), nil
+}
+
 // Attach opens a read-only view of the window named by target
 // ("<session>:<window index>.<pane id>") and returns when the viewer detaches.
 //

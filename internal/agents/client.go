@@ -26,12 +26,14 @@ type KittyClient interface {
 	FocusWindow(ctx context.Context, id int) error
 	Windows(ctx context.Context) ([]kitty.Window, error)
 	Launch(ctx context.Context, args []string) error
+	Text(ctx context.Context, id int) (string, error)
 }
 
 // TmuxClient is the tmux half.
 type TmuxClient interface {
 	ListAgents(ctx context.Context) ([]agent.Agent, error)
 	Alive(ctx context.Context, target string) (bool, error)
+	Capture(ctx context.Context, target string) (string, error)
 }
 
 // Client lists and reaches agents in every host.
@@ -132,6 +134,19 @@ func (c *Client) Focus(ctx context.Context, a agent.Agent) error {
 		return fmt.Errorf("tmux pane %s is gone", a.Target)
 	}
 	return c.kitty.Launch(ctx, viewerArgs(c.exe, a.Target))
+}
+
+// Preview returns the screen one agent is showing, for the picker's sidebar.
+// It reads and changes nothing: unlike Focus, it leaves the user where they
+// are, and it reaches an unfocused window and a detached pane alike.
+func (c *Client) Preview(ctx context.Context, a agent.Agent) (string, error) {
+	if a.Host != agent.HostTmux {
+		return c.kitty.Text(ctx, a.ID)
+	}
+	if a.Target == "" {
+		return "", fmt.Errorf("tmux agent %d has no pane to read", a.ID)
+	}
+	return c.tmux.Capture(ctx, a.Target)
 }
 
 // viewerArgs is the kitty tab that shows one tmux agent. The title says the

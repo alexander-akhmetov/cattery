@@ -75,6 +75,14 @@ const (
 	// footer's selected-agent summary, leaving the list every row it can.
 	minRoomyHeight = 12
 
+	// The preview sidebar's geometry. The list keeps enough for a row's indent
+	// and a full-length name; the sidebar needs enough that an agent's screen is
+	// worth reading. previewGutter is " │ ", the rule between the two columns.
+	minListWidth    = 44
+	minPreviewWidth = 40
+	previewGutter   = 3
+	previewShare    = 45 // percent of the inner width the sidebar asks for
+
 	// What Enter does, per host. A kitty window is focused; a tmux pane opens a
 	// read-only view, and the hint says so before the user presses it.
 	jumpHint   = "\u23ce jump"
@@ -384,14 +392,7 @@ func (m Model) View() string {
 	if m.quitting {
 		return ""
 	}
-	width := m.width
-	if width <= 0 {
-		width = 100
-	}
-	height := m.height
-	if height <= 0 {
-		height = 30
-	}
+	width, height := viewWidth(m.width), viewHeight(m.height)
 	if width < 20 || height < 7 {
 		return smallView(width, height)
 	}
@@ -406,9 +407,18 @@ func (m Model) View() string {
 	}
 
 	avail := height - len(header) - len(footer)
-	body := m.listLines(inner, avail)
+	// The sidebar splits the body horizontally and leaves the vertical
+	// geometry alone, so the list keeps every line it had.
+	listInner, sideInner, sidebar := inner, 0, false
+	if m.previewOpen {
+		listInner, sideInner, sidebar = previewWidths(inner)
+	}
+	body := m.listLines(listInner, avail)
 	if len(body) > avail {
 		body = body[:avail]
+	}
+	if sidebar {
+		body = m.joinPreview(body, listInner, sideInner, avail)
 	}
 	for i, line := range body {
 		body[i] = pad.Render(line)
@@ -425,6 +435,123 @@ func (m Model) View() string {
 		lines[i] = ansi.Truncate(line, width, "")
 	}
 	return strings.Join(lines, "\n")
+}
+
+// viewWidth and viewHeight are the geometry the picker assumes before kitty has
+// reported a size.
+func viewWidth(w int) int {
+	if w <= 0 {
+		return 100
+	}
+	return w
+}
+
+func viewHeight(h int) int {
+	if h <= 0 {
+		return 30
+	}
+	return h
+}
+
+// previewWidths splits the inner width between the list and the sidebar. The
+// third result is false when the terminal cannot hold both, and then the list
+// keeps the whole width.
+func previewWidths(inner int) (list, preview int, ok bool) {
+	if inner < minListWidth+previewGutter+minPreviewWidth {
+		return inner, 0, false
+	}
+	preview = max(inner*previewShare/100, minPreviewWidth)
+	preview = min(preview, inner-previewGutter-minListWidth)
+	return inner - previewGutter - preview, preview, true
+}
+
+// previewFits reports whether a terminal this wide can hold the sidebar. The
+// key handler asks before it opens one, and the fetchers ask before they spawn
+// a process for a column nobody can see.
+func previewFits(width int) bool {
+	_, _, ok := previewWidths(viewWidth(width) - 4)
+	return ok
+}
+
+// joinPreview puts the sidebar beside the list, one line at a time.
+//
+// Each list line is padded to its own column first. A row pads itself through
+// composeLine, but the banner lines above the list are plain truncations, and
+// an unpadded one would drag the rule left on that line alone.
+func (m Model) joinPreview(body []string, listWidth, previewWidth, avail int) []string {
+	side := m.previewColumn(previewWidth, avail)
+	rule := lipgloss.NewStyle().Foreground(cBorder).Render("│")
+
+	out := make([]string, avail)
+	for i := range out {
+		line := ""
+		if i < len(body) {
+			line = body[i]
+		}
+		out[i] = padTo(line, listWidth) + " " + rule + " " + side[i]
+	}
+	return out
+}
+
+// previewColumn is the sidebar: a heading naming the agent, a rule, then the
+// last lines of its screen. It always returns exactly avail lines.
+func (m Model) previewColumn(width, avail int) []string {
+	if width < 1 || avail < 1 {
+		return nil
+	}
+	blankLine := strings.Repeat(" ", width)
+
+	a, ok := m.selectedAgent()
+	if !ok {
+		return fill(nil, blankLine, avail)
+	}
+
+	head := lipgloss.NewStyle().Foreground(cSubtext).Bold(true).Render(truncate(agentName(a), width))
+	out := []string{padTo(head, width)}
+	if avail >= 4 {
+		out = append(out, divider(width))
+	}
+	body := avail - len(out)
+	if body < 1 {
+		return out
+	}
+
+	switch {
+	case m.previewErr != nil:
+		return append(out, note(width, body, oneLine(m.previewErr.Error()), cRed)...)
+	case m.previewKey != a.Key():
+		return append(out, note(width, body, "loading…", cOverlay0)...)
+	case blank(m.previewScreen):
+		return append(out, note(width, body, "no output", cOverlay0)...)
+	}
+	return append(out, previewLines(m.previewScreen, width, body)...)
+}
+
+// note fills the sidebar with one dim line, for a state with no screen behind
+// it: a capture in flight, an agent that could not be read, an empty pane.
+func note(width, lines int, text string, colour lipgloss.Color) []string {
+	if lines < 1 {
+		return nil
+	}
+	first := padTo(lipgloss.NewStyle().Foreground(colour).Render(truncate(text, width)), width)
+	return fill([]string{first}, strings.Repeat(" ", width), lines)
+}
+
+// padTo renders s as exactly width cells, cutting or padding as needed. The
+// padding is plain, so it carries no background from whatever s ended with.
+func padTo(s string, width int) string {
+	s = ansi.Truncate(s, width, "")
+	if pad := width - ansi.StringWidth(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+func fill(lines []string, blank string, n int) []string {
+	for len(lines) < n {
+		lines = append(lines, blank)
+	}
+	return lines
 }
 
 // headerLines is the top chrome: title bar, filter tabs, the search field once
@@ -990,9 +1117,14 @@ func (m Model) hintTiers() []string {
 		// makes one.
 		return []string{m.sessionVerb + " the session snapshot…", m.sessionVerb + "…"}
 	default:
+		preview := "v preview"
+		if m.previewOpen {
+			preview = "v close preview"
+		}
 		return []string{
-			"↑↓ / j k move · 1-9 select · " + action + " · / search · f filter · s save · R restore · esc close",
-			"j k move · " + action + " · / search · f filter · s save · R restore · esc close",
+			"↑↓ / j k move · 1-9 select · " + action + " · " + preview + " · / search · f filter · s save · R restore · esc close",
+			"j k move · " + action + " · " + preview + " · / search · f filter · s save · R restore · esc close",
+			"j k move · " + action + " · " + preview + " · / search · f filter · esc close",
 			"j k move · " + action + " · / search · f filter · esc close",
 			action + " · / search · esc close",
 			"esc close",

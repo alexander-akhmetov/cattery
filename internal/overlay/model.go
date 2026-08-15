@@ -30,6 +30,11 @@ var filters = []string{"all", "working", "blocked", "done", "idle"}
 type Client interface {
 	ListAgents(context.Context) ([]agent.Agent, error)
 	Focus(context.Context, agent.Agent) error
+
+	// Preview is what one agent is showing right now, with its colours. It
+	// reaches an unfocused kitty window and a detached tmux pane alike, and
+	// leaves the user where they are.
+	Preview(context.Context, agent.Agent) (string, error)
 }
 
 type (
@@ -61,6 +66,20 @@ type (
 	// noticeExpiredMsg clears only the notice it was scheduled for. A second
 	// action before the first tick arrives keeps its own message.
 	noticeExpiredMsg struct{ id uint64 }
+
+	// previewMsg is one agent's captured screen. It carries the key as well as
+	// the generation, so a result that arrives after the cursor moved is
+	// dropped rather than shown under another agent's name.
+	previewMsg struct {
+		generation uint64
+		key        string
+		screen     string
+		err        error
+	}
+	// previewDueMsg is the debounce timer. Holding "j" repeats far faster than
+	// a subprocess round trip, so a selection change schedules this instead of
+	// spawning at once, and only the generation that is still current fetches.
+	previewDueMsg struct{ generation uint64 }
 )
 
 // noticeLife is how long a save or restore result stays on screen: long enough
@@ -74,6 +93,15 @@ const (
 	saveTimeout    = 15 * time.Second
 	restoreTimeout = 60 * time.Second
 )
+
+// previewTimeout bounds one screen capture, the budget the picker gives every
+// other interactive round trip.
+const previewTimeout = 2 * time.Second
+
+// previewDebounce is how long the cursor has to settle before the sidebar
+// fetches. A held movement key repeats around thirty times a second, and each
+// fetch is a process.
+const previewDebounce = 150 * time.Millisecond
 
 // noticeLevel decides how a save or restore result is coloured.
 type noticeLevel int
@@ -126,6 +154,15 @@ type Model struct {
 	// finishes, and sessionVerb is what the footer calls it meanwhile.
 	sessionBusy bool
 	sessionVerb string
+
+	// The preview sidebar, toggled with "v". previewKey is the agent screen
+	// belongs to, so a result for an agent the cursor has left is discarded,
+	// and previewGeneration drops a result the debounce has superseded.
+	previewOpen       bool
+	previewScreen     string
+	previewKey        string
+	previewErr        error
+	previewGeneration uint64
 
 	width    int
 	height   int
@@ -241,6 +278,74 @@ func restoreCmd(client session.Client) tea.Cmd {
 	}
 }
 
+// previewCmd captures the screen of one agent. The key travels with the result
+// so Update can tell whether the cursor is still on that agent.
+func previewCmd(client Client, generation uint64, a agent.Agent) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), previewTimeout)
+		defer cancel()
+		screen, err := client.Preview(ctx, a)
+		return previewMsg{generation: generation, key: a.Key(), screen: screen, err: err}
+	}
+}
+
+func previewDue(generation uint64) tea.Cmd {
+	return tea.Tick(previewDebounce, func(time.Time) tea.Msg {
+		return previewDueMsg{generation: generation}
+	})
+}
+
+// schedulePreview starts the debounce for whatever is under the cursor now. It
+// drops the text of the agent the cursor came from, so the sidebar never shows
+// one agent's screen under another's name.
+func (m *Model) schedulePreview() tea.Cmd {
+	if !m.previewOpen || !previewFits(m.width) {
+		return nil
+	}
+	m.previewGeneration++
+	m.previewScreen = ""
+	m.previewKey = ""
+	m.previewErr = nil
+	return previewDue(m.previewGeneration)
+}
+
+// refreshPreview asks again for the agent already on display, without clearing
+// it. The reload tick calls this, so a working agent's sidebar keeps up without
+// blinking through an empty frame every second.
+func (m *Model) refreshPreview() tea.Cmd {
+	a, ok := m.selectedAgent()
+	if !m.previewOpen || !ok || !previewFits(m.width) {
+		return nil
+	}
+	m.previewGeneration++
+	return previewCmd(m.client, m.previewGeneration, a)
+}
+
+// startPreview runs the capture a debounce timer was scheduled for, unless a
+// newer move superseded it. That move scheduled a timer of its own.
+func (m Model) startPreview(generation uint64) tea.Cmd {
+	a, ok := m.selectedAgent()
+	if generation != m.previewGeneration || !m.previewOpen || !ok {
+		return nil
+	}
+	return previewCmd(m.client, m.previewGeneration, a)
+}
+
+// applyPreview takes a captured screen, if it is still the one being waited
+// for. The cursor can move between a capture and its answer without the
+// generation catching it, so the agent is checked by name too.
+func (m Model) applyPreview(msg previewMsg) Model {
+	if msg.generation != m.previewGeneration || !m.previewOpen || msg.key != m.selectedKey() {
+		return m
+	}
+	m.previewKey = msg.key
+	m.previewErr = msg.err
+	if msg.err == nil {
+		m.previewScreen = msg.screen
+	}
+	return m
+}
+
 func expireNotice(id uint64) tea.Cmd {
 	return tea.Tick(noticeLife, func(time.Time) tea.Msg { return noticeExpiredMsg{id: id} })
 }
@@ -254,12 +359,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tickMsg:
 		m.now = time.Time(msg)
+		// The sidebar refreshes on the same tick as the list, so a working
+		// agent is watched live rather than sampled when it was opened. It does
+		// not wait on the list: a reload still in flight is no reason to leave
+		// the screen a second stale.
+		preview := m.refreshPreview()
 		if m.loading {
-			return m, tick()
+			return m, tea.Batch(preview, tick())
 		}
 		m.loading = true
 		m.reloadGeneration++
-		return m, tea.Batch(m.reload(m.reloadGeneration), tick())
+		return m, tea.Batch(m.reload(m.reloadGeneration), preview, tick())
 	case spinMsg:
 		m.spin++
 		if !m.anyWorking() {
@@ -271,16 +381,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.generation != m.reloadGeneration {
 			return m, nil
 		}
+		before := m.selectedKey()
 		m.replaceAgents(msg.agents)
 		m.resizeSearch()
 		m.loaded = true
 		m.loading = false
 		m.reloadErr = nil
+		var cmds []tea.Cmd
+		// The previewed agent can end between two reloads. Its screen goes with
+		// it, rather than sitting under whichever row took its place.
+		if m.selectedKey() != before {
+			cmds = append(cmds, m.schedulePreview())
+		}
 		if !m.spinning && m.anyWorking() {
 			m.spinning = true
-			return m, spin()
+			cmds = append(cmds, spin())
 		}
-		return m, nil
+		return m, tea.Batch(cmds...)
 	case reloadErrMsg:
 		if msg.generation != m.reloadGeneration {
 			return m, nil
@@ -310,6 +427,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice, m.noticeLevel = msg.summary, noticeOK
 		}
 		return m, expireNotice(m.noticeID)
+	case previewDueMsg:
+		return m, m.startPreview(msg.generation)
+	case previewMsg:
+		return m.applyPreview(msg), nil
 	case noticeExpiredMsg:
 		// A newer notice replaced this one and owns its own tick.
 		if msg.id == m.noticeID {
@@ -433,8 +554,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	before := m.selectedKey()
 	next, cmd := m.handleActiveKey(msg)
-	if next.focusErr != nil && next.selectedKey() != before {
+	// Every key that moves the cursor lands here, so the sidebar follows the
+	// selection from one place rather than from each movement handler.
+	if next.selectedKey() != before {
 		next.focusErr = nil
+		if preview := next.schedulePreview(); preview != nil {
+			cmd = tea.Batch(cmd, preview)
+		}
 	}
 	return next, cmd
 }
@@ -495,6 +621,8 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		return m.focusSelected()
+	case "v":
+		return m.togglePreview()
 	case "s":
 		return m.startSession("saving", saveCmd(m.snapshots))
 	case "R":
@@ -509,6 +637,28 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// togglePreview opens or closes the sidebar.
+//
+// A terminal too narrow to hold both the list and a readable column of screen
+// refuses, rather than squeezing the rows down to nothing. It reports that
+// through the notice line, where "s" and "R" report themselves.
+func (m Model) togglePreview() (Model, tea.Cmd) {
+	if m.previewOpen {
+		m.previewOpen = false
+		m.previewScreen, m.previewKey, m.previewErr = "", "", nil
+		// Strand any capture already on its way back.
+		m.previewGeneration++
+		return m, nil
+	}
+	if !previewFits(m.width) {
+		m.noticeID++
+		m.notice, m.noticeLevel = "terminal too narrow for the preview", noticeErr
+		return m, expireNotice(m.noticeID)
+	}
+	m.previewOpen = true
+	return m, m.schedulePreview()
 }
 
 // startSession runs a snapshot command unless one is already running, and names

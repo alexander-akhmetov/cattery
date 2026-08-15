@@ -26,6 +26,12 @@ type fakeClient struct {
 	focused  []string
 	focusErr error
 
+	// The preview half. previewed records the agent keys asked for, so a test
+	// can prove which agent the sidebar went after and how often.
+	previewed  []string
+	screen     string
+	previewErr error
+
 	// The session half of the interface. actionErr makes save or restore fail
 	// without a kitty. windows is what goto_session produced, so it stays empty
 	// until then and the duplicate guard sees nothing.
@@ -43,6 +49,11 @@ func (f *fakeClient) ListAgents(context.Context) ([]agent.Agent, error) {
 func (f *fakeClient) Focus(_ context.Context, a agent.Agent) error {
 	f.focused = append(f.focused, a.Key())
 	return f.focusErr
+}
+
+func (f *fakeClient) Preview(_ context.Context, a agent.Agent) (string, error) {
+	f.previewed = append(f.previewed, a.Key())
+	return f.screen, f.previewErr
 }
 
 func (f *fakeClient) Action(_ context.Context, arg string) error {
@@ -1282,6 +1293,40 @@ func TestViewFitsTerminal(t *testing.T) {
 		{name: "wide unicode", set: func(m *Model) { m.agents = wideAgents() }},
 		{name: "scrolled", set: func(m *Model) { m.agents = manyAgents(30); m.selected = 25 }},
 		{name: "stale selection", set: func(m *Model) { m.selected = 99 }},
+		{
+			// The sidebar draws a captured screen the picker did not write. It
+			// has to hold its column at every size, including the ones too
+			// narrow to open it at all.
+			name: "preview",
+			set: func(m *Model) {
+				m.previewOpen = true
+				m.previewKey = m.selectedKey()
+				m.previewScreen = "\x1b[31m" + strings.Repeat("wide ", 60) + "\n\x1b]0;title\x07\x1b[2Jhello\n界界界界"
+			},
+		},
+		{name: "preview loading", set: func(m *Model) { m.previewOpen = true }},
+		{
+			name: "preview failed",
+			set: func(m *Model) {
+				m.previewOpen = true
+				m.previewKey = m.selectedKey()
+				m.previewErr = errors.New("window 42: no matching window found for id:42")
+			},
+		},
+		{
+			name: "preview with banners",
+			set: func(m *Model) {
+				m.previewOpen = true
+				m.previewKey = m.selectedKey()
+				m.previewScreen = "hello"
+				m.focusErr = errors.New("window 42: gone")
+				m.reloadErr = errors.New("socket unavailable")
+			},
+		},
+		{
+			name: "preview of nothing selected",
+			set:  func(m *Model) { m.previewOpen = true; m.filter = "idle" },
+		},
 	}
 	for _, size := range sizes {
 		for _, v := range variants {
@@ -2027,4 +2072,276 @@ func TestHintTiersFitWithTheAttachAction(t *testing.T) {
 			t.Errorf("footer at width %d is %d cells: %q", width, got, line)
 		}
 	}
+}
+
+// previewModel is a picker wide enough for the sidebar, with the client the
+// sidebar will ask for screens.
+func previewModel(client *fakeClient) Model {
+	m := New(client, &fakeClient{})
+	m.loaded = true
+	m.loading = false
+	m.agents = []agent.Agent{
+		checkout(3, "pi", "working", "astra-l", "feat/oauth"),
+		checkout(2, "pi", "working", "dotfiles", "main"),
+	}
+	m.width, m.height = 140, 40
+	return m
+}
+
+// open presses "v" and runs whatever it scheduled, up to and including the
+// capture, so a test can assert on what the sidebar ended up with.
+func open(t *testing.T, m Model) (Model, *fakeClient) {
+	t.Helper()
+	client, ok := m.client.(*fakeClient)
+	if !ok {
+		t.Fatalf("client is %T, not a fakeClient", m.client)
+	}
+	m, msg := press(t, m, runes('v'))
+	if !m.previewOpen {
+		t.Fatal(`"v" did not open the sidebar`)
+	}
+	return drain(t, m, msg), client
+}
+
+// drain feeds a message back and follows the commands it produces, so a
+// debounce tick and the capture behind it resolve inside one test step.
+func drain(t *testing.T, m Model, msg tea.Msg) Model {
+	t.Helper()
+	for range 4 {
+		if msg == nil {
+			return m
+		}
+		updated, cmd := m.Update(msg)
+		m = updated.(Model)
+		if cmd == nil {
+			return m
+		}
+		msg = cmd()
+	}
+	t.Fatal("the preview never settled")
+	return m
+}
+
+func TestPreviewToggle(t *testing.T) {
+	t.Run("v opens the sidebar and captures the selected agent", func(t *testing.T) {
+		m, client := open(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+		if !slices.Equal(client.previewed, []string{"kitty:3"}) {
+			t.Fatalf("captured: got %v, want [kitty:3]", client.previewed)
+		}
+		out := ansi.Strip(m.View())
+		if !strings.Contains(out, "building the thing") {
+			t.Fatalf("the screen is not on display:\n%s", out)
+		}
+	})
+
+	t.Run("v again closes it and forgets the screen", func(t *testing.T) {
+		m, _ := open(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+		closed, _ := press(t, m, runes('v'))
+		if closed.previewOpen {
+			t.Fatal(`the second "v" did not close the sidebar`)
+		}
+		if closed.previewScreen != "" || closed.previewKey != "" {
+			t.Fatalf("kept %q for %q after closing", closed.previewScreen, closed.previewKey)
+		}
+		if out := ansi.Strip(closed.View()); strings.Contains(out, "building the thing") {
+			t.Fatalf("the screen survived the close:\n%s", out)
+		}
+	})
+
+	// The picker has one text field, and while it has focus every letter
+	// belongs to the query, as it does for "f", "s" and "R".
+	t.Run("v is a letter while searching", func(t *testing.T) {
+		m := previewModel(&fakeClient{})
+		m.searching = true
+		m.search.Focus()
+
+		typed, _ := press(t, m, runes('v'))
+		if typed.previewOpen {
+			t.Fatal(`"v" opened the sidebar instead of reaching the query`)
+		}
+		if typed.search.Value() != "v" {
+			t.Fatalf("query: got %q, want %q", typed.search.Value(), "v")
+		}
+	})
+
+	// Squeezing the list to nothing serves nobody, so the refusal is explicit
+	// rather than a sidebar that silently never appears.
+	t.Run("a terminal too narrow refuses and says so", func(t *testing.T) {
+		m := previewModel(&fakeClient{})
+		m.width = 80
+
+		narrow, msg := press(t, m, runes('v'))
+		if narrow.previewOpen {
+			t.Fatal("the sidebar opened on a terminal that cannot hold it")
+		}
+		if !strings.Contains(narrow.notice, "too narrow") {
+			t.Fatalf("notice: got %q", narrow.notice)
+		}
+		if _, ok := msg.(noticeExpiredMsg); !ok {
+			t.Fatalf("the notice was not scheduled to clear: got %T", msg)
+		}
+		if client := m.client.(*fakeClient); len(client.previewed) != 0 {
+			t.Fatalf("captured %v for a sidebar that never opened", client.previewed)
+		}
+	})
+}
+
+func TestPreviewFollowsTheSelection(t *testing.T) {
+	t.Run("moving the cursor drops the screen it came from", func(t *testing.T) {
+		m, client := open(t, previewModel(&fakeClient{screen: "first agent"}))
+
+		moved, msg := press(t, m, runes('j'))
+		if moved.previewScreen != "" || moved.previewKey != "" {
+			t.Fatalf("the previous agent's screen survived the move: %q", moved.previewScreen)
+		}
+		if out := ansi.Strip(moved.View()); strings.Contains(out, "first agent") {
+			t.Fatalf("one agent's screen is shown under another's name:\n%s", out)
+		}
+
+		client.screen = "second agent"
+		settled := drain(t, moved, msg)
+		if !slices.Equal(client.previewed, []string{"kitty:3", "kitty:2"}) {
+			t.Fatalf("captured: got %v, want [kitty:3 kitty:2]", client.previewed)
+		}
+		if !strings.Contains(ansi.Strip(settled.View()), "second agent") {
+			t.Fatal("the sidebar did not follow the cursor")
+		}
+	})
+
+	// A held movement key repeats far faster than a capture, and every capture
+	// is a process. Only the generation still current gets to spawn one.
+	t.Run("a superseded move never spawns a capture", func(t *testing.T) {
+		m, client := open(t, previewModel(&fakeClient{}))
+		before := len(client.previewed)
+
+		first, due := press(t, m, runes('j'))
+		second, _ := press(t, first, runes('k'))
+
+		updated, cmd := second.Update(due)
+		if cmd != nil {
+			t.Fatalf("the stale timer started work: %T", cmd())
+		}
+		if got := updated.(Model); got.previewKey != "" {
+			t.Fatalf("a stale timer filled the sidebar with %q", got.previewKey)
+		}
+		if len(client.previewed) != before {
+			t.Fatalf("captured %v, one per keypress", client.previewed)
+		}
+	})
+
+	// A capture is a round trip to another process. The cursor can move while
+	// it is out, and the answer belongs to the agent that is gone from under it.
+	t.Run("a capture for another agent is discarded", func(t *testing.T) {
+		m, _ := open(t, previewModel(&fakeClient{screen: "first agent"}))
+
+		stale := previewMsg{generation: m.previewGeneration, key: "kitty:2", screen: "second agent"}
+		updated, _ := m.Update(stale)
+		got := updated.(Model)
+		if got.previewScreen != "first agent" {
+			t.Fatalf("screen: got %q, want the selected agent's", got.previewScreen)
+		}
+	})
+}
+
+func TestPreviewStates(t *testing.T) {
+	cases := []struct {
+		name   string
+		client *fakeClient
+		want   string
+	}{
+		{
+			name:   "a failure names the reason on one line",
+			client: &fakeClient{previewErr: errors.New("window 3: no matching window\nfor id:3")},
+			want:   "no matching window",
+		},
+		{
+			name:   "a pane with nothing on it says so",
+			client: &fakeClient{screen: "\n\n   \n"},
+			want:   "no output",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := open(t, previewModel(tc.client))
+			out := ansi.Strip(m.View())
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("view missing %q:\n%s", tc.want, out)
+			}
+		})
+	}
+
+	t.Run("a capture in flight says so rather than showing nothing", func(t *testing.T) {
+		m := previewModel(&fakeClient{})
+		opened, _ := press(t, m, runes('v'))
+		if out := ansi.Strip(opened.View()); !strings.Contains(out, "loading") {
+			t.Fatalf("view missing the loading state:\n%s", out)
+		}
+	})
+}
+
+// The list keeps every line it had: the sidebar splits the body across, not
+// down, so the selected row cannot be pushed off the bottom.
+func TestPreviewKeepsTheListWhole(t *testing.T) {
+	plain := sampleModel()
+	plain.agents = manyAgents(30)
+	plain.selected = 25
+	plain.width, plain.height = 140, 24
+
+	with := plain
+	with.previewOpen = true
+	with.previewKey = with.selectedKey()
+	with.previewScreen = "a screen"
+
+	if got, want := len(strings.Split(with.View(), "\n")), len(strings.Split(plain.View(), "\n")); got != want {
+		t.Fatalf("line count with the sidebar: got %d, want %d", got, want)
+	}
+	if out := ansi.Strip(with.View()); !strings.Contains(out, "project-25") {
+		t.Fatalf("the selected row left the list:\n%s", out)
+	}
+}
+
+// The sidebar refreshes on the same tick as the list, so a working agent is
+// watched live rather than sampled when it was opened.
+func TestPreviewRefreshesOnTheTick(t *testing.T) {
+	m, client := open(t, previewModel(&fakeClient{screen: "first frame"}))
+	client.screen = "second frame"
+
+	updated, cmd := m.Update(tickMsg(time.Now()))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("the tick scheduled nothing")
+	}
+	// The tick batches a reload, a capture and the next tick. Only the capture
+	// matters here, and Update ignores the rest of the batch's order.
+	for _, msg := range batched(cmd) {
+		if p, ok := msg.(previewMsg); ok {
+			updated, _ = m.Update(p)
+			m = updated.(Model)
+		}
+	}
+	if m.previewScreen != "second frame" {
+		t.Fatalf("screen: got %q, want the fresh one", m.previewScreen)
+	}
+	if len(client.previewed) != 2 {
+		t.Fatalf("captured %v, want one per tick", client.previewed)
+	}
+}
+
+// batched runs a command and returns the messages it produced, flattening the
+// BatchMsg a tea.Batch delivers.
+func batched(cmd tea.Cmd) []tea.Msg {
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return []tea.Msg{msg}
+	}
+	out := make([]tea.Msg, 0, len(batch))
+	for _, c := range batch {
+		if c != nil {
+			out = append(out, c())
+		}
+	}
+	return out
 }
