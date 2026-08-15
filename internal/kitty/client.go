@@ -97,6 +97,27 @@ func focusCommand(ctx context.Context, kitten string, id int) *exec.Cmd {
 	return exec.CommandContext(ctx, kitten, "@", "focus-window", "--match", "id:"+strconv.Itoa(id))
 }
 
+// Text returns what one kitty window is showing right now, with its colours.
+//
+// The extent is the visible screen, which for an agent in the alternate screen
+// is the TUI frame rather than the shell scrollback underneath it. Output()
+// rather than CombinedOutput(), because kitty's answer is the data: stderr goes
+// through commandError instead of into the middle of the screen.
+func (c *Client) Text(ctx context.Context, id int) (string, error) {
+	out, err := textCommand(ctx, c.kitten, id).Output()
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", window(id), commandError(err))
+	}
+	return string(out), nil
+}
+
+func textCommand(ctx context.Context, kitten string, id int) *exec.Cmd {
+	// --ansi keeps the colours. --add-cursor and --add-wrap-markers are left
+	// off: both add escapes to text that goes inside another TUI's frame.
+	return exec.CommandContext(ctx, kitten, "@", "get-text",
+		"--match", "id:"+strconv.Itoa(id), "--extent", "screen", "--ansi")
+}
+
 // SetUserVars publishes user variables on one kitty window, in the order given.
 // Each entry is "NAME=value" to set a variable and a bare "NAME" to delete it,
 // the form `kitten @ set-user-vars` takes.

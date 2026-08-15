@@ -339,6 +339,66 @@ func TestAlive(t *testing.T) {
 	})
 }
 
+func TestCapture(t *testing.T) {
+	// The pane id alone, as Alive does: a bare pane id is a valid target and
+	// survives the pane moving to another window. -J is absent on purpose,
+	// because joining wrapped lines reflows a frame drawn for the pane's width.
+	t.Run("the pane is what tmux is asked about", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
+
+		if _, err := client.Capture(context.Background(), "kontora:3.%17"); err != nil {
+			t.Fatalf("capture: %v", err)
+		}
+		if got, want := readLines(t, log), []string{"capture-pane -e -p -t %17"}; !slices.Equal(got, want) {
+			t.Fatalf("commands: got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the screen comes back whole", func(t *testing.T) {
+		const screen = "\x1b[38;2;108;112;134m~/p/cattery\x1b[39m\nnono sandbox\n"
+		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+screen+"EOF")}
+
+		got, err := client.Capture(context.Background(), "kontora:3.%17")
+		if err != nil {
+			t.Fatalf("capture: %v", err)
+		}
+		if got != screen {
+			t.Fatalf("screen: got %q, want %q", got, screen)
+		}
+	})
+
+	// A stopped server means the pane is gone, which is nothing to preview
+	// rather than a failure the sidebar should shout about.
+	t.Run("no server is an empty screen", func(t *testing.T) {
+		client := &Client{tmux: fakeTmux(t, "printf 'no server running on /tmp/x\\n' >&2; exit 1")}
+
+		got, err := client.Capture(context.Background(), "kontora:3.%17")
+		if err != nil {
+			t.Fatalf("capture: %v", err)
+		}
+		if got != "" {
+			t.Fatalf("screen: got %q, want empty", got)
+		}
+	})
+
+	t.Run("another failure keeps tmux's reason on one line", func(t *testing.T) {
+		client := &Client{tmux: fakeTmux(t, "printf \"can't find pane: %%17\\nand more\\n\" >&2; exit 1")}
+
+		if _, err := client.Capture(context.Background(), "kontora:3.%17"); err == nil {
+			t.Fatal("expected an error")
+		} else if !strings.Contains(err.Error(), "find pane") || strings.Contains(err.Error(), "\n") {
+			t.Fatalf("error: %q", err)
+		}
+	})
+
+	t.Run("a malformed target is a failure, not an empty screen", func(t *testing.T) {
+		if _, err := (&Client{tmux: "tmux"}).Capture(context.Background(), "kontora"); err == nil {
+			t.Fatal("expected an error")
+		}
+	})
+}
+
 func TestViewName(t *testing.T) {
 	pid := strconv.Itoa(os.Getpid())
 	if got, want := viewName("kontora"), viewPrefix+"kontora-"+pid; got != want {

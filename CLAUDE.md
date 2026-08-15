@@ -106,6 +106,17 @@ the picker compares the installed files with the embedded ones and warns.
   `internal/kitty` and `internal/tmux` both fall back to known install prefixes
   when the lookup fails. Without that, `noServer` reads the missing binary as
   "no tmux on this machine" and every tmux agent leaves the picker silently.
+- The preview sidebar draws text the picker did not write, inside its own
+  frame. `internal/overlay/preview.go` passes SGR through and drops every other
+  escape and control byte. One cursor movement or one OSC would corrupt the
+  whole picker, not one column, and nothing downstream could undo it.
+- Every preview line carries its own reset on both sides. Bubble Tea repaints
+  individual lines, so a line can reach the terminal without the one above it.
+  kitty happens to begin each captured line with a reset and tmux does not.
+- `kitten @ get-text --extent screen` returns the *visible* screen, which for an
+  agent in the alternate screen is its TUI frame. That is the whole reason the
+  preview shows anything useful. `--extent all` would return the main screen and
+  its scrollback instead, which for those agents is the shell they started in.
 - tmux ends a command at any argument that ends in ";", not only at one that is
   nothing else. `@AGENT_MSG` carries raw prompt text, so both writers escape a
   trailing ";" as `\;`. Without that escape a prompt ending in ";" loses that

@@ -53,6 +53,18 @@ seen and drops the marker.
 `opt+a` `opt+a` opens the management overlay. It lists all running agents, grouped 
 by git repository.
 
+`v` opens a preview sidebar beside the list, showing the screen of the agent
+under the cursor. It follows the cursor, and it refreshes every second, so you
+can watch an agent work without leaving the picker. `v` again closes it.
+
+The preview reads the agent and changes nothing. It works on a kitty window you
+are not looking at and on a tmux pane nobody is attached to, and it does not
+mark the agent seen: a `done` marker survives being previewed.
+
+The sidebar shows the leftmost columns of a screen written for a wider
+terminal, so a boxed frame is cut off on the right. It needs about 91 columns
+to open at all, and says so instead of opening when the terminal is narrower.
+
 ## tmux agents
 
 An agent in a tmux pane publishes the same states as one in a kitty window, as

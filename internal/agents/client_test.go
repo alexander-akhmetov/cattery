@@ -27,6 +27,12 @@ type fakeKitty struct {
 	focused  []int
 	focusErr error
 	launched [][]string
+
+	// read records the window ids Text was asked for, and screen is what it
+	// answers with.
+	read    []int
+	screen  string
+	textErr error
 }
 
 func (f *fakeKitty) ListAgents(context.Context) ([]agent.Agent, error) {
@@ -53,6 +59,11 @@ func (f *fakeKitty) Launch(_ context.Context, args []string) error {
 	return nil
 }
 
+func (f *fakeKitty) Text(_ context.Context, id int) (string, error) {
+	f.read = append(f.read, id)
+	return f.screen, f.textErr
+}
+
 type fakeTmux struct {
 	agents  []agent.Agent
 	err     error
@@ -64,6 +75,12 @@ type fakeTmux struct {
 	dead     []string
 	aliveErr error
 	asked    []string
+
+	// captured records the targets Capture was asked for, and screen is what it
+	// answers with.
+	captured   []string
+	screen     string
+	captureErr error
 }
 
 func (f *fakeTmux) ListAgents(context.Context) ([]agent.Agent, error) {
@@ -79,6 +96,11 @@ func (f *fakeTmux) ListAgents(context.Context) ([]agent.Agent, error) {
 func (f *fakeTmux) Alive(_ context.Context, target string) (bool, error) {
 	f.asked = append(f.asked, target)
 	return !slices.Contains(f.dead, target), f.aliveErr
+}
+
+func (f *fakeTmux) Capture(_ context.Context, target string) (string, error) {
+	f.captured = append(f.captured, target)
+	return f.screen, f.captureErr
 }
 
 func newTestClient(k *fakeKitty, tm *fakeTmux) *Client {
@@ -307,6 +329,70 @@ func TestFocus(t *testing.T) {
 			t.Fatalf("reached kitty anyway: launched=%v focused=%v", k.launched, k.focused)
 		}
 	})
+}
+
+// Preview reaches the host the agent runs in and nothing else. A kitty window
+// is read by id; a tmux pane is read by its target, which is what carries the
+// pane id.
+func TestPreview(t *testing.T) {
+	cases := []struct {
+		name        string
+		a           agent.Agent
+		wantRead    []int
+		wantCapture []string
+		wantErr     string
+	}{
+		{
+			name:     "a kitty agent is read by window id",
+			a:        agent.Agent{ID: 12, Host: agent.HostKitty},
+			wantRead: []int{12},
+		},
+		{
+			// An agent listed before internal/kitty grew a Host defaults to
+			// kitty, the same way Key() does.
+			name:     "an agent with no host reads as kitty",
+			a:        agent.Agent{ID: 5},
+			wantRead: []int{5},
+		},
+		{
+			name:        "a tmux agent is read by target",
+			a:           agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"},
+			wantCapture: []string{"kontora:3.%17"},
+		},
+		{
+			name:    "a tmux agent with no target reaches neither host",
+			a:       agent.Agent{ID: 17, Host: agent.HostTmux},
+			wantErr: "no pane to read",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &fakeKitty{screen: "kitty screen"}
+			tm := &fakeTmux{screen: "tmux screen"}
+			client := newTestClient(k, tm)
+
+			screen, err := client.Preview(context.Background(), tc.a)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error: got %v, want one containing %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("preview: %v", err)
+			}
+			if !slices.Equal(k.read, tc.wantRead) {
+				t.Errorf("kitty read: got %v, want %v", k.read, tc.wantRead)
+			}
+			if !slices.Equal(tm.captured, tc.wantCapture) {
+				t.Errorf("tmux captured: got %v, want %v", tm.captured, tc.wantCapture)
+			}
+			if len(tc.wantRead) > 0 && screen != k.screen {
+				t.Errorf("screen: got %q, want %q", screen, k.screen)
+			}
+			if len(tc.wantCapture) > 0 && screen != tm.screen {
+				t.Errorf("screen: got %q, want %q", screen, tm.screen)
+			}
+		})
+	}
 }
 
 func initRepo(t *testing.T) string {

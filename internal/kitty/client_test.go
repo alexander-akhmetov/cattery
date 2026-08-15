@@ -487,6 +487,52 @@ func TestLaunchCommand(t *testing.T) {
 	}
 }
 
+// The preview asks for the visible screen with its colours, and for nothing
+// else. --add-cursor and --add-wrap-markers would put escapes into text that
+// the picker draws inside its own frame.
+func TestTextCommand(t *testing.T) {
+	cmd := textCommand(context.Background(), "kitten", 386)
+	want := []string{"kitten", "@", "get-text", "--match", "id:386", "--extent", "screen", "--ansi"}
+	if !slices.Equal(cmd.Args, want) {
+		t.Fatalf("get-text args: got %v, want %v", cmd.Args, want)
+	}
+}
+
+func TestText(t *testing.T) {
+	t.Run("the screen comes back whole", func(t *testing.T) {
+		const screen = "\x1b[m❯ \n\x1b[38;5;39mbuilding…\x1b[39m\n"
+		client := &Client{kitten: fakeKitten(t, "cat <<'EOF'\n"+screen+"EOF")}
+
+		got, err := client.Text(context.Background(), 386)
+		if err != nil {
+			t.Fatalf("text: %v", err)
+		}
+		if got != screen {
+			t.Fatalf("screen: got %q, want %q", got, screen)
+		}
+	})
+
+	// The sidebar draws the reason on one line, and stderr must never reach the
+	// column as if it were the agent's screen.
+	t.Run("a failure names the window and stays on one line", func(t *testing.T) {
+		client := &Client{kitten: fakeKitten(t, "printf 'no matching window\\nsecond line\\n' >&2; exit 1")}
+
+		got, err := client.Text(context.Background(), 386)
+		if err == nil {
+			t.Fatal("no error for a window kitty does not have")
+		}
+		if got != "" {
+			t.Fatalf("screen: got %q, want empty", got)
+		}
+		if !strings.Contains(err.Error(), "window 386") || !strings.Contains(err.Error(), "no matching window") {
+			t.Fatalf("error: %v", err)
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Fatalf("error spans lines: %q", err)
+		}
+	})
+}
+
 // The text goes in on stdin, never as an argument. kitty reads Python escapes
 // out of a positional text argument, which mangles a shell-quoted path. The
 // POSIX escape for a single quote loses its backslash and leaves an
