@@ -76,17 +76,17 @@ type Transport interface {
 	Publish(vars []Var) error
 }
 
-// Writer publishes the AGENT_* variables of a single kitty window.
+// Writer publishes the AGENT_* variables of a single agent window or pane.
 type Writer struct {
-	// WindowID is KITTY_WINDOW_ID. Empty means the caller is not inside kitty
-	// and there is nothing to publish.
+	// WindowID is KITTY_WINDOW_ID, which the kitty transports match on. It says
+	// nothing about where the state goes: New picks tmux over kitty.
 	WindowID string
 
 	// Stdin carries the agent's hook payload. A character device is never read,
 	// so a manual run in a terminal does not hang waiting for EOF.
 	Stdin io.Reader
 
-	// Transport is nil when no route to kitty exists. The writer then does
+	// Transport is nil when there is no route to a host. The writer then does
 	// nothing: the agent could not act on the failure anyway.
 	Transport Transport
 
@@ -103,12 +103,23 @@ func Run(args []string) {
 	New().Write(args[0])
 }
 
-// New builds the writer for this process from the kitty environment.
+// New builds the writer for this process from its environment.
 func New() Writer {
 	w := Writer{
 		WindowID:     os.Getenv("KITTY_WINDOW_ID"),
 		Stdin:        os.Stdin,
 		ResumePrefix: resumePrefix(),
+	}
+	// tmux first, and the kitty window id is not even consulted. A tmux server
+	// inherits the environment of whatever started it, so every pane under a
+	// server that kontora launched from kitty carries that window's
+	// KITTY_WINDOW_ID. Publishing there would move an unrelated window's tab
+	// marker, and the pane the agent runs in would stay blank.
+	if os.Getenv("TMUX") != "" {
+		if pane := os.Getenv("TMUX_PANE"); pane != "" {
+			w.Transport = tmuxTransport{tmux: "tmux", pane: pane}
+			return w
+		}
 	}
 	if w.WindowID == "" {
 		return w
@@ -125,15 +136,16 @@ func New() Writer {
 	return w
 }
 
-// Write publishes the updates the named state calls for. An unknown word, a
-// caller outside kitty, and a missing transport all mean "publish nothing".
+// Write publishes the updates the named state calls for. An unknown word and a
+// missing transport both mean "publish nothing". No transport is what a caller
+// outside both kitty and tmux gets.
 func (w Writer) Write(state string) {
 	switch state {
 	case "working", "blocked", "idle", "clear":
 	default:
 		return
 	}
-	if w.WindowID == "" || w.Transport == nil {
+	if w.Transport == nil {
 		return
 	}
 

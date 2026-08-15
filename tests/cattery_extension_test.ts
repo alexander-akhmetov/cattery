@@ -15,7 +15,7 @@ import test from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import register from "../extensions/cattery.ts";
+import register, { setRunner } from "../extensions/cattery.ts";
 
 /** One user variable write. A null value means the variable was deleted. */
 type VarWrite = [key: string, value: string | null];
@@ -66,6 +66,17 @@ class FakePi {
   }
 }
 
+/**
+ * Put the process in a kitty window and nowhere else.
+ *
+ * The suite can be run from inside a tmux pane, and a pane beats a kitty window
+ * in the extension, so the kitty tests have to say so.
+ */
+function inKittyOnly(): void {
+  delete process.env.TMUX;
+  delete process.env.TMUX_PANE;
+}
+
 /** Fire one pi event and return the user variables the extension wrote. */
 async function fire(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<VarWrite[]> {
   const written: VarWrite[] = [];
@@ -89,6 +100,7 @@ async function fire(pi: FakePi, event: string, payload: Record<string, unknown> 
  * session to reset them, as pi does.
  */
 async function startedSession(): Promise<FakePi> {
+  inKittyOnly();
   process.env.KITTY_WINDOW_ID = "7";
   const pi = new FakePi();
   register(pi as unknown as ExtensionAPI);
@@ -96,19 +108,22 @@ async function startedSession(): Promise<FakePi> {
   return pi;
 }
 
-test("outside kitty the extension registers nothing", () => {
-  const saved = process.env.KITTY_WINDOW_ID;
+test("outside kitty and tmux the extension registers nothing", () => {
+  const saved = { ...process.env };
   delete process.env.KITTY_WINDOW_ID;
+  delete process.env.TMUX;
+  delete process.env.TMUX_PANE;
   try {
     const pi = new FakePi();
     register(pi as unknown as ExtensionAPI);
     assert.equal(pi.handlers.size, 0);
   } finally {
-    if (saved !== undefined) process.env.KITTY_WINDOW_ID = saved;
+    process.env = saved;
   }
 });
 
 test("a session opens as an idle pi agent with no stale message", async () => {
+  inKittyOnly();
   process.env.KITTY_WINDOW_ID = "7";
   const pi = new FakePi();
   register(pi as unknown as ExtensionAPI);
@@ -126,6 +141,7 @@ test("a session opens as an idle pi agent with no stale message", async () => {
 
 /** Fire session_start with a given session file and return only AGENT_RESUME. */
 async function resumeOn(sessionFile: string | undefined): Promise<VarWrite[]> {
+  inKittyOnly();
   process.env.KITTY_WINDOW_ID = "7";
   const pi = new FakePi();
   pi.ctx = context(sessionFile);
@@ -196,6 +212,7 @@ test("an ephemeral session clears any resume command left in the window", async 
 test("the extension survives a pi with no session manager", async () => {
   // Reading the session file must never break session_start. Without the read
   // the window loses its resume command; with it the agent loses its marker.
+  inKittyOnly();
   process.env.KITTY_WINDOW_ID = "7";
   const pi = new FakePi();
   pi.ctx = undefined as unknown as FakeContext;
@@ -328,4 +345,148 @@ test("shutdown clears the state and the message but keeps the kind", async () =>
     // worth restoring after a reboot.
     ["AGENT_MSG", null],
   ]);
+});
+
+// --- tmux panes ---------------------------------------------------------------
+
+/** One tmux run: the argv the extension passed, without the binary name. */
+type TmuxRun = string[];
+
+/**
+ * A registered extension in a tmux pane, with the process runner replaced.
+ *
+ * The returned array collects every tmux command line, so the tests assert the
+ * options without a tmux server.
+ */
+function inPane(): { pi: FakePi; runs: TmuxRun[] } {
+  process.env.TMUX = "/private/tmp/tmux-501/default,69427,0";
+  process.env.TMUX_PANE = "%17";
+  // A kontora agent inherits this from the tmux server, which inherited it from
+  // whatever kitty window started the daemon. It names an unrelated window.
+  process.env.KITTY_WINDOW_ID = "7";
+  const runs: TmuxRun[] = [];
+  setRunner((file, args) => {
+    assert.equal(file, "tmux");
+    runs.push(args);
+  });
+  const pi = new FakePi();
+  register(pi as unknown as ExtensionAPI);
+  return { pi, runs };
+}
+
+/** Fire one pi event in a pane and return the tmux command lines it ran. */
+async function firePane(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<TmuxRun[]> {
+  const runs: TmuxRun[] = [];
+  setRunner((_file, args) => {
+    runs.push(args);
+  });
+  const original = process.stdout.write;
+  process.stdout.write = ((): boolean => {
+    throw new Error("wrote an escape sequence from a tmux pane");
+  }) as typeof process.stdout.write;
+  try {
+    await pi.emit(event, payload);
+  } finally {
+    process.stdout.write = original;
+  }
+  return runs;
+}
+
+/** The options one tmux command line sets, deletions marked with "-u". */
+function options(args: TmuxRun): string[] {
+  const out: string[] = [];
+  let deleting = false;
+  for (const arg of args) {
+    if (arg === ";") deleting = false;
+    else if (arg === "-u") deleting = true;
+    else if (arg.startsWith("@")) out.push(deleting ? `-u ${arg}` : arg);
+  }
+  return out;
+}
+
+test("in a pane the extension publishes options, not escapes", async () => {
+  const { pi } = inPane();
+
+  const runs = await firePane(pi, "session_start");
+
+  assert.deepEqual(runs.slice(0, 4), [
+    ["set", "-p", "-t", "%17", "@AGENT_KIND", "pi"],
+    ["set", "-p", "-t", "%17", "@AGENT_RESUME", `pi --session ${SESSION_FILE}`],
+    // A pi that was killed leaves "has worked" behind, and this session's first
+    // idle would read as "done" in the picker.
+    ["set", "-p", "-u", "-t", "%17", "@AGENT_WORKED"],
+    ["set", "-p", "-u", "-t", "%17", "@AGENT_MSG"],
+  ]);
+  // The state chains the stamp the picker counts elapsed time from into the
+  // same command line, so a state change costs one process.
+  assert.deepEqual(runs[4]!.slice(0, 7), ["set", "-p", "-t", "%17", "@AGENT_STATE", "idle", ";"]);
+  assert.deepEqual(options(runs[4]!), ["@AGENT_STATE", "@AGENT_SINCE"]);
+});
+
+// tmux ends a command at any argument ending in ";", so a prompt ending in one
+// would lose that character, and a prompt that is only ";" would swallow the
+// updates chained behind it. This mirrors escapeArg in internal/state/tmux.go.
+test("a prompt that ends in a semicolon is escaped", async () => {
+  const { pi } = inPane();
+  await firePane(pi, "session_start");
+
+  const plain = await firePane(pi, "before_agent_start", { prompt: "cd x; make" });
+  const trailing = await firePane(pi, "before_agent_start", { prompt: "make test;" });
+  const only = await firePane(pi, "before_agent_start", { prompt: ";" });
+
+  assert.deepEqual(plain[0], ["set", "-p", "-t", "%17", "@AGENT_MSG", "cd x; make"]);
+  assert.deepEqual(trailing[0], ["set", "-p", "-t", "%17", "@AGENT_MSG", "make test\\;"]);
+  assert.deepEqual(only[0], ["set", "-p", "-t", "%17", "@AGENT_MSG", "\\;"]);
+});
+
+test("a pane with no kitty window at all still publishes", async () => {
+  // A tmux server started outside kitty gives its panes no KITTY_WINDOW_ID, and
+  // the OSC path has nowhere to go.
+  const { pi } = inPane();
+  delete process.env.KITTY_WINDOW_ID;
+
+  const runs = await firePane(pi, "session_start");
+
+  assert.equal(runs.length, 5);
+});
+
+test("the pane options a state change leaves behind", async () => {
+  const { pi } = inPane();
+  await firePane(pi, "session_start");
+
+  const working = await firePane(pi, "agent_start");
+  const blocked = await firePane(pi, "tool_execution_start", { toolName: "ask_user_question" });
+  const idle = await firePane(pi, "agent_settled");
+  const shutdown = await firePane(pi, "session_shutdown");
+
+  // Working and blocked mark the work and drop the acknowledgement, so the next
+  // idle reads as "done" until someone looks at the pane.
+  assert.deepEqual(options(working[0]!), ["@AGENT_STATE", "@AGENT_SINCE", "@AGENT_WORKED", "-u @AGENT_SEEN"]);
+  assert.deepEqual(options(blocked[0]!), ["@AGENT_STATE", "@AGENT_SINCE", "@AGENT_WORKED", "-u @AGENT_SEEN"]);
+  assert.deepEqual(options(idle[0]!), ["@AGENT_STATE", "@AGENT_SINCE"]);
+  // Shutdown forgets the work, or the next agent in this pane would report
+  // "done" the moment it starts idle. AGENT_RESUME stays.
+  assert.deepEqual(options(shutdown[0]!), ["-u @AGENT_STATE", "-u @AGENT_WORKED"]);
+  assert.deepEqual(options(shutdown[1]!), ["-u @AGENT_MSG"]);
+});
+
+test("a state already published is not published again in a pane", async () => {
+  const { pi } = inPane();
+  await firePane(pi, "session_start");
+  await firePane(pi, "agent_start");
+
+  assert.deepEqual(await firePane(pi, "agent_start"), []);
+});
+
+test("@AGENT_SINCE is unix seconds", async () => {
+  const { pi } = inPane();
+  await firePane(pi, "session_start");
+  const before = Math.floor(Date.now() / 1000);
+
+  const runs = await firePane(pi, "agent_start");
+
+  const args = runs[0]!;
+  const stamp = Number(args[args.indexOf("@AGENT_SINCE") + 1]);
+  assert.ok(Number.isInteger(stamp), "@AGENT_SINCE is not an integer");
+  assert.ok(stamp >= before && stamp <= Math.floor(Date.now() / 1000), `@AGENT_SINCE ${stamp} is outside the run`);
 });

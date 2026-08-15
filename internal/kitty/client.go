@@ -10,82 +10,21 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/alexander-akhmetov/cattery/internal/agent"
 )
-
-// Agent is a single kitty window carrying AGENT_DISPLAY, which the kitty
-// watcher derives from the agent's own AGENT_STATE.
-type Agent struct {
-	ID      int
-	Kind    string // AGENT_KIND, e.g. "pi" or "claude"
-	Display string // AGENT_DISPLAY: blocked, done, working, idle
-	Title   string
-	CWD     string
-	Since   time.Time // from AGENT_SINCE; zero when unknown
-	Msg     string    // AGENT_MSG: the latest user prompt, when published
-
-	// CreatedAt is when kitty opened the window, a stable session age. Since
-	// resets on every display transition.
-	CreatedAt time.Time
-
-	// Worktrees of one repository share Project and ProjectKey but differ in
-	// Root and Branch, so the picker groups them together and still tells
-	// them apart.
-	Project    string // repo label, e.g. "dotfiles"
-	ProjectKey string // stable project identity: the git common dir, else the cwd
-	Root       string // worktree top level; empty outside git
-	Branch     string // empty on a detached HEAD or outside git
-}
-
-// repo is what one git lookup says about a working directory.
-type repo struct {
-	project    string
-	projectKey string
-	root       string
-	branch     string
-}
-
-func (a *Agent) setRepo(r repo) {
-	a.Project, a.ProjectKey, a.Root, a.Branch = r.project, r.projectKey, r.root, r.branch
-}
-
-const (
-	defaultRepoTTL  = 5 * time.Second
-	maxRepoWorkers  = 4
-	gitLookupBudget = 500 * time.Millisecond
-)
-
-type repoCacheEntry struct {
-	repo    repo
-	expires time.Time
-}
 
 // Client runs kitty remote-control commands.
 type Client struct {
 	kitten string
-
-	// lookup resolves one directory's git facts. A field, so tests can count
-	// lookups without spawning git. nil means gitRepo.
-	lookup func(ctx context.Context, cwd string) (found repo, answered bool)
-
-	mu      sync.Mutex
-	repo    map[string]repoCacheEntry // cwd -> recently observed repo facts
-	repoTTL time.Duration
 }
 
 // NewClient resolves the kitten binary and returns a ready client.
 func NewClient() *Client {
-	return &Client{
-		kitten:  kittenPath(),
-		lookup:  gitRepo,
-		repo:    map[string]repoCacheEntry{},
-		repoTTL: defaultRepoTTL,
-	}
+	return &Client{kitten: kittenPath()}
 }
 
 func kittenPath() string {
@@ -100,19 +39,15 @@ func kittenPath() string {
 	return "kitten"
 }
 
-// ListAgents returns the agent windows known to kitty, grouped by project.
-func (c *Client) ListAgents(ctx context.Context) ([]Agent, error) {
+// ListAgents returns the agent windows known to kitty, in kitty's own order. It
+// resolves no repositories and does not sort: the picker merges these with the
+// agents of other hosts first, so both passes run once over the whole set.
+func (c *Client) ListAgents(ctx context.Context) ([]agent.Agent, error) {
 	out, err := c.ls(ctx)
 	if err != nil {
 		return nil, err
 	}
-	agents, err := parseAgents(out)
-	if err != nil {
-		return nil, err
-	}
-	c.populateRepos(ctx, agents)
-	sortAgents(agents)
-	return agents, nil
+	return parseAgents(out)
 }
 
 // FocusWindow focuses the kitty window with the given id, switching OS window
@@ -195,6 +130,19 @@ func actionCommand(ctx context.Context, kitten, arg string) *exec.Cmd {
 	return exec.CommandContext(ctx, kitten, "@", "action", arg)
 }
 
+// Launch opens a window as `kitten @ launch <args...>`. Unlike Action, this is
+// a remote-control command with its own parser, so the arguments stay separate
+// argv entries and nothing has to be quoted for a shell.
+//
+// The picker uses it for the read-only tmux viewer tab.
+func (c *Client) Launch(ctx context.Context, args []string) error {
+	return run(launchCommand(ctx, c.kitten, args), "launch "+strings.Join(args, " "))
+}
+
+func launchCommand(ctx context.Context, kitten string, args []string) *exec.Cmd {
+	return exec.CommandContext(ctx, kitten, append([]string{"@", "launch"}, args...)...)
+}
+
 // SendText types text into one kitty window, as if the user had typed it. It
 // adds no carriage return; the caller appends one to run what it sent.
 //
@@ -234,132 +182,6 @@ func (c *Client) ls(ctx context.Context) ([]byte, error) {
 		return nil, commandError(err)
 	}
 	return out, nil
-}
-
-// populateRepos resolves each unique cwd once, concurrently, then fills every
-// agent that shares it. The worker limit keeps a large inventory from spawning
-// an unbounded number of git processes.
-func (c *Client) populateRepos(ctx context.Context, agents []Agent) {
-	indices := make(map[string][]int)
-	for i, agent := range agents {
-		if agent.CWD != "" {
-			indices[agent.CWD] = append(indices[agent.CWD], i)
-		}
-	}
-	if len(indices) == 0 {
-		return
-	}
-
-	cwds := make([]string, 0, len(indices))
-	for cwd := range indices {
-		cwds = append(cwds, cwd)
-	}
-	repos := make([]repo, len(cwds))
-	workers := make(chan struct{}, maxRepoWorkers)
-	var wg sync.WaitGroup
-	for i, cwd := range cwds {
-		workers <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-workers }()
-			repos[i] = c.repoFor(ctx, cwd)
-		})
-	}
-	wg.Wait()
-
-	for i, cwd := range cwds {
-		for _, j := range indices[cwd] {
-			agents[j].setRepo(repos[i])
-		}
-	}
-}
-
-// repoFor returns the recent git facts for cwd. An answer from git is cached
-// for the TTL, including "this is not a repository". Without that, one agent
-// outside git would start a git process on every reload.
-//
-// A lookup that ran out of time is not an answer, and is not cached. Caching it
-// would hold the folder fallback for the whole TTL, which drops the branch from
-// the row and splits worktrees of one repository into separate headings.
-func (c *Client) repoFor(ctx context.Context, cwd string) repo {
-	if cwd == "" {
-		return repo{}
-	}
-	now := time.Now()
-	c.mu.Lock()
-	if cached, ok := c.repo[cwd]; ok && now.Before(cached.expires) {
-		c.mu.Unlock()
-		return cached.repo
-	}
-	c.mu.Unlock()
-
-	lookup := c.lookup
-	if lookup == nil {
-		lookup = gitRepo
-	}
-	found, answered := lookup(ctx, cwd)
-
-	if c.repoTTL > 0 && answered {
-		c.mu.Lock()
-		if c.repo == nil {
-			c.repo = make(map[string]repoCacheEntry)
-		}
-		c.repo[cwd] = repoCacheEntry{repo: found, expires: now.Add(c.repoTTL)}
-		c.mu.Unlock()
-	}
-	return found
-}
-
-// gitRepo asks git about one directory, under its own time budget. It reports
-// whether git answered. A lookup killed by the budget or by a cancelled reload
-// returns the folder fallback with answered false, which the caller must not
-// cache.
-func gitRepo(ctx context.Context, cwd string) (repo, bool) {
-	cctx, cancel := context.WithTimeout(ctx, gitLookupBudget)
-	defer cancel()
-	out, _ := exec.CommandContext(cctx, "git", "-C", cwd, "rev-parse",
-		"--path-format=absolute", "--git-common-dir", "--show-toplevel", "--abbrev-ref", "HEAD").Output()
-	return parseRepo(cwd, out), cctx.Err() == nil
-}
-
-// fallbackRepo is what an agent's directory looks like with no git answer:
-// grouped by the folder itself.
-func fallbackRepo(cwd string) repo {
-	if cwd == "" {
-		return repo{}
-	}
-	return repo{project: filepath.Base(cwd), projectKey: cwd}
-}
-
-// parseRepo reads the three-line rev-parse output: git common dir, worktree top
-// level, branch. It reads line by line instead of all-or-nothing, because git
-// prints the paths it resolved before failing on a later argument. A repository
-// with no commits prints both paths, then exits 128.
-func parseRepo(cwd string, out []byte) repo {
-	found := fallbackRepo(cwd)
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) > 0 && strings.HasPrefix(lines[0], "/") {
-		found.projectKey = filepath.Clean(lines[0])
-		found.project = projectName(found.projectKey)
-	}
-	if len(lines) > 1 && strings.HasPrefix(lines[1], "/") {
-		found.root = filepath.Clean(lines[1])
-	}
-	if len(lines) > 2 {
-		if branch := strings.TrimSpace(lines[2]); branch != "HEAD" {
-			found.branch = branch // "HEAD" is a detached or unborn head, not a name
-		}
-	}
-	return found
-}
-
-// projectName labels a git common dir: the directory holding ".git" for a
-// normal checkout, or the bare repository's own name.
-func projectName(commonDir string) string {
-	base := filepath.Base(commonDir)
-	if base == ".git" {
-		return filepath.Base(filepath.Dir(commonDir))
-	}
-	return strings.TrimSuffix(base, ".git")
 }
 
 // --- kitten @ ls JSON shape (only the fields we use) ------------------------
@@ -435,22 +257,22 @@ func parseWindows(data []byte) ([]Window, error) {
 }
 
 // parseAgents keeps the windows that published an AGENT_DISPLAY value. It never
-// touches git and never sorts. ListAgents fills in the repo facts the ordering
-// depends on, then sorts.
-func parseAgents(data []byte) ([]Agent, error) {
+// touches git and never sorts; the picker does both once for every host.
+func parseAgents(data []byte) ([]agent.Agent, error) {
 	windows, err := parseWindows(data)
 	if err != nil {
 		return nil, err
 	}
 
-	var agents []Agent
+	var agents []agent.Agent
 	for _, w := range windows {
 		display := w.UserVars["AGENT_DISPLAY"]
 		if display == "" {
 			continue
 		}
-		a := Agent{
+		a := agent.Agent{
 			ID:        w.ID,
+			Host:      agent.HostKitty,
 			Kind:      w.UserVars["AGENT_KIND"],
 			Display:   display,
 			Title:     w.Title,
@@ -466,28 +288,4 @@ func parseAgents(data []byte) ([]Agent, error) {
 		agents = append(agents, a)
 	}
 	return agents, nil
-}
-
-// sortAgents groups agents by project and orders each group oldest session
-// first. Project order is alphabetical, so a group never moves under the user
-// while agents change state; the status filter tabs cover triage. Agents whose
-// project could not be determined go last.
-func sortAgents(agents []Agent) {
-	sort.SliceStable(agents, func(i, j int) bool {
-		a, b := agents[i], agents[j]
-		if (a.ProjectKey == "") != (b.ProjectKey == "") {
-			return b.ProjectKey == ""
-		}
-		if la, lb := strings.ToLower(a.Project), strings.ToLower(b.Project); la != lb {
-			return la < lb
-		}
-		// Two repositories can share a label; the common dir separates them.
-		if a.ProjectKey != b.ProjectKey {
-			return a.ProjectKey < b.ProjectKey
-		}
-		if !a.CreatedAt.Equal(b.CreatedAt) {
-			return a.CreatedAt.Before(b.CreatedAt)
-		}
-		return a.ID < b.ID
-	})
 }

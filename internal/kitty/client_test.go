@@ -5,13 +5,13 @@ import (
 	"io"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/alexander-akhmetov/cattery/internal/agent"
 )
 
 const sampleLs = `[
@@ -93,6 +93,16 @@ func TestParseAgents(t *testing.T) {
 	if agents[0].Kind != "pi" {
 		t.Errorf("working agent kind: got %q, want pi", agents[0].Kind)
 	}
+	// Every window here is a kitty agent, which is what tells the picker to
+	// focus it rather than attach to it.
+	for _, a := range agents {
+		if a.Host != agent.HostKitty {
+			t.Errorf("window %d host: got %q, want %q", a.ID, a.Host, agent.HostKitty)
+		}
+		if a.Target != "" {
+			t.Errorf("window %d target: got %q, want empty", a.ID, a.Target)
+		}
+	}
 	if got := agents[0].Since; !got.Equal(time.Unix(1700000000, 0)) {
 		t.Errorf("AGENT_SINCE parse: got %v, want %v", got, time.Unix(1700000000, 0))
 	}
@@ -120,157 +130,6 @@ func TestParseAgentsEmpty(t *testing.T) {
 func TestParseAgentsInvalid(t *testing.T) {
 	if _, err := parseAgents([]byte(`not json`)); err == nil {
 		t.Fatal("expected error for invalid JSON")
-	}
-}
-
-func TestSortAgents(t *testing.T) {
-	at := func(sec int64) time.Time { return time.Unix(sec, 0) }
-
-	tests := []struct {
-		name  string
-		input []Agent
-		want  []int
-	}{
-		{
-			name: "projects are alphabetical regardless of status",
-			input: []Agent{
-				{ID: 1, Display: "idle", Project: "zulu", ProjectKey: "/z/.git"},
-				{ID: 2, Display: "blocked", Project: "alpha", ProjectKey: "/a/.git"},
-				{ID: 3, Display: "done", Project: "mike", ProjectKey: "/m/.git"},
-			},
-			want: []int{2, 3, 1},
-		},
-		{
-			name: "oldest session first inside a project",
-			input: []Agent{
-				{ID: 1, Project: "a", ProjectKey: "/a/.git", CreatedAt: at(300)},
-				{ID: 2, Project: "a", ProjectKey: "/a/.git", CreatedAt: at(100)},
-				{ID: 3, Project: "a", ProjectKey: "/a/.git", CreatedAt: at(200)},
-			},
-			want: []int{2, 3, 1},
-		},
-		{
-			name: "worktrees of one repo stay in the same group",
-			input: []Agent{
-				{ID: 1, Project: "repo", ProjectKey: "/p/repo/.git", Root: "/wt/b", CreatedAt: at(200)},
-				{ID: 2, Project: "other", ProjectKey: "/p/other/.git", CreatedAt: at(50)},
-				{ID: 3, Project: "repo", ProjectKey: "/p/repo/.git", Root: "/p/repo", CreatedAt: at(100)},
-			},
-			want: []int{2, 3, 1},
-		},
-		{
-			name: "same label from different repos does not merge",
-			input: []Agent{
-				{ID: 1, Project: "grafana", ProjectKey: "/work/grafana/.git"},
-				{ID: 2, Project: "grafana", ProjectKey: "/oss/grafana/.git"},
-				{ID: 3, Project: "grafana", ProjectKey: "/work/grafana/.git"},
-			},
-			want: []int{2, 1, 3},
-		},
-		{
-			name: "label order ignores case",
-			input: []Agent{
-				{ID: 1, Project: "beta", ProjectKey: "/b/.git"},
-				{ID: 2, Project: "Alpha", ProjectKey: "/A/.git"},
-			},
-			want: []int{2, 1},
-		},
-		{
-			name: "windows without a project go last",
-			input: []Agent{
-				{ID: 1},
-				{ID: 2, Project: "zulu", ProjectKey: "/z/.git"},
-			},
-			want: []int{2, 1},
-		},
-		{
-			name: "equal timestamps fall back to window id",
-			input: []Agent{
-				{ID: 9, Project: "a", ProjectKey: "/a/.git"},
-				{ID: 4, Project: "a", ProjectKey: "/a/.git"},
-			},
-			want: []int{4, 9},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sortAgents(tt.input)
-			var got []int
-			for _, a := range tt.input {
-				got = append(got, a.ID)
-			}
-			if !slices.Equal(got, tt.want) {
-				t.Errorf("order: got %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestParseRepo(t *testing.T) {
-	tests := []struct {
-		name string
-		cwd  string
-		out  string
-		want repo
-	}{
-		{
-			name: "normal checkout",
-			cwd:  "/p/dotfiles",
-			out:  "/p/dotfiles/.git\n/p/dotfiles\nmain\n",
-			want: repo{project: "dotfiles", projectKey: "/p/dotfiles/.git", root: "/p/dotfiles", branch: "main"},
-		},
-		{
-			name: "worktree resolves to its main repo",
-			cwd:  "/wt/dotfiles/feat-oauth",
-			out:  "/p/dotfiles/.git\n/wt/dotfiles/feat-oauth\nfeat/oauth\n",
-			want: repo{project: "dotfiles", projectKey: "/p/dotfiles/.git", root: "/wt/dotfiles/feat-oauth", branch: "feat/oauth"},
-		},
-		{
-			name: "subdirectory resolves to the repo, not the subdirectory",
-			cwd:  "/p/dotfiles/internal/kitty",
-			out:  "/p/dotfiles/.git\n/p/dotfiles\nmain\n",
-			want: repo{project: "dotfiles", projectKey: "/p/dotfiles/.git", root: "/p/dotfiles", branch: "main"},
-		},
-		{
-			name: "detached HEAD keeps the project but has no branch",
-			cwd:  "/tmp/sig-review",
-			out:  "/p/sigil/.git\n/tmp/sig-review\nHEAD\n",
-			want: repo{project: "sigil", projectKey: "/p/sigil/.git", root: "/tmp/sig-review"},
-		},
-		{
-			name: "bare repo drops the .git suffix from its label",
-			cwd:  "/tmp/wt",
-			out:  "/srv/dotfiles.git\n/tmp/wt\nwt\n",
-			want: repo{project: "dotfiles", projectKey: "/srv/dotfiles.git", root: "/tmp/wt", branch: "wt"},
-		},
-		{
-			// git prints the paths it resolved, then exits 128 on HEAD.
-			name: "repository without commits still yields a project",
-			cwd:  "/p/fresh",
-			out:  "/p/fresh/.git\n/p/fresh\nHEAD\n",
-			want: repo{project: "fresh", projectKey: "/p/fresh/.git", root: "/p/fresh"},
-		},
-		{
-			name: "no git output falls back to the folder",
-			cwd:  "/home/x/scratch",
-			out:  "",
-			want: repo{project: "scratch", projectKey: "/home/x/scratch"},
-		},
-		{
-			name: "no cwd yields nothing to group by",
-			cwd:  "",
-			out:  "",
-			want: repo{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := parseRepo(tt.cwd, []byte(tt.out)); got != tt.want {
-				t.Errorf("parseRepo(%q):\n got %+v\nwant %+v", tt.cwd, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -453,8 +312,7 @@ func TestListAgentsError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := newTestClient()
-			client.kitten = tc.kitten
+			client := &Client{kitten: tc.kitten}
 			_, err := client.ListAgents(context.Background())
 			if err == nil {
 				t.Fatal("expected a list error")
@@ -614,6 +472,21 @@ func TestActionCommand(t *testing.T) {
 	}
 }
 
+// launch is the opposite of action: a remote-control command with its own
+// parser, so its arguments stay separate argv entries. The command after "--"
+// reaches kitty unsplit, which is what keeps a target with a space in it whole.
+func TestLaunchCommand(t *testing.T) {
+	args := []string{
+		"--type=tab", "--title", "ro kontora:3.%17", "--var", "AGENT_VIEW=kontora:3.%17",
+		"--", "/usr/local/bin/cattery", "attach", "kontora:3.%17",
+	}
+	cmd := launchCommand(context.Background(), "kitten", args)
+	want := append([]string{"kitten", "@", "launch"}, args...)
+	if !slices.Equal(cmd.Args, want) {
+		t.Fatalf("launch args: got %v, want %v", cmd.Args, want)
+	}
+}
+
 // The text goes in on stdin, never as an argument. kitty reads Python escapes
 // out of a positional text argument, which mangles a shell-quoted path. The
 // POSIX escape for a single quote loses its backslash and leaves an
@@ -738,281 +611,4 @@ func fakeKitten(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
-}
-
-// countingLookup replaces the git call with a stub that records how often each
-// directory was resolved. A lookup per agent instead of per unique cwd then
-// shows without spawning anything.
-func countingLookup(client *Client) func() map[string]int {
-	var mu sync.Mutex
-	calls := map[string]int{}
-	client.lookup = func(_ context.Context, cwd string) (repo, bool) {
-		mu.Lock()
-		calls[cwd]++
-		mu.Unlock()
-		return repo{project: "repo", projectKey: "/repo/.git", root: "/repo", branch: "main"}, true
-	}
-	return func() map[string]int {
-		mu.Lock()
-		defer mu.Unlock()
-		return maps.Clone(calls)
-	}
-}
-
-func TestPopulateRepos(t *testing.T) {
-	t.Run("one lookup per unique cwd, fanned out to every agent", func(t *testing.T) {
-		client := newTestClient()
-		calls := countingLookup(client)
-		agents := []Agent{
-			{ID: 1, CWD: "/repo"},
-			{ID: 2, CWD: "/repo/sub"},
-			{ID: 3, CWD: "/repo"},
-			{ID: 4, CWD: ""}, // no cwd, no lookup
-			{ID: 5, CWD: "/repo"},
-		}
-		client.populateRepos(context.Background(), agents)
-
-		want := map[string]int{"/repo": 1, "/repo/sub": 1}
-		if got := calls(); !maps.Equal(got, want) {
-			t.Errorf("lookups: got %v, want %v", got, want)
-		}
-		for _, a := range agents {
-			wantBranch := "main"
-			if a.CWD == "" {
-				wantBranch = ""
-			}
-			if a.Branch != wantBranch {
-				t.Errorf("agent %d branch: got %q, want %q", a.ID, a.Branch, wantBranch)
-			}
-		}
-	})
-
-	t.Run("distinct cwds each get their own facts", func(t *testing.T) {
-		dir := initRepo(t)
-		other := initRepo(t)
-		runGit(t, other, "checkout", "-b", "feature")
-
-		client := newTestClient()
-		agents := []Agent{
-			{ID: 1, CWD: dir},
-			{ID: 2, CWD: other},
-			{ID: 3, CWD: dir},
-			{ID: 4, CWD: ""}, // no cwd, must stay empty
-			{ID: 5, CWD: dir},
-		}
-		client.populateRepos(context.Background(), agents)
-
-		wantBranch := []string{"main", "feature", "main", "", "main"}
-		wantProject := []string{
-			filepath.Base(dir), filepath.Base(other), filepath.Base(dir), "", filepath.Base(dir),
-		}
-		for i := range agents {
-			if agents[i].Branch != wantBranch[i] {
-				t.Errorf("agent %d branch: got %q, want %q", agents[i].ID, agents[i].Branch, wantBranch[i])
-			}
-			if agents[i].Project != wantProject[i] {
-				t.Errorf("agent %d project: got %q, want %q", agents[i].ID, agents[i].Project, wantProject[i])
-			}
-		}
-		// Two distinct cwds, so two cache entries despite five agents.
-		if len(client.repo) != 2 {
-			t.Errorf("cache entries: got %d, want 2", len(client.repo))
-		}
-	})
-
-	// A lookup the caller cut short says nothing about the directory. Caching it
-	// would hold the folder fallback for the whole TTL and block the retry.
-	t.Run("cancelled lookup is not cached", func(t *testing.T) {
-		dir := initRepo(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		client := newTestClient()
-		client.populateRepos(ctx, []Agent{{ID: 1, CWD: dir}})
-		if len(client.repo) != 0 {
-			t.Fatalf("cache entries after a cancelled lookup: got %d, want 0", len(client.repo))
-		}
-
-		agents := []Agent{{ID: 1, CWD: dir}}
-		client.populateRepos(context.Background(), agents)
-		if agents[0].Branch != "main" {
-			t.Errorf("branch after the retry: got %q, want main", agents[0].Branch)
-		}
-	})
-
-	// Worktrees are why grouping keys off the common dir instead of the working
-	// directory: three paths, one project.
-	t.Run("worktrees share their main repo's project", func(t *testing.T) {
-		main := initRepo(t)
-		wt := filepath.Join(t.TempDir(), "feature-wt")
-		runGit(t, main, "worktree", "add", "-b", "feature", wt)
-
-		client := newTestClient()
-		agents := []Agent{{ID: 1, CWD: main}, {ID: 2, CWD: wt}}
-		client.populateRepos(context.Background(), agents)
-
-		if agents[0].ProjectKey != agents[1].ProjectKey {
-			t.Errorf("worktree project keys differ: %q vs %q", agents[0].ProjectKey, agents[1].ProjectKey)
-		}
-		if agents[0].Project != filepath.Base(main) || agents[1].Project != filepath.Base(main) {
-			t.Errorf("projects: got %q and %q, want %q", agents[0].Project, agents[1].Project, filepath.Base(main))
-		}
-		if agents[0].Branch != "main" || agents[1].Branch != "feature" {
-			t.Errorf("branches: got %q and %q, want main and feature", agents[0].Branch, agents[1].Branch)
-		}
-		if filepath.Base(agents[1].Root) != "feature-wt" {
-			t.Errorf("worktree root: got %q, want .../feature-wt", agents[1].Root)
-		}
-	})
-
-	// The picker still has to draw a row, so a cancelled lookup groups by folder
-	// instead of dropping the agent into "unknown".
-	t.Run("cancelled context falls back to the folder", func(t *testing.T) {
-		dir := initRepo(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		client := newTestClient()
-		agents := []Agent{{ID: 1, CWD: dir}}
-		client.populateRepos(ctx, agents)
-
-		if agents[0].Branch != "" {
-			t.Errorf("cancelled lookup branch: got %q, want empty", agents[0].Branch)
-		}
-		if agents[0].Project != filepath.Base(dir) || agents[0].ProjectKey != dir {
-			t.Errorf("cancelled lookup project: got %q/%q, want %q/%q",
-				agents[0].Project, agents[0].ProjectKey, filepath.Base(dir), dir)
-		}
-	})
-
-	t.Run("no cwd anywhere is a no-op", func(t *testing.T) {
-		client := newTestClient()
-		agents := []Agent{{ID: 1}, {ID: 2}}
-		client.populateRepos(context.Background(), agents)
-		if len(client.repo) != 0 {
-			t.Errorf("cache entries: got %d, want 0", len(client.repo))
-		}
-	})
-}
-
-func TestRepoFor(t *testing.T) {
-	t.Run("fresh entry is served from cache", func(t *testing.T) {
-		// A non-repo path. Any value returned came from the cache.
-		dir := t.TempDir()
-		client := newTestClient()
-		client.repo[dir] = repoCacheEntry{
-			repo:    repo{project: "cached", projectKey: "/cached/.git", branch: "cached"},
-			expires: time.Now().Add(time.Hour),
-		}
-		if got := client.repoFor(context.Background(), dir); got.branch != "cached" || got.project != "cached" {
-			t.Fatalf("repo: got %+v, want the cached entry", got)
-		}
-	})
-
-	t.Run("detached HEAD keeps the project but has no branch", func(t *testing.T) {
-		dir := initRepo(t)
-		runGit(t, dir, "checkout", "--detach")
-
-		client := newTestClient()
-		got := client.repoFor(context.Background(), dir)
-		if got.branch != "" {
-			t.Fatalf("detached branch: got %q, want empty", got.branch)
-		}
-		if got.project != filepath.Base(dir) {
-			t.Errorf("detached project: got %q, want %q", got.project, filepath.Base(dir))
-		}
-		// Detached HEAD is a successful lookup, and is cached as it stands.
-		if entry, ok := client.repo[dir]; !ok || entry.repo.branch != "" {
-			t.Errorf("detached HEAD cache entry: %+v present=%v", entry, ok)
-		}
-	})
-
-	t.Run("empty cwd is skipped", func(t *testing.T) {
-		client := newTestClient()
-		if got := client.repoFor(context.Background(), ""); got != (repo{}) {
-			t.Fatalf("empty cwd: got %+v, want zero", got)
-		}
-	})
-}
-
-func TestRepoCache(t *testing.T) {
-	t.Run("expired entry refreshes", func(t *testing.T) {
-		dir := initRepo(t)
-		client := newTestClient()
-		if got := client.repoFor(context.Background(), dir); got.branch != "main" {
-			t.Fatalf("initial branch: got %q, want main", got.branch)
-		}
-		runGit(t, dir, "checkout", "-b", "feature")
-
-		expireRepo(t, client, dir)
-		if got := client.repoFor(context.Background(), dir); got.branch != "feature" {
-			t.Fatalf("refreshed branch: got %q, want feature", got.branch)
-		}
-	})
-
-	// A directory outside git resolves to the folder fallback on every reload.
-	// Caching that answer is what stops the picker starting a git process per
-	// second for as long as it stays open.
-	t.Run("failure is cached until the ttl expires", func(t *testing.T) {
-		dir := t.TempDir()
-		client := newTestClient()
-		if got := client.repoFor(context.Background(), dir); got.branch != "" || got.projectKey != dir {
-			t.Fatalf("non-repo lookup: got %+v, want the folder fallback", got)
-		}
-		if _, ok := client.repo[dir]; !ok {
-			t.Fatal("failed lookup should be cached")
-		}
-
-		initRepoAt(t, dir)
-		if got := client.repoFor(context.Background(), dir); got.branch != "" {
-			t.Fatalf("branch before expiry: got %q, want the cached empty value", got.branch)
-		}
-		expireRepo(t, client, dir)
-		if got := client.repoFor(context.Background(), dir); got.branch != "main" {
-			t.Fatalf("retried branch: got %q, want main", got.branch)
-		}
-	})
-}
-
-func newTestClient() *Client {
-	return &Client{repo: map[string]repoCacheEntry{}, repoTTL: time.Hour}
-}
-
-// expireRepo ages out a cache entry so the next lookup re-runs git.
-func expireRepo(t *testing.T, client *Client, cwd string) {
-	t.Helper()
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	entry, ok := client.repo[cwd]
-	if !ok {
-		t.Fatalf("no cache entry for %q", cwd)
-	}
-	entry.expires = time.Now().Add(-time.Second)
-	client.repo[cwd] = entry
-}
-
-func initRepo(t *testing.T) string {
-	t.Helper()
-	// t.TempDir() is a symlinked /var path on macOS; git reports the resolved
-	// one, so resolve up front or every path comparison here fails.
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	initRepoAt(t, dir)
-	return dir
-}
-
-func initRepoAt(t *testing.T, repo string) {
-	t.Helper()
-	runGit(t, repo, "init", "-b", "main")
-	runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init")
-}
-
-func runGit(t *testing.T, repo string, args ...string) {
-	t.Helper()
-	cmdArgs := append([]string{"-C", repo}, args...)
-	if out, err := exec.Command("git", cmdArgs...).CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
 }

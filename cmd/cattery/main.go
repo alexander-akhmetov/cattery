@@ -9,11 +9,14 @@
 //	cattery state <x>        publish this window's agent state
 //	cattery save [path]      snapshot the kitty tab tree
 //	cattery restore [path]   put a snapshot back
+//	cattery attach <target>  watch a tmux agent read-only
 //
 // The picker shows every kitty window carrying AGENT_DISPLAY. The watcher
 // derives that variable from the agent's AGENT_STATE, so a window that sets
-// AGENT_STATE without a watcher loaded does not appear. `cattery setup` binds
-// the picker in kitty.conf as:
+// AGENT_STATE without a watcher loaded does not appear. It also shows every
+// tmux pane carrying @AGENT_STATE, where there is no watcher and the display
+// state is derived at read time instead. `cattery setup` binds the picker in
+// kitty.conf as:
 //
 //	map opt+a>opt+a launch --type=overlay --cwd=current --copy-colors /path/to/cattery
 //
@@ -34,11 +37,14 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/alexander-akhmetov/cattery/internal/agent"
+	"github.com/alexander-akhmetov/cattery/internal/agents"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/overlay"
 	"github.com/alexander-akhmetov/cattery/internal/session"
 	"github.com/alexander-akhmetov/cattery/internal/setup"
 	"github.com/alexander-akhmetov/cattery/internal/state"
+	"github.com/alexander-akhmetov/cattery/internal/tmux"
 )
 
 // The names route returns. Plain strings, so the switch that runs them need not
@@ -50,6 +56,7 @@ const (
 	cmdState   = "state"
 	cmdSave    = "save"
 	cmdRestore = "restore"
+	cmdAttach  = "attach"
 	cmdVersion = "version"
 )
 
@@ -101,17 +108,22 @@ func run(args []string) int {
 	case cmdSetup:
 		return runSetup(cmd.args)
 	case cmdSave:
+		// Snapshots are kitty's tab tree. A tmux agent belongs to whatever
+		// started it, and restoring one would fork work that is still running.
 		return runSave(kitty.NewClient(), os.Stdout, cmd.args)
 	case cmdRestore:
 		return runRestore(kitty.NewClient(), os.Stdout, cmd.args)
+	case cmdAttach:
+		return runAttach(tmux.NewClient(), cmd.args)
 	case cmdPrint:
-		if err := printAgents(kitty.NewClient()); err != nil {
+		if err := printAgents(agents.NewClient(kitty.NewClient()), os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "cattery:", err)
 			return 1
 		}
 		return 0
 	default:
-		program := tea.NewProgram(overlay.New(kitty.NewClient()), tea.WithAltScreen())
+		snapshots := kitty.NewClient()
+		program := tea.NewProgram(overlay.New(agents.NewClient(snapshots), snapshots), tea.WithAltScreen())
 		if _, err := program.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "cattery:", err)
 			return 1
@@ -125,10 +137,10 @@ func run(args []string) int {
 func route(args []string, out io.Writer) (command, error) {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
-		case cmdSetup, cmdState, cmdSave, cmdRestore:
+		case cmdSetup, cmdState, cmdSave, cmdRestore, cmdAttach:
 			return command{name: args[0], args: args[1:]}, nil
 		default:
-			return command{}, fmt.Errorf("unknown command %q (try setup, state, save, restore, or no argument for the picker)", args[0])
+			return command{}, fmt.Errorf("unknown command %q (try setup, state, save, restore, attach, or no argument for the picker)", args[0])
 		}
 	}
 
@@ -282,15 +294,44 @@ func flagExit(err error) int {
 	return 2
 }
 
-func printAgents(client *kitty.Client) error {
+// lister is the inventory `-print` reads, an interface so a test can print
+// without a kitty or a tmux server.
+type lister interface {
+	ListAgents(ctx context.Context) ([]agent.Agent, error)
+}
+
+// printAgents writes the inventory as one line per agent. A tmux row carries
+// the target `cattery attach` takes; a kitty row is reached by window id and
+// has none.
+//
+// A host that failed still returns the other's rows, so they are printed before
+// the error goes back.
+func printAgents(client lister, out io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	agents, err := client.ListAgents(ctx)
-	if err != nil {
-		return err
-	}
 	for _, a := range agents {
-		fmt.Printf("%-16s %-7s %-7s id=%-5d %-24s %s\n", a.Project, a.Display, a.Kind, a.ID, a.Branch, a.CWD)
+		target := ""
+		if a.Target != "" {
+			target = " target=" + a.Target
+		}
+		fmt.Fprintf(out, "%-16s %-7s %-7s host=%-5s id=%-5d %-24s %s%s\n",
+			a.Project, a.Display, a.Kind, a.Host, a.ID, a.Branch, a.CWD, target)
 	}
-	return nil
+	return err
+}
+
+// runAttach opens a read-only view of one tmux agent, and returns when the
+// viewer detaches. It runs without a deadline: the view stays for as long as
+// the user watches it.
+func runAttach(client *tmux.Client, args []string) int {
+	if len(args) != 1 || args[0] == "" {
+		fmt.Fprintln(os.Stderr, "cattery: attach takes one <session>:<window>.<pane id> target")
+		return 2
+	}
+	if err := client.Attach(context.Background(), args[0]); err != nil {
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return 1
+	}
+	return 0
 }

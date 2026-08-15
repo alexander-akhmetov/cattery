@@ -14,7 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/alexander-akhmetov/cattery/internal/kitty"
+	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/session"
 	"github.com/alexander-akhmetov/cattery/internal/setup"
 )
@@ -22,24 +22,27 @@ import (
 // filters are the status tabs, in cycle order for the "f" key.
 var filters = []string{"all", "working", "blocked", "done", "idle"}
 
-// KittyClient is the part of kitty remote control the picker needs. An
-// interface, so a test can drive the model without a live kitty instance.
+// Client is the inventory the picker lists and jumps into. An interface, so a
+// test can drive the model without a live kitty or tmux.
 //
-// It embeds session.Client because "s" and "R" snapshot and restore the tab
-// tree from inside the picker.
-type KittyClient interface {
-	ListAgents(context.Context) ([]kitty.Agent, error)
-	FocusWindow(context.Context, int) error
-	session.Client
+// Focus takes the whole agent rather than an id, because reaching a tmux agent
+// means attaching to its pane, not focusing a window.
+type Client interface {
+	ListAgents(context.Context) ([]agent.Agent, error)
+	Focus(context.Context, agent.Agent) error
 }
 
 type (
 	agentsMsg struct {
 		generation uint64
-		agents     []kitty.Agent
+		agents     []agent.Agent
 	}
+	// reloadErrMsg carries the rows the reload did produce. One host can fail
+	// while the other answers, and those rows are still worth showing under the
+	// warning.
 	reloadErrMsg struct {
 		generation uint64
+		agents     []agent.Agent
 		err        error
 	}
 	focusMsg struct{ err error }
@@ -89,9 +92,13 @@ const spinInterval = 110 * time.Millisecond
 
 // Model is the Bubble Tea model for the picker.
 type Model struct {
-	client KittyClient
+	client Client
 
-	agents           []kitty.Agent
+	// snapshots is the kitty half, for "s" and "R". Snapshots hold kitty tabs
+	// only: a tmux agent's lifecycle belongs to whatever started it.
+	snapshots session.Client
+
+	agents           []agent.Agent
 	filter           string
 	search           textinput.Model
 	searching        bool
@@ -129,8 +136,9 @@ type Model struct {
 	quitting bool
 }
 
-// New builds a Model with an initial reload scheduled in Init.
-func New(client KittyClient) Model {
+// New builds a Model with an initial reload scheduled in Init. client lists and
+// reaches agents of every host; snapshots is kitty alone, for save and restore.
+func New(client Client, snapshots session.Client) Model {
 	in := textinput.New()
 	in.Prompt = ""
 	in.Placeholder = "search by name, path, branch, prompt…"
@@ -138,6 +146,7 @@ func New(client KittyClient) Model {
 
 	return Model{
 		client:           client,
+		snapshots:        snapshots,
 		filter:           "all",
 		search:           in,
 		loading:          true,
@@ -180,21 +189,21 @@ func (m Model) reload(generation uint64) tea.Cmd {
 		defer cancel()
 		agents, err := client.ListAgents(ctx)
 		if err != nil {
-			return reloadErrMsg{generation: generation, err: err}
+			return reloadErrMsg{generation: generation, agents: agents, err: err}
 		}
 		return agentsMsg{generation: generation, agents: agents}
 	}
 }
 
-func focusCmd(ctx context.Context, client KittyClient, id int) tea.Cmd {
+func focusCmd(ctx context.Context, client Client, a agent.Agent) tea.Cmd {
 	return func() tea.Msg {
-		return focusMsg{err: client.FocusWindow(ctx, id)}
+		return focusMsg{err: client.Focus(ctx, a)}
 	}
 }
 
 // saveCmd snapshots the tab tree to the default snapshot path. The key is a
 // shortcut; `cattery save <path>` is how to name a path.
-func saveCmd(client KittyClient) tea.Cmd {
+func saveCmd(client session.Client) tea.Cmd {
 	return func() tea.Msg {
 		path, err := session.DefaultPath()
 		if err != nil {
@@ -216,7 +225,7 @@ func saveCmd(client KittyClient) tea.Cmd {
 // restoreCmd puts the default snapshot back. It never runs the resumed agents,
 // because one keypress in the picker is easy to hit by accident.
 // `cattery restore -run` is how to ask for that on purpose.
-func restoreCmd(client KittyClient) tea.Cmd {
+func restoreCmd(client session.Client) tea.Cmd {
 	return func() tea.Msg {
 		path, err := session.DefaultPath()
 		if err != nil {
@@ -275,6 +284,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case reloadErrMsg:
 		if msg.generation != m.reloadGeneration {
 			return m, nil
+		}
+		// One source can fail while the other answers. Its rows go up, and the
+		// warning above them says the list is incomplete.
+		if len(msg.agents) > 0 {
+			m.replaceAgents(msg.agents)
+			m.resizeSearch()
 		}
 		m.loaded = true
 		m.loading = false
@@ -363,24 +378,35 @@ func (m Model) searchActive() bool {
 	return m.searching || strings.TrimSpace(m.search.Value()) != ""
 }
 
-// selectedID is the kitty window under the cursor, or 0 when nothing is
-// visible. The window id survives filter, search, and inventory changes; a row
-// index does not.
-func (m Model) selectedID() int {
+// selectedAgent is the agent under the cursor, and false when the list is
+// empty or the filter hides every row.
+func (m Model) selectedAgent() (agent.Agent, bool) {
 	vis := m.visible()
 	if m.selected < 0 || m.selected >= len(vis) {
-		return 0
+		return agent.Agent{}, false
 	}
-	return vis[m.selected].ID
+	return vis[m.selected], true
 }
 
-func (m *Model) replaceAgents(agents []kitty.Agent) {
-	selectedID := m.selectedID()
+// selectedKey identifies the agent under the cursor, or "" when nothing is
+// visible. The key survives filter, search, and inventory changes; a row index
+// does not. It carries the host, because a kitty window id and a tmux pane id
+// are both small integers and collide.
+func (m Model) selectedKey() string {
+	a, ok := m.selectedAgent()
+	if !ok {
+		return ""
+	}
+	return a.Key()
+}
+
+func (m *Model) replaceAgents(agents []agent.Agent) {
+	selected := m.selectedKey()
 
 	m.agents = agents
-	if selectedID != 0 {
-		for i, agent := range m.visible() {
-			if agent.ID == selectedID {
+	if selected != "" {
+		for i, a := range m.visible() {
+			if a.Key() == selected {
 				m.selected = i
 				return
 			}
@@ -405,9 +431,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	before := m.selectedID()
+	before := m.selectedKey()
 	next, cmd := m.handleActiveKey(msg)
-	if next.focusErr != nil && next.selectedID() != before {
+	if next.focusErr != nil && next.selectedKey() != before {
 		next.focusErr = nil
 	}
 	return next, cmd
@@ -470,11 +496,11 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "enter":
 		return m.focusSelected()
 	case "s":
-		return m.startSession("saving", saveCmd(m.client))
+		return m.startSession("saving", saveCmd(m.snapshots))
 	case "R":
 		// Shift-only, because it creates tabs. Lowercase "r" sits close to the
 		// movement keys and is easy to hit by accident.
-		return m.startSession("restoring", restoreCmd(m.client))
+		return m.startSession("restoring", restoreCmd(m.snapshots))
 	}
 
 	if len(msg.Runes) == 1 && msg.Runes[0] >= '1' && msg.Runes[0] <= '9' {
@@ -498,15 +524,15 @@ func (m Model) startSession(verb string, cmd tea.Cmd) (Model, tea.Cmd) {
 }
 
 func (m Model) focusSelected() (Model, tea.Cmd) {
-	vis := m.visible()
-	if m.selected < 0 || m.selected >= len(vis) {
+	a, ok := m.selectedAgent()
+	if !ok {
 		return m, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	m.focusErr = nil
 	m.focusing = true
 	m.focusCancel = cancel
-	return m, focusCmd(ctx, m.client, vis[m.selected].ID)
+	return m, focusCmd(ctx, m.client, a)
 }
 
 func (m *Model) cancelFocus() {
@@ -558,9 +584,9 @@ func (m Model) anyWorking() bool {
 }
 
 // visible returns the agents passing the active filter and search query.
-func (m Model) visible() []kitty.Agent {
+func (m Model) visible() []agent.Agent {
 	q := strings.ToLower(strings.TrimSpace(m.search.Value()))
-	var out []kitty.Agent
+	var out []agent.Agent
 	for _, a := range m.agents {
 		if m.filter != "all" && a.Display != m.filter {
 			continue
@@ -573,7 +599,7 @@ func (m Model) visible() []kitty.Agent {
 	return out
 }
 
-func matches(a kitty.Agent, q string) bool {
+func matches(a agent.Agent, q string) bool {
 	hay := strings.ToLower(strings.Join([]string{
 		a.Display, a.Kind, a.Project, agentName(a), a.Branch, a.CWD, a.Title, a.Msg,
 	}, " "))
@@ -582,7 +608,7 @@ func matches(a kitty.Agent, q string) bool {
 
 // groupLabel names a project group. An agent in a directory outside git is
 // grouped by that folder, so only a window with no cwd has no label.
-func groupLabel(a kitty.Agent) string {
+func groupLabel(a agent.Agent) string {
 	if a.Project != "" {
 		return a.Project
 	}
@@ -593,7 +619,7 @@ func groupLabel(a kitty.Agent) string {
 // names the project. The branch does that for a normal checkout and for most
 // worktrees. A detached HEAD has no branch, so the row falls back to the
 // worktree directory, which still separates it from its siblings.
-func rowLabel(a kitty.Agent) string {
+func rowLabel(a agent.Agent) string {
 	if a.Branch != "" {
 		return a.Branch
 	}
@@ -605,7 +631,7 @@ func rowLabel(a kitty.Agent) string {
 
 // agentName is the agent's full identity, for a row with no project heading
 // above it: the cwd basename, or the title when cwd is empty.
-func agentName(a kitty.Agent) string {
+func agentName(a agent.Agent) string {
 	if a.CWD != "" {
 		return filepath.Base(a.CWD)
 	}
@@ -614,7 +640,7 @@ func agentName(a kitty.Agent) string {
 
 // groupSize counts the agents sharing start's project from start onward. The
 // list is sorted by project, so a group is one consecutive run.
-func groupSize(agents []kitty.Agent, start int) int {
+func groupSize(agents []agent.Agent, start int) int {
 	n := 0
 	for i := start; i < len(agents) && sameProject(agents[i], agents[start]); i++ {
 		n++
@@ -622,7 +648,7 @@ func groupSize(agents []kitty.Agent, start int) int {
 	return n
 }
 
-func sameProject(a, b kitty.Agent) bool {
+func sameProject(a, b agent.Agent) bool {
 	return a.ProjectKey == b.ProjectKey && a.Project == b.Project
 }
 

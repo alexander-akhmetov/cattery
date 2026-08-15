@@ -16,12 +16,14 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/alexander-akhmetov/cattery"
+	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 )
 
 type fakeClient struct {
-	agents   []kitty.Agent
-	focused  []int
+	agents   []agent.Agent
+	listErr  error
+	focused  []string
 	focusErr error
 
 	// The session half of the interface. actionErr makes save or restore fail
@@ -34,10 +36,12 @@ type fakeClient struct {
 	sent      []string
 }
 
-func (f *fakeClient) ListAgents(context.Context) ([]kitty.Agent, error) { return f.agents, nil }
+func (f *fakeClient) ListAgents(context.Context) ([]agent.Agent, error) {
+	return f.agents, f.listErr
+}
 
-func (f *fakeClient) FocusWindow(_ context.Context, id int) error {
-	f.focused = append(f.focused, id)
+func (f *fakeClient) Focus(_ context.Context, a agent.Agent) error {
+	f.focused = append(f.focused, a.Key())
 	return f.focusErr
 }
 
@@ -70,20 +74,20 @@ func (f *fakeClient) Windows(context.Context) ([]kitty.Window, error) {
 
 // checkout builds an agent in the primary checkout of its project, the shape
 // ListAgents produces for a plain `cd ~/projects/x` session.
-func checkout(id int, kind, display, project, branch string) kitty.Agent {
+func checkout(id int, kind, display, project, branch string) agent.Agent {
 	root := "/p/" + project
-	return kitty.Agent{
+	return agent.Agent{
 		ID: id, Kind: kind, Display: display,
 		CWD: root, Project: project, ProjectKey: root + "/.git", Root: root, Branch: branch,
 	}
 }
 
 func sampleModel() Model {
-	m := New(&fakeClient{})
+	m := New(&fakeClient{}, &fakeClient{})
 	m.loaded = true
 	m.loading = false
 	// Project order, the way ListAgents delivers them.
-	m.agents = []kitty.Agent{
+	m.agents = []agent.Agent{
 		checkout(3, "pi", "working", "astra-l", "feat/oauth"),
 		checkout(2, "pi", "working", "dotfiles", "main"),
 		checkout(1, "claude", "blocked", "llm-proxy", "master"),
@@ -201,13 +205,27 @@ func TestFocusSelectedTargetsVisibleRow(t *testing.T) {
 }
 
 func TestFocusCmdCallsClient(t *testing.T) {
-	fc := &fakeClient{}
-	msg := focusCmd(context.Background(), fc, 3)()
-	if got := msg.(focusMsg).err; got != nil {
-		t.Errorf("focusCmd error: got %v, want nil", got)
+	cases := []struct {
+		name string
+		in   agent.Agent
+		want string
+	}{
+		{name: "a kitty window", in: agent.Agent{ID: 3, Host: agent.HostKitty}, want: "kitty:3"},
+		// The whole agent goes to the client, because reaching a tmux agent
+		// means attaching to its pane rather than focusing a window id.
+		{name: "a tmux pane", in: agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"}, want: "tmux:%17"},
 	}
-	if len(fc.focused) != 1 || fc.focused[0] != 3 {
-		t.Errorf("focused windows: got %v, want [3]", fc.focused)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakeClient{}
+			msg := focusCmd(context.Background(), fc, tc.in)()
+			if got := msg.(focusMsg).err; got != nil {
+				t.Errorf("focusCmd error: got %v, want nil", got)
+			}
+			if !slices.Equal(fc.focused, []string{tc.want}) {
+				t.Errorf("focused: got %v, want [%s]", fc.focused, tc.want)
+			}
+		})
 	}
 }
 
@@ -238,7 +256,7 @@ func TestSearchEscClears(t *testing.T) {
 
 func TestCounts(t *testing.T) {
 	m := sampleModel()
-	m.agents = append(m.agents, kitty.Agent{ID: 5, Display: "idle"})
+	m.agents = append(m.agents, agent.Agent{ID: 5, Display: "idle"})
 	c := m.counts()
 	want := map[string]int{"all": 5, "working": 2, "blocked": 1, "done": 1, "idle": 1}
 	for k, v := range want {
@@ -251,8 +269,8 @@ func TestCounts(t *testing.T) {
 // The spinner tick is the only thing that redraws a still list. It stops when
 // no agent is working and starts again when one appears.
 func TestSpinTickFollowsWorkingAgents(t *testing.T) {
-	idle := []kitty.Agent{{ID: 1, Display: "idle"}}
-	working := []kitty.Agent{{ID: 1, Display: "working"}}
+	idle := []agent.Agent{{ID: 1, Display: "idle"}}
+	working := []agent.Agent{{ID: 1, Display: "working"}}
 
 	m := sampleModel()
 	m.agents, m.spinning = nil, false
@@ -301,18 +319,18 @@ func TestElapsed(t *testing.T) {
 func TestActivity(t *testing.T) {
 	cases := []struct {
 		name string
-		in   kitty.Agent
+		in   agent.Agent
 		want string
 	}{
-		{"message wins over title", kitty.Agent{Display: "working", Title: "zsh", Msg: "refactor the prompt"}, "refactor the prompt"},
-		{"blocked with title", kitty.Agent{Display: "blocked", Title: "build"}, "build"},
-		{"blocked no title", kitty.Agent{Display: "blocked"}, "waiting for input"},
-		{"working with title", kitty.Agent{Display: "working", Title: "writing tests"}, "writing tests"},
-		{"done no title", kitty.Agent{Display: "done"}, "finished"},
-		{"idle with message", kitty.Agent{Display: "idle", Msg: "ship the release"}, "ship the release"},
-		{"idle with title", kitty.Agent{Display: "idle", Title: "fish"}, "fish"},
+		{"message wins over title", agent.Agent{Display: "working", Title: "zsh", Msg: "refactor the prompt"}, "refactor the prompt"},
+		{"blocked with title", agent.Agent{Display: "blocked", Title: "build"}, "build"},
+		{"blocked no title", agent.Agent{Display: "blocked"}, "waiting for input"},
+		{"working with title", agent.Agent{Display: "working", Title: "writing tests"}, "writing tests"},
+		{"done no title", agent.Agent{Display: "done"}, "finished"},
+		{"idle with message", agent.Agent{Display: "idle", Msg: "ship the release"}, "ship the release"},
+		{"idle with title", agent.Agent{Display: "idle", Title: "fish"}, "fish"},
 		// The status column already says "idle", so the row has nothing to add.
-		{"idle bare", kitty.Agent{Display: "idle"}, ""},
+		{"idle bare", agent.Agent{Display: "idle"}, ""},
 	}
 	for _, tc := range cases {
 		if got := activity(tc.in); got != tc.want {
@@ -340,7 +358,7 @@ func TestStatusGlyph(t *testing.T) {
 }
 
 func TestActivityGlyph(t *testing.T) {
-	wrk := kitty.Agent{Display: "working"}
+	wrk := agent.Agent{Display: "working"}
 	if a, b := activityGlyph(wrk, 0), activityGlyph(wrk, 1); a == b {
 		t.Errorf("working glyph should advance with spin: %q == %q", a, b)
 	}
@@ -352,7 +370,7 @@ func TestActivityGlyph(t *testing.T) {
 		"idle": "",
 	}
 	for display, want := range cases {
-		if got := activityGlyph(kitty.Agent{Display: display}, 3); got != want {
+		if got := activityGlyph(agent.Agent{Display: display}, 3); got != want {
 			t.Errorf("activityGlyph(%q): got %q, want %q", display, got, want)
 		}
 	}
@@ -362,13 +380,13 @@ func TestTimeLabel(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	cases := []struct {
 		name string
-		in   kitty.Agent
+		in   agent.Agent
 		want string
 	}{
-		{"working", kitty.Agent{Display: "working", Since: now.Add(-90 * time.Second)}, "1m 30s"},
-		{"blocked", kitty.Agent{Display: "blocked", Since: now.Add(-30 * time.Second)}, "waiting 30s"},
-		{"done", kitty.Agent{Display: "done", Since: now.Add(-6 * time.Minute)}, "6m ago"},
-		{"blocked unknown", kitty.Agent{Display: "blocked"}, "waiting"},
+		{"working", agent.Agent{Display: "working", Since: now.Add(-90 * time.Second)}, "1m 30s"},
+		{"blocked", agent.Agent{Display: "blocked", Since: now.Add(-30 * time.Second)}, "waiting 30s"},
+		{"done", agent.Agent{Display: "done", Since: now.Add(-6 * time.Minute)}, "6m ago"},
+		{"blocked unknown", agent.Agent{Display: "blocked"}, "waiting"},
 	}
 	for _, tc := range cases {
 		if got := timeLabel(now, tc.in); got != tc.want {
@@ -381,13 +399,13 @@ func TestMetaRight(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	cases := []struct {
 		name string
-		in   kitty.Agent
+		in   agent.Agent
 		want string
 	}{
-		{"working", kitty.Agent{Display: "working", Since: now.Add(-(13*time.Minute + 41*time.Second))}, "13m 41s"},
-		{"done", kitty.Agent{Display: "done", Since: now.Add(-2 * time.Minute)}, "finished 2m ago"},
-		{"done unknown", kitty.Agent{Display: "done"}, "finished"},
-		{"idle has no summary", kitty.Agent{Display: "idle", Since: now.Add(-time.Minute)}, ""},
+		{"working", agent.Agent{Display: "working", Since: now.Add(-(13*time.Minute + 41*time.Second))}, "13m 41s"},
+		{"done", agent.Agent{Display: "done", Since: now.Add(-2 * time.Minute)}, "finished 2m ago"},
+		{"done unknown", agent.Agent{Display: "done"}, "finished"},
+		{"idle has no summary", agent.Agent{Display: "idle", Since: now.Add(-time.Minute)}, ""},
 	}
 	for _, tc := range cases {
 		if got := metaRight(now, tc.in); got != tc.want {
@@ -397,10 +415,10 @@ func TestMetaRight(t *testing.T) {
 }
 
 func TestAgentName(t *testing.T) {
-	if got := agentName(kitty.Agent{CWD: "/p/dotfiles"}); got != "dotfiles" {
+	if got := agentName(agent.Agent{CWD: "/p/dotfiles"}); got != "dotfiles" {
 		t.Errorf("name from cwd: %q", got)
 	}
-	if got := agentName(kitty.Agent{Title: "fallback"}); got != "fallback" {
+	if got := agentName(agent.Agent{Title: "fallback"}); got != "fallback" {
 		t.Errorf("name fallback to title: %q", got)
 	}
 }
@@ -410,32 +428,32 @@ func TestAgentName(t *testing.T) {
 func TestRowLabel(t *testing.T) {
 	cases := []struct {
 		name  string
-		agent kitty.Agent
+		agent agent.Agent
 		want  string
 	}{
 		{
 			name:  "branch names the checkout",
-			agent: kitty.Agent{CWD: "/p/dotfiles", Root: "/p/dotfiles", Branch: "main"},
+			agent: agent.Agent{CWD: "/p/dotfiles", Root: "/p/dotfiles", Branch: "main"},
 			want:  "main",
 		},
 		{
 			name:  "worktree branch beats the directory",
-			agent: kitty.Agent{CWD: "/wt/feat-oauth", Root: "/wt/feat-oauth", Branch: "feat/oauth"},
+			agent: agent.Agent{CWD: "/wt/feat-oauth", Root: "/wt/feat-oauth", Branch: "feat/oauth"},
 			want:  "feat/oauth",
 		},
 		{
 			name:  "detached HEAD falls back to the worktree",
-			agent: kitty.Agent{CWD: "/tmp/sig-review/sub", Root: "/tmp/sig-review"},
+			agent: agent.Agent{CWD: "/tmp/sig-review/sub", Root: "/tmp/sig-review"},
 			want:  "sig-review",
 		},
 		{
 			name:  "outside git falls back to the folder",
-			agent: kitty.Agent{CWD: "/home/x/scratch"},
+			agent: agent.Agent{CWD: "/home/x/scratch"},
 			want:  "scratch",
 		},
 		{
 			name:  "no path at all falls back to the title",
-			agent: kitty.Agent{Title: "pi"},
+			agent: agent.Agent{Title: "pi"},
 			want:  "pi",
 		},
 	}
@@ -449,16 +467,16 @@ func TestRowLabel(t *testing.T) {
 }
 
 func TestGroupLabel(t *testing.T) {
-	if got := groupLabel(kitty.Agent{Project: "dotfiles"}); got != "dotfiles" {
+	if got := groupLabel(agent.Agent{Project: "dotfiles"}); got != "dotfiles" {
 		t.Errorf("group label: %q", got)
 	}
-	if got := groupLabel(kitty.Agent{}); got != "unknown" {
+	if got := groupLabel(agent.Agent{}); got != "unknown" {
 		t.Errorf("group label without a project: %q", got)
 	}
 }
 
 func TestGroupSize(t *testing.T) {
-	agents := []kitty.Agent{
+	agents := []agent.Agent{
 		{ID: 1, Project: "a", ProjectKey: "/a/.git"},
 		{ID: 2, Project: "a", ProjectKey: "/a/.git"},
 		// The same label from another repository, so a separate group.
@@ -477,7 +495,7 @@ func TestGroupSize(t *testing.T) {
 func TestViewGroupsWorktreesUnderOneHeading(t *testing.T) {
 	m := sampleModel()
 	m.width, m.height = 100, 40
-	m.agents = []kitty.Agent{
+	m.agents = []agent.Agent{
 		{ID: 1, Kind: "pi", Display: "working", CWD: "/p/dotfiles", Project: "dotfiles",
 			ProjectKey: "/p/dotfiles/.git", Root: "/p/dotfiles", Branch: "main"},
 		{ID: 2, Kind: "pi", Display: "idle", CWD: "/wt/dotfiles/feat-oauth", Project: "dotfiles",
@@ -539,7 +557,7 @@ func TestViewGroupHeadingsSurviveScrolling(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := sampleModel()
 			m.width, m.height = 60, tc.height
-			m.agents = []kitty.Agent{
+			m.agents = []agent.Agent{
 				checkout(1, "pi", "working", "alpha", "main"),
 				checkout(2, "pi", "working", "alpha", "topic"),
 				checkout(3, "pi", "working", "zulu", "main"),
@@ -676,7 +694,7 @@ func TestTitleBarStates(t *testing.T) {
 // whole right edge on every keypress.
 func TestRowTimeColumnHoldsStill(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
-	agent := kitty.Agent{
+	agent := agent.Agent{
 		ID: 1, Kind: "pi", Display: "working",
 		CWD: "/p/dotfiles", Branch: "main", Since: now.Add(-90 * time.Second),
 	}
@@ -735,22 +753,22 @@ func TestIdleRowLine2(t *testing.T) {
 	indent := strings.Repeat(" ", rowIndent)
 	cases := []struct {
 		name  string
-		agent kitty.Agent
+		agent agent.Agent
 		want  string
 	}{
 		{
 			name:  "nothing to report",
-			agent: kitty.Agent{ID: 8, Kind: "pi", Display: "idle", CWD: "/p/org"},
+			agent: agent.Agent{ID: 8, Kind: "pi", Display: "idle", CWD: "/p/org"},
 			want:  indent + "/p/org",
 		},
 		{
 			name:  "message without a status glyph",
-			agent: kitty.Agent{ID: 9, Kind: "pi", Display: "idle", CWD: "/p/org", Msg: "tidy the notes"},
+			agent: agent.Agent{ID: 9, Kind: "pi", Display: "idle", CWD: "/p/org", Msg: "tidy the notes"},
 			want:  indent + "/p/org · tidy the notes",
 		},
 		{
 			name:  "title fallback",
-			agent: kitty.Agent{ID: 10, Kind: "pi", Display: "idle", CWD: "/p/org", Title: "π - org"},
+			agent: agent.Agent{ID: 10, Kind: "pi", Display: "idle", CWD: "/p/org", Title: "π - org"},
 			want:  indent + "/p/org · π - org",
 		},
 	}
@@ -779,7 +797,7 @@ func TestAgentsMsgPreservesSelectedID(t *testing.T) {
 	m.selected = 1 // id 2
 	updated, _ := m.Update(agentsMsg{
 		generation: m.reloadGeneration,
-		agents: []kitty.Agent{
+		agents: []agent.Agent{
 			{ID: 1, Display: "blocked", CWD: "/p/llm-proxy"},
 			{ID: 4, Display: "done", CWD: "/p/qmp-relay"},
 			{ID: 9, Display: "done", CWD: "/p/new"},
@@ -960,7 +978,7 @@ func TestFocusErrClearsWhenSearchNarrowsSelection(t *testing.T) {
 	// so the cursor moves to another window and the stale error goes with it.
 	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	got := updated.(Model)
-	if got.selectedID() == 1 {
+	if got.selectedKey() == "kitty:1" {
 		t.Fatal("query should have moved the selection off window 1")
 	}
 	if got.focusErr != nil {
@@ -974,55 +992,66 @@ func TestReplaceAgentsSelectionFallback(t *testing.T) {
 		filter   string
 		query    string
 		selected int
-		agents   []kitty.Agent
-		wantID   int
+		agents   []agent.Agent
+		wantKey  string
 	}{
 		{
 			name:     "selected window closes, index stays valid",
 			selected: 1, // id 2
-			agents: []kitty.Agent{
+			agents: []agent.Agent{
 				{ID: 1, Display: "blocked"},
 				{ID: 3, Display: "working"},
 				{ID: 4, Display: "done"},
 			},
-			wantID: 3, // same index, next agent down
+			wantKey: "kitty:3", // same index, next agent down
 		},
 		{
 			name:     "selected window closes at the end, clamps",
 			selected: 3, // id 4
-			agents: []kitty.Agent{
+			agents: []agent.Agent{
 				{ID: 1, Display: "blocked"},
 				{ID: 2, Display: "working"},
 			},
-			wantID: 2,
+			wantKey: "kitty:2",
 		},
 		{
 			name:     "selection survives under an active filter",
 			filter:   "working",
 			selected: 1, // id 2
-			agents: []kitty.Agent{
+			agents: []agent.Agent{
 				{ID: 9, Display: "working", CWD: "/p/new"},
 				{ID: 2, Display: "working", CWD: "/p/dotfiles"},
 				{ID: 3, Display: "working", CWD: "/p/astra-l"},
 			},
-			wantID: 2,
+			wantKey: "kitty:2",
 		},
 		{
 			name:     "selection survives under an active query",
 			query:    "working",
 			selected: 1, // id 2
-			agents: []kitty.Agent{
+			agents: []agent.Agent{
 				{ID: 3, Display: "working", CWD: "/p/astra-l"},
 				{ID: 1, Display: "blocked", CWD: "/p/llm-proxy"},
 				{ID: 2, Display: "working", CWD: "/p/dotfiles"},
 			},
-			wantID: 2,
+			wantKey: "kitty:2",
+		},
+		{
+			// A tmux pane and a kitty window can carry the same number, and the
+			// cursor must stay on the one it was on.
+			name:     "a pane id equal to a window id does not steal the cursor",
+			selected: 1, // id 2
+			agents: []agent.Agent{
+				{ID: 2, Host: agent.HostTmux, Display: "working", CWD: "/p/dotfiles", Target: "kontora:1.%2"},
+				{ID: 2, Display: "working", CWD: "/p/dotfiles"},
+			},
+			wantKey: "kitty:2",
 		},
 		{
 			name:     "empty inventory resets to the empty state",
 			selected: 2,
 			agents:   nil,
-			wantID:   0,
+			wantKey:  "",
 		},
 	}
 	for _, tc := range cases {
@@ -1038,8 +1067,8 @@ func TestReplaceAgentsSelectionFallback(t *testing.T) {
 
 			m.replaceAgents(tc.agents)
 
-			if got := m.selectedID(); got != tc.wantID {
-				t.Fatalf("selected id: got %d, want %d", got, tc.wantID)
+			if got := m.selectedKey(); got != tc.wantKey {
+				t.Fatalf("selected agent: got %q, want %q", got, tc.wantKey)
 			}
 			if vis := m.visible(); len(vis) > 0 && (m.selected < 0 || m.selected >= len(vis)) {
 				t.Fatalf("selection %d outside visible list of %d", m.selected, len(vis))
@@ -1119,7 +1148,7 @@ func TestViewLoadStates(t *testing.T) {
 			want: "loading agents",
 			absent: []string{
 				"no agents.",                 // loading is not an empty inventory
-				"showing cached agents",      // nor stale data
+				"stale or missing",           // nor stale data
 				"remote control unavailable", // nor a fatal failure
 			},
 		},
@@ -1127,19 +1156,19 @@ func TestViewLoadStates(t *testing.T) {
 			name:   "empty inventory",
 			set:    func(m *Model) { m.agents = nil },
 			want:   "nothing has published agent state yet",
-			absent: []string{"loading agents", "showing cached agents", "remote control unavailable"},
+			absent: []string{"loading agents", "stale or missing", "remote control unavailable"},
 		},
 		{
 			// A failed first load is fatal, because nothing is cached to show.
 			name:   "fatal first load",
 			set:    func(m *Model) { m.agents = nil; m.reloadErr = errors.New("socket unavailable") },
 			want:   "kitty remote control unavailable",
-			absent: []string{"loading agents", "no agents.", "showing cached agents"},
+			absent: []string{"loading agents", "no agents.", "stale or missing"},
 		},
 		{
 			name:   "stale",
 			set:    func(m *Model) { m.reloadErr = errors.New("socket unavailable") },
-			want:   "showing cached agents",
+			want:   "stale or missing",
 			absent: []string{"loading agents", "remote control unavailable"},
 		},
 		{
@@ -1163,7 +1192,7 @@ func TestViewLoadStates(t *testing.T) {
 			name:   "stale kitty files",
 			set:    func(m *Model) { m.staleAssets = true },
 			want:   "kitty files are out of date · run cattery setup",
-			absent: []string{"showing cached agents"},
+			absent: []string{"stale or missing"},
 		},
 		{
 			name:   "fresh kitty files say nothing",
@@ -1176,7 +1205,7 @@ func TestViewLoadStates(t *testing.T) {
 			// rows on screen; stale files are a background chore.
 			name:   "a failed refresh outranks stale files",
 			set:    func(m *Model) { m.staleAssets = true; m.reloadErr = errors.New("socket unavailable") },
-			want:   "showing cached agents",
+			want:   "stale or missing",
 			absent: []string{"out of date"},
 		},
 	}
@@ -1276,8 +1305,8 @@ func TestViewFitsTerminal(t *testing.T) {
 
 // wideAgents exercises cell-width truncation with CJK, emoji ZWJ sequences, and
 // combining marks in every field the row renders.
-func wideAgents() []kitty.Agent {
-	return []kitty.Agent{
+func wideAgents() []agent.Agent {
+	return []agent.Agent{
 		{
 			ID: 1, Kind: "claude", Display: "blocked",
 			CWD:    "/p/项目名称很长很长很长很长/子目录",
@@ -1294,10 +1323,10 @@ func wideAgents() []kitty.Agent {
 	}
 }
 
-func manyAgents(n int) []kitty.Agent {
-	agents := make([]kitty.Agent, 0, n)
+func manyAgents(n int) []agent.Agent {
+	agents := make([]agent.Agent, 0, n)
 	for i := range n {
-		agents = append(agents, kitty.Agent{
+		agents = append(agents, agent.Agent{
 			ID:      i + 1,
 			Kind:    "pi",
 			Display: "working",
@@ -1627,7 +1656,9 @@ func sessionModel(t *testing.T, client *fakeClient) Model {
 	}
 	t.Setenv("CATTERY_SESSION_FILE", path)
 	m := sampleModel()
-	m.client = client
+	// Snapshots go to kitty alone, so "s" and "R" talk to the snapshot client
+	// rather than the one listing agents.
+	m.snapshots = client
 	return m
 }
 
@@ -1849,5 +1880,151 @@ func TestSessionHintNamesTheOperation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// --- tmux rows ---------------------------------------------------------------
+
+// tmuxAgent is a kontora agent: a detached pane in a ticket worktree.
+func tmuxAgent() agent.Agent {
+	return agent.Agent{
+		ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
+		CWD: "/p/astra-l/al-67je", Project: "astra-l", ProjectKey: "/p/astra-l/.git",
+		Root: "/p/astra-l/al-67je", Branch: "kontora/al-67je",
+		Target: "kontora:3.%17", Msg: "run the review",
+	}
+}
+
+// The chip says how Enter reaches the agent, which is the one thing the rest of
+// the row cannot show.
+func TestRowHostChip(t *testing.T) {
+	cases := []struct {
+		name string
+		in   agent.Agent
+		want bool
+	}{
+		{name: "a tmux pane is marked", in: tmuxAgent(), want: true},
+		{name: "a kitty window is not", in: checkout(3, "pi", "working", "dotfiles", "main")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := sampleModel()
+			for _, grouped := range []bool{true, false} {
+				line1, _ := m.renderRow(0, tc.in, 100, grouped)
+				got := ansi.Strip(line1)
+				if strings.Contains(got, " tmux ") != tc.want {
+					t.Errorf("grouped=%v row %q: tmux chip present=%v, want %v", grouped, got, !tc.want, tc.want)
+				}
+				// The kind chip stays either way: the host says where the agent
+				// runs, not what it is.
+				if !strings.Contains(got, " "+tc.in.Kind+" ") {
+					t.Errorf("grouped=%v row %q lost its kind chip", grouped, got)
+				}
+			}
+		})
+	}
+}
+
+// Enter attaches to a tmux agent instead of jumping to it, and the row and the
+// footer both have to say so before it is pressed.
+func TestTmuxRowSaysItAttaches(t *testing.T) {
+	m := sampleModel()
+	m.width, m.height = 120, 40
+	m.agents = []agent.Agent{tmuxAgent()}
+
+	line1, _ := m.renderRow(0, m.agents[0], 100, true)
+	if got := ansi.Strip(line1); !strings.Contains(got, attachHint) {
+		t.Errorf("selected tmux row %q does not offer %q", got, attachHint)
+	}
+	if got := ansi.Strip(m.renderHints(120)); !strings.Contains(got, attachHint) {
+		t.Errorf("footer %q does not offer %q", got, attachHint)
+	}
+	// The summary names the target, which is what `cattery attach` takes.
+	if got := ansi.Strip(m.renderSummary(120)); !strings.Contains(got, "kontora:3.%17") {
+		t.Errorf("summary %q does not name the target", got)
+	}
+
+	// A kitty row keeps the old wording and shows no target.
+	m.agents = []agent.Agent{checkout(3, "pi", "working", "dotfiles", "main")}
+	line1, _ = m.renderRow(0, m.agents[0], 100, true)
+	if got := ansi.Strip(line1); !strings.Contains(got, jumpHint) || strings.Contains(got, attachHint) {
+		t.Errorf("kitty row %q should offer %q", got, jumpHint)
+	}
+	if got := ansi.Strip(m.renderHints(120)); !strings.Contains(got, jumpHint) || strings.Contains(got, attachHint) {
+		t.Errorf("footer %q should offer %q", got, jumpHint)
+	}
+	if got := ansi.Strip(m.renderSummary(120)); strings.Contains(got, ":") {
+		t.Errorf("kitty summary %q should carry no target", got)
+	}
+}
+
+// The action is in flight: the row must not promise an attach and then report a
+// jump.
+func TestTmuxRowInFlightVerb(t *testing.T) {
+	m := sampleModel()
+	m.width, m.height = 120, 40
+	m.agents = []agent.Agent{tmuxAgent()}
+	m.focusing = true
+
+	line1, _ := m.renderRow(0, m.agents[0], 100, true)
+	for name, got := range map[string]string{
+		"row":       ansi.Strip(line1),
+		"footer":    ansi.Strip(m.renderHints(120)),
+		"title bar": ansi.Strip(m.renderTitleBar(120)),
+	} {
+		if !strings.Contains(got, "attach") {
+			t.Errorf("%s %q says nothing about attaching", name, got)
+		}
+	}
+}
+
+// The chip costs cells, so the thresholds that shed the status word and the
+// hint have to account for it. Every width still has to draw the row.
+func TestTmuxRowDegradesWithWidth(t *testing.T) {
+	m := sampleModel()
+	a := tmuxAgent()
+	m.agents = []agent.Agent{a}
+
+	cases := []struct {
+		name           string
+		inner          int
+		wantStatusWord bool
+		wantHint       bool
+	}{
+		{name: "wide", inner: 100, wantStatusWord: true, wantHint: true},
+		{name: "no room for the time and the hint", inner: minJumpHintWidth - 1, wantStatusWord: true, wantHint: true},
+		{name: "the status word goes with the chip in the way", inner: minStatusWordWidth + hostChipWidth - 1},
+		{name: "narrow", inner: 20},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			line1, _ := m.renderRow(0, a, tc.inner, true)
+			got := ansi.Strip(line1)
+			if width := ansi.StringWidth(got); width > tc.inner {
+				t.Fatalf("row is %d cells wide, over the %d it was given: %q", width, tc.inner, got)
+			}
+			if strings.Contains(got, "working ") != tc.wantStatusWord {
+				t.Errorf("inner=%d row %q: status word present=%v, want %v",
+					tc.inner, got, !tc.wantStatusWord, tc.wantStatusWord)
+			}
+			if strings.Contains(got, attachHint) != tc.wantHint {
+				t.Errorf("inner=%d row %q: hint present=%v, want %v", tc.inner, got, !tc.wantHint, tc.wantHint)
+			}
+		})
+	}
+}
+
+// Every footer tier has to fit the width it is meant for, with the longer
+// attach wording too.
+func TestHintTiersFitWithTheAttachAction(t *testing.T) {
+	m := sampleModel()
+	m.agents = []agent.Agent{tmuxAgent()}
+
+	for _, width := range []int{40, 60, 80, 100, 120} {
+		m.width, m.height = width, 40
+		line := ansi.Strip(m.renderHints(width))
+		if got := ansi.StringWidth(line); got > width {
+			t.Errorf("footer at width %d is %d cells: %q", width, got, line)
+		}
 	}
 }

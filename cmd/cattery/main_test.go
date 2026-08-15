@@ -11,7 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
+	"github.com/alexander-akhmetov/cattery/internal/tmux"
 )
 
 func TestRoute(t *testing.T) {
@@ -47,6 +49,10 @@ func TestRoute(t *testing.T) {
 			want:     cmdSetup,
 			wantArgs: []string{"--dry-run", "--kitty-dir", "/tmp/k"},
 		},
+
+		{name: "attach", args: []string{"attach", "kontora:3.%17"}, want: cmdAttach, wantArgs: []string{"kontora:3.%17"}},
+		// The target is checked where the attach runs, not here.
+		{name: "attach with no target", args: []string{"attach"}, want: cmdAttach},
 
 		{name: "unknown subcommand", args: []string{"install"}, wantErr: true},
 		{name: "unknown flag", args: []string{"-nope"}, wantErr: true},
@@ -439,4 +445,92 @@ func TestRunRestore(t *testing.T) {
 			t.Fatalf("exit code: got %d, want 2", code)
 		}
 	})
+}
+
+// --- print ------------------------------------------------------------------
+
+// printLister stands in for the merged inventory.
+type printLister struct {
+	agents []agent.Agent
+	err    error
+}
+
+func (p printLister) ListAgents(context.Context) ([]agent.Agent, error) { return p.agents, p.err }
+
+// A printed row says which host the agent runs in, and a tmux row carries the
+// target `cattery attach` takes. `cattery -print` is how the contract is
+// checked by hand when the picker shows nothing.
+func TestPrintAgents(t *testing.T) {
+	var out strings.Builder
+	err := printAgents(printLister{agents: []agent.Agent{
+		{
+			ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
+			Project: "astra-l", Branch: "kontora/al-67je",
+			CWD:    "/Users/x/.kontora/worktrees/astra-l/al-67je",
+			Target: "kontora:3.%17",
+		},
+		{
+			ID: 12, Host: agent.HostKitty, Kind: "pi", Display: "idle",
+			Project: "dotfiles", Branch: "main", CWD: "/Users/x/projects/dotfiles",
+		},
+	}}, &out)
+	if err != nil {
+		t.Fatalf("print: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2: %q", len(lines), out.String())
+	}
+	for _, want := range []string{"host=tmux", "id=17", "target=kontora:3.%17", "astra-l", "working"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("tmux row %q is missing %q", lines[0], want)
+		}
+	}
+	if !strings.Contains(lines[1], "host=kitty") || strings.Contains(lines[1], "target=") {
+		t.Errorf("kitty row %q should name its host and no target", lines[1])
+	}
+}
+
+// One host can fail while the other answers. Its rows are the whole inventory
+// on a machine with no kitty running, so they print and the failure still comes
+// back for the exit code.
+func TestPrintAgentsPartialFailure(t *testing.T) {
+	var out strings.Builder
+	err := printAgents(printLister{
+		agents: []agent.Agent{{ID: 17, Host: agent.HostTmux, Display: "working", Target: "kontora:3.%17"}},
+		err:    errors.New("kitty: no listening socket"),
+	}, &out)
+
+	if err == nil {
+		t.Fatal("expected the lister failure to come back")
+	}
+	if !strings.Contains(out.String(), "host=tmux") {
+		t.Errorf("dropped the rows the working host returned: %q", out.String())
+	}
+}
+
+// --- attach -----------------------------------------------------------------
+
+// A target is required, and one that is not <session>:<window>.<pane id>
+// never reaches tmux.
+func TestRunAttachArguments(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{name: "no target", args: nil, want: 2},
+		{name: "an empty target", args: []string{""}, want: 2},
+		{name: "two targets", args: []string{"kontora:3.%17", "kontora:4.%18"}, want: 2},
+		{name: "a target with no window index", args: []string{"kontora"}, want: 1},
+		{name: "a target with no pane id", args: []string{"kontora:3"}, want: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runAttach(tmux.NewClient(), tc.args); got != tc.want {
+				t.Fatalf("exit code: got %d, want %d", got, tc.want)
+			}
+		})
+	}
 }

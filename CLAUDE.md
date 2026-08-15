@@ -23,8 +23,14 @@ that is what decides whether the guarded import succeeds.
 
 `kitty/` holds the four files kitty loads directly. `extensions/cattery.ts` is
 the pi-side state writer. `cmd/` and `internal/` build the binary: the picker,
-`cattery setup`, `cattery state <x>` (the Claude-side writer), and
-`cattery save`/`cattery restore` (the tab-tree snapshot).
+`cattery setup`, `cattery state <x>` (the Claude-side writer),
+`cattery save`/`cattery restore` (the tab-tree snapshot), and `cattery attach`
+(a read-only view of a tmux agent).
+
+An agent runs in one of two hosts. `internal/agent` holds what both share: the
+`Agent` struct, its `Key()`, and the git grouping. `internal/kitty` and
+`internal/tmux` each list their own host, `internal/agents` merges them for the
+picker, and `internal/state` picks the transport the state writer publishes on.
 
 `cattery setup` installs copies of the `kitty/` files, so an install does not
 depend on where the source lives. A copy does not follow a binary upgrade, so
@@ -72,5 +78,31 @@ the picker compares the installed files with the embedded ones and warns.
   as sent as is.
 - `kitten @ ls` reports `session_name` on the window. Its tab dictionaries carry
   no such key.
+- A tmux server inherits the environment of whatever started it, so a detached
+  pane can carry a `KITTY_WINDOW_ID` belonging to an unrelated window. Both
+  writers check `$TMUX` and `$TMUX_PANE` first. Otherwise the state goes to that
+  window and the pane stays blank.
+- Grouped sessions share their windows, so `tmux list-panes -a` reports one pane
+  once per session. `internal/tmux` deduplicates by `pane_id`, keeping the row
+  whose session is not a `cattery-view-` viewer. Keeping the other row lists
+  every watched agent twice, under a target that dies with the viewer.
+- `tmux attach -r` is `read-only,ignore-size`. Dropping `ignore-size` lets the
+  viewer's terminal resize the agent's live pane.
+- `cattery attach` runs tmux as a child process, never `syscall.Exec`. The
+  grouped view session has to be killed after the detach, and an exec'd process
+  has nothing left to do it. That cleanup only runs if the process survives the
+  signal that ends the attach. kitty sends SIGHUP when the viewer tab closes,
+  and Go terminates on SIGHUP by default, so `Attach` takes SIGHUP, SIGINT, and
+  SIGTERM through `signal.NotifyContext`.
+- An agent's target is `<session>:<window index>.<pane id>`, not
+  `<session>:<window index>`. A window target resolves to whichever pane is
+  active, so `@AGENT_SEEN` would go to the other agent in a split window, and
+  the picker would match a viewer tab showing a different pane. tmux allows both
+  ":" and "." in a session name and reads its own targets from the end;
+  `splitTarget` does the same.
+- tmux ends a command at any argument that ends in ";", not only at one that is
+  nothing else. `@AGENT_MSG` carries raw prompt text, so both writers escape a
+  trailing ";" as `\;`. Without that escape a prompt ending in ";" loses that
+  character, and a prompt that is only ";" drops every update chained behind it.
 
 @README.md

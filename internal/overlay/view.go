@@ -9,7 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/alexander-akhmetov/cattery/internal/kitty"
+	"github.com/alexander-akhmetov/cattery/internal/agent"
 )
 
 // Catppuccin Mocha palette (the subset the picker uses).
@@ -57,19 +57,57 @@ const (
 	headerBlockLines = 2
 	rowContentLines  = 2
 
-	// Below this inner width the padded status word is dropped from a row.
+	// Below this inner width the padded status word is dropped from a row. A
+	// row carrying a host chip needs hostChipWidth more before it fits.
 	minStatusWordWidth = 30
 
-	// Below this inner width a row shows either its time or the jump hint,
+	// Below this inner width a row shows either its time or the action hint,
 	// never both.
 	minJumpHintWidth = 70
+
+	// hostChipWidth is the width of the " tmux " chip plus the space chips draws
+	// in front of it, which only a tmux row carries. The row's width thresholds
+	// add it, so a narrow overlay sheds the status word before the chip crowds
+	// out the agent's name.
+	hostChipWidth = 7
 
 	// Below this terminal height the chrome sheds its blank lines and the
 	// footer's selected-agent summary, leaving the list every row it can.
 	minRoomyHeight = 12
 
-	jumpHint = "\u23ce jump"
+	// What Enter does, per host. A kitty window is focused; a tmux pane opens a
+	// read-only view, and the hint says so before the user presses it.
+	jumpHint   = "\u23ce jump"
+	attachHint = "\u23ce attach (ro)"
 )
+
+// actionHint is what Enter does to this agent.
+func actionHint(a agent.Agent) string {
+	if a.Host == agent.HostTmux {
+		return attachHint
+	}
+	return jumpHint
+}
+
+// actionVerb is the in-flight label for the same action, so the row does not
+// promise an attach and then report a jump.
+func actionVerb(a agent.Agent) string {
+	if a.Host == agent.HostTmux {
+		return "attaching\u2026"
+	}
+	return "focusing\u2026"
+}
+
+// chips are the labels after a row's name: the agent kind always, and the host
+// when the agent is not a kitty window. Blue keeps the host apart from the
+// status colours, which own red, green, and yellow.
+func chips(a agent.Agent) []span {
+	out := []span{{" " + a.Kind + " ", modelColor(a.Kind), false, cSurface0}}
+	if a.Host == agent.HostTmux {
+		out = append(out, span{" ", cText, false, ""}, span{" tmux ", cBlue, false, cSurface0})
+	}
+	return out
+}
 
 func statusColor(display string) lipgloss.Color {
 	switch display {
@@ -125,7 +163,7 @@ func activityColor(display string) lipgloss.Color {
 // activityGlyph leads the line-2 task with a steady status glyph. A working
 // agent shows the animated braille spinner instead. An idle agent gets none,
 // because its middot repeats the separator before it and reads as a typo.
-func activityGlyph(a kitty.Agent, spin int) string {
+func activityGlyph(a agent.Agent, spin int) string {
 	switch a.Display {
 	case "working":
 		return string(spinnerFrames[spin%len(spinnerFrames)])
@@ -138,7 +176,7 @@ func activityGlyph(a kitty.Agent, spin int) string {
 
 // activity is the prompt text on line 2. It prefers the agent's published user
 // message (AGENT_MSG) and falls back to the window title.
-func activity(a kitty.Agent) string {
+func activity(a agent.Agent) string {
 	if msg := strings.TrimSpace(a.Msg); msg != "" {
 		return msg
 	}
@@ -160,7 +198,7 @@ func activity(a kitty.Agent) string {
 }
 
 // timeLabel is the right-hand time on line 1, phrased per status.
-func timeLabel(now time.Time, a kitty.Agent) string {
+func timeLabel(now time.Time, a agent.Agent) string {
 	switch a.Display {
 	case "blocked":
 		if e := elapsed(now, a.Since); e != "" {
@@ -178,7 +216,7 @@ func timeLabel(now time.Time, a kitty.Agent) string {
 }
 
 // metaRight is the footer's right-hand summary for the selected agent.
-func metaRight(now time.Time, a kitty.Agent) string {
+func metaRight(now time.Time, a agent.Agent) string {
 	switch a.Display {
 	case "working":
 		return elapsed(now, a.Since)
@@ -455,7 +493,11 @@ func (m Model) renderTitleBar(width int) string {
 	rightTiers := []string{"esc close"}
 	switch {
 	case m.focusing:
-		rightTiers = []string{"focusing…"}
+		verb := "focusing…"
+		if a, ok := m.selectedAgent(); ok {
+			verb = actionVerb(a)
+		}
+		rightTiers = []string{verb}
 	case m.searching:
 		rightTiers = []string{"esc clear · ^c close", "esc clear"}
 	}
@@ -566,7 +608,7 @@ type block struct {
 
 // blocks lays the visible agents out as project headings and rows. It returns
 // the blocks and the index of the block holding the selected agent.
-func (m Model) blocks(vis []kitty.Agent, inner int) ([]block, int) {
+func (m Model) blocks(vis []agent.Agent, inner int) ([]block, int) {
 	var out []block
 	selected := 0
 	header := ""
@@ -733,7 +775,7 @@ func (m Model) listLines(inner, avail int) []string {
 func (m Model) warning() string {
 	switch {
 	case m.reloadErr != nil:
-		return "refresh failed · showing cached agents · retrying automatically"
+		return "refresh failed · some agents may be stale or missing · retrying automatically"
 	case m.staleAssets:
 		return "kitty files are out of date · run cattery setup"
 	default:
@@ -794,7 +836,7 @@ func centeredState(inner, avail int, message, hint string) []string {
 
 // renderRow returns the two lines for one agent row. grouped says whether a
 // project heading sits above it, which decides how the row names itself.
-func (m Model) renderRow(i int, a kitty.Agent, inner int, grouped bool) (string, string) {
+func (m Model) renderRow(i int, a agent.Agent, inner int, grouped bool) (string, string) {
 	sc := statusColor(a.Display)
 	selected := i == m.selected
 
@@ -818,7 +860,11 @@ func (m Model) renderRow(i int, a kitty.Agent, inner int, grouped bool) (string,
 	}
 	// The glyph already carries the status, so a narrow row drops the padded
 	// status word instead of crowding out the agent's name.
-	if inner >= minStatusWordWidth {
+	statusWordWidth := minStatusWordWidth
+	if a.Host == agent.HostTmux {
+		statusWordWidth += hostChipWidth
+	}
+	if inner >= statusWordWidth {
 		left1 = append(left1,
 			span{fmt.Sprintf("%-*s", colStatus, a.Display), sc, true, ""},
 			span{" ", cText, false, ""},
@@ -830,31 +876,34 @@ func (m Model) renderRow(i int, a kitty.Agent, inner int, grouped bool) (string,
 		left1 = append(left1,
 			span{truncate(rowLabel(a), maxName), cText, true, ""},
 			span{" ", cText, false, ""},
-			span{" " + a.Kind + " ", modelColor(a.Kind), false, cSurface0},
 		)
+		left1 = append(left1, chips(a)...)
 	} else {
 		left1 = append(left1,
 			span{truncate(agentName(a), maxName), cText, true, ""},
 			span{" ", cText, false, ""},
-			span{" " + a.Kind + " ", modelColor(a.Kind), false, cSurface0},
+		)
+		left1 = append(left1, chips(a)...)
+		left1 = append(left1,
 			span{" ", cText, false, ""},
 			span{truncate(a.Branch, maxBranch), cOverlay1, false, ""},
 		)
 	}
+	hint := actionHint(a)
 	right1 := []span{{timeLabel(m.now, a), cOverlay2, false, ""}}
 	switch {
 	case selected && m.focusing:
-		right1 = []span{{"focusing…", cLavender, false, ""}}
+		right1 = []span{{actionVerb(a), cLavender, false, ""}}
 	case selected && inner < minJumpHintWidth:
 		//nolint:prealloc // every branch holds at most three spans, so a
 		// preallocated capacity would be a guess.
-		right1 = []span{{jumpHint, cLavender, false, ""}}
+		right1 = []span{{hint, cLavender, false, ""}}
 	case selected:
-		right1 = append(right1, span{"  ", cText, false, ""}, span{jumpHint, cLavender, false, ""})
+		right1 = append(right1, span{"  ", cText, false, ""}, span{hint, cLavender, false, ""})
 	case inner >= minJumpHintWidth:
-		// Reserve the hint's cells on every other row, so the time column holds
-		// still while the cursor moves.
-		right1 = append(right1, span{strings.Repeat(" ", lipgloss.Width(jumpHint)+2), cText, false, ""})
+		// Reserve this row's own hint, so the time column holds still while the
+		// cursor moves onto it.
+		right1 = append(right1, span{strings.Repeat(" ", lipgloss.Width(hint)+2), cText, false, ""})
 	}
 	line1 := composeLine(left1, right1, inner, bg)
 
@@ -901,6 +950,12 @@ func (m Model) renderSummary(width int) string {
 	if a.Branch != "" {
 		loc += " · " + truncate(a.Branch, maxBranch)
 	}
+	// The target is what `cattery attach` takes, and the only identity a tmux
+	// agent has outside the picker. A kitty agent is reached by window id, which
+	// the user never types.
+	if a.Target != "" {
+		loc += " · " + a.Target
+	}
 	left := []span{
 		{statusGlyph(a.Display), sc, false, ""},
 		{" ", cText, false, ""},
@@ -917,22 +972,29 @@ func (m Model) renderSummary(width int) string {
 // hintTiers are the footer keybinds from fullest to barest. Truncating the
 // longest list would cut the close key on the narrow terminals that need it, so
 // a shorter complete list wins.
+// The action names what Enter does to the selected agent, so it changes with
+// the cursor: "jump" for a kitty window, "attach (ro)" for a tmux pane.
 func (m Model) hintTiers() []string {
+	action := jumpHint
+	verb := "focusing"
+	if a, ok := m.selectedAgent(); ok {
+		action, verb = actionHint(a), strings.TrimSuffix(actionVerb(a), "…")
+	}
 	switch {
 	case m.focusing:
-		return []string{"focusing selected agent…", "focusing…"}
+		return []string{verb + " selected agent…", verb + "…"}
 	case m.searching:
-		return []string{"↑↓ move · ⏎ jump · esc clear · ^c close", "⏎ jump · esc clear", "esc clear"}
+		return []string{"↑↓ move · " + action + " · esc clear · ^c close", action + " · esc clear", "esc clear"}
 	case m.sessionBusy:
 		// The verb names which key is running. "R" restores a snapshot; "s"
 		// makes one.
 		return []string{m.sessionVerb + " the session snapshot…", m.sessionVerb + "…"}
 	default:
 		return []string{
-			"↑↓ / j k move · 1-9 select · ⏎ jump · / search · f filter · s save · R restore · esc close",
-			"j k move · ⏎ jump · / search · f filter · s save · R restore · esc close",
-			"j k move · ⏎ jump · / search · f filter · esc close",
-			"⏎ jump · / search · esc close",
+			"↑↓ / j k move · 1-9 select · " + action + " · / search · f filter · s save · R restore · esc close",
+			"j k move · " + action + " · / search · f filter · s save · R restore · esc close",
+			"j k move · " + action + " · / search · f filter · esc close",
+			action + " · / search · esc close",
 			"esc close",
 		}
 	}

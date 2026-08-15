@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,32 +155,23 @@ func TestClearReturnsBeforeReadingStdin(t *testing.T) {
 	assertVars(t, rec.sent(), []Var{del(varState), del(varKind), del(varMsg)})
 }
 
-func TestWriteWithoutAWayToPublish(t *testing.T) {
-	cases := []struct {
-		name   string
-		writer Writer
-	}{
-		{
-			// kitty sets KITTY_WINDOW_ID on every child shell, so an empty one
-			// means the caller is somewhere else.
-			name:   "outside kitty",
-			writer: Writer{Stdin: strings.NewReader(`{"prompt":"x"}`), Transport: &recorder{}},
-		},
-		{
-			name:   "no transport",
-			writer: Writer{WindowID: "7", Stdin: strings.NewReader(`{"prompt":"x"}`)},
-		},
+// A caller in neither kitty nor tmux gets no transport from New, and the writer
+// is the last place that can notice: every state word arrives from a hook that
+// cannot report a failure. The window id is not the test, because a tmux pane
+// can carry one belonging to another window.
+func TestWriteWithoutAWayToPublish(_ *testing.T) {
+	writer := Writer{WindowID: "7", Stdin: strings.NewReader(`{"prompt":"x"}`)}
+	for _, state := range []string{"working", "blocked", "idle", "clear"} {
+		writer.Write(state)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, state := range []string{"working", "blocked", "idle", "clear"} {
-				tc.writer.Write(state)
-			}
-			if rec, ok := tc.writer.Transport.(*recorder); ok && len(rec.batches) != 0 {
-				t.Fatalf("published %v with no window id", rec.batches)
-			}
-		})
-	}
+}
+
+// A pane publishes with no kitty window id at all, which is what a tmux server
+// started outside kitty gives every agent under it.
+func TestWritePublishesWithoutAKittyWindow(t *testing.T) {
+	rec := &recorder{}
+	Writer{Stdin: strings.NewReader(`{"prompt":"fix the picker"}`), Transport: rec}.Write("working")
+	assertVars(t, rec.sent(), []Var{set(varKind, "claude"), set(varState, "working"), set(varMsg, "fix the picker")})
 }
 
 // AGENT_RESUME tells a snapshot how to reopen this Claude session. Every hook
@@ -463,23 +456,49 @@ func TestRunWithoutAState(_ *testing.T) {
 
 // --- transports -------------------------------------------------------------
 
-// New wires the transports from the kitty environment: the terminal always, and
-// the remote-control socket behind it when kitty published one and the window
-// id is a number that socket can match on.
-func TestNewBuildsTheTransportChain(t *testing.T) {
+// New picks the transport from the environment. tmux comes first, then the
+// terminal, then the remote-control socket behind it.
+func TestNewPicksTheTransport(t *testing.T) {
 	cases := []struct {
 		name     string
+		tmux     string
+		pane     string
 		windowID string
 		listenOn string
-		want     int // transports in the chain; 0 means no transport at all
+		// want is the chain length, or 0 for no transport at all. wantTmux
+		// overrides it: the tmux transport is not a chain.
+		want     int
+		wantTmux string
 	}{
-		{name: "outside kitty"},
+		{name: "outside kitty and tmux"},
 		{name: "inside kitty, no remote control", windowID: "7", want: 1},
 		{name: "inside kitty with remote control", windowID: "7", listenOn: "unix:/tmp/kitty-1", want: 2},
 		{name: "a window id that is not a number", windowID: "w7", listenOn: "unix:/tmp/kitty-1", want: 1},
+		{
+			// The tmux server inherits the environment of whatever started it,
+			// so a detached pane can carry a kitty window id that belongs to an
+			// unrelated window. The pane wins.
+			name:     "a pane with a leaked kitty window id",
+			tmux:     "/private/tmp/tmux-501/default,69427,0",
+			pane:     "%17",
+			windowID: "7",
+			listenOn: "unix:/tmp/kitty-1",
+			wantTmux: "%17",
+		},
+		{name: "a pane outside kitty", tmux: "/private/tmp/tmux-501/default,1,0", pane: "%17", wantTmux: "%17"},
+		{
+			// Half the pair is not enough to name a pane to publish to.
+			name:     "TMUX without a pane falls back to kitty",
+			tmux:     "/private/tmp/tmux-501/default,1,0",
+			windowID: "7",
+			want:     1,
+		},
+		{name: "a pane without TMUX is not a pane", pane: "%17", windowID: "7", want: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TMUX", tc.tmux)
+			t.Setenv("TMUX_PANE", tc.pane)
 			t.Setenv("KITTY_WINDOW_ID", tc.windowID)
 			t.Setenv("KITTY_LISTEN_ON", tc.listenOn)
 
@@ -487,6 +506,16 @@ func TestNewBuildsTheTransportChain(t *testing.T) {
 
 			if w.WindowID != tc.windowID {
 				t.Errorf("window id: got %q, want %q", w.WindowID, tc.windowID)
+			}
+			if tc.wantTmux != "" {
+				got, ok := w.Transport.(tmuxTransport)
+				if !ok {
+					t.Fatalf("transport: got %T, want the tmux transport", w.Transport)
+				}
+				if got.pane != tc.wantTmux {
+					t.Fatalf("pane: got %q, want %q", got.pane, tc.wantTmux)
+				}
+				return
 			}
 			if tc.want == 0 {
 				if w.Transport != nil {
@@ -571,6 +600,218 @@ func assertVars(t *testing.T, got, want []Var) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("update %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// --- the tmux transport -------------------------------------------------------
+
+// fakeTmux writes a stub tmux that records its argv one line per run, and
+// answers `show` with prev. It returns the transport and a reader for the log.
+func fakeTmux(t *testing.T, prev string) (tmuxTransport, func() []string) {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "argv")
+	body := "if [ \"$1\" = show ]; then printf '%s\\n' " + strconv.Quote(prev) + "; exit 0; fi\n" +
+		"printf '%s\\n' \"$*\" >> " + log + "\n"
+	path := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return tmuxTransport{tmux: path, pane: "%17"}, func() []string {
+		data, err := os.ReadFile(log)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	}
+}
+
+// One process per batch, with tmux's own ";" separator between the commands,
+// and "-u" for a deletion.
+func TestTmuxTransportPublishesOneCommandLine(t *testing.T) {
+	transport, _ := fakeTmux(t, "")
+	args := transport.args([]Var{set(varKind, "claude"), set(varState, "idle"), del(varMsg)})
+
+	want := []string{
+		"set", "-p", "-t", "%17", "@AGENT_KIND", "claude", ";",
+		"set", "-p", "-t", "%17", "@AGENT_STATE", "idle", ";",
+		"set", "-p", "-u", "-t", "%17", "@AGENT_MSG",
+	}
+	if !slices.Equal(args, want) {
+		t.Fatalf("argv:\n got %v\nwant %v", args, want)
+	}
+}
+
+// tmux ends a command at any argument ending in ";", so a prompt ending in one
+// would lose that character, and a prompt that is only ";" would swallow every
+// update chained behind it.
+func TestTmuxTransportEscapesACommandTerminator(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "a plain value is passed as it is", value: "run make test", want: "run make test"},
+		{name: "a semicolon inside the value is not a terminator", value: "cd x; make", want: "cd x; make"},
+		{name: "a trailing semicolon is escaped", value: "make test;", want: `make test\;`},
+		{name: "a value that is only a semicolon", value: ";", want: `\;`},
+		{name: "a backslash before the semicolon survives", value: `make\;`, want: `make\\;`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport, _ := fakeTmux(t, "")
+
+			args := transport.args([]Var{set(varMsg, tc.value)})
+
+			if got := args[len(args)-1]; got != tc.want {
+				t.Fatalf("value: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The picker derives "done" and the elapsed time from three options the writer
+// keeps beside the state word.
+func TestTmuxTransportMetadata(t *testing.T) {
+	cases := []struct {
+		name string
+		prev string
+		vars []Var
+		// want is the option names the run has to carry, in order, with a "-u "
+		// prefix for the ones it deletes.
+		want []string
+	}{
+		{
+			name: "a new state stamps the time and marks the work",
+			prev: "idle",
+			vars: []Var{set(varKind, "claude"), set(varState, "working")},
+			want: []string{"@AGENT_KIND", "@AGENT_STATE", "@AGENT_SINCE", "@AGENT_WORKED", "-u @AGENT_SEEN"},
+		},
+		{
+			name: "blocked marks the work too",
+			prev: "working",
+			vars: []Var{set(varState, "blocked")},
+			want: []string{"@AGENT_STATE", "@AGENT_SINCE", "@AGENT_WORKED", "-u @AGENT_SEEN"},
+		},
+		{
+			// Claude fires a hook per turn, and the state word often repeats.
+			// Restamping would restart the picker's elapsed counter each time.
+			name: "the same state again leaves the time alone",
+			prev: "working",
+			vars: []Var{set(varState, "working")},
+			want: []string{"@AGENT_STATE", "@AGENT_WORKED", "-u @AGENT_SEEN"},
+		},
+		{
+			// The pane has no state yet, so this is a change.
+			name: "the first state of a pane is stamped",
+			prev: "",
+			vars: []Var{set(varState, "idle")},
+			want: []string{"@AGENT_STATE", "@AGENT_SINCE"},
+		},
+		{
+			// Going idle neither marks work nor acknowledges it: that pair is
+			// what turns into "done" in the picker.
+			name: "idle touches neither marker",
+			prev: "working",
+			vars: []Var{set(varState, "idle")},
+			want: []string{"@AGENT_STATE", "@AGENT_SINCE"},
+		},
+		{
+			// A pane outlives its agents, and the next one starts with nothing
+			// finished.
+			name: "clear forgets the work",
+			prev: "idle",
+			vars: []Var{del(varState), del(varKind), del(varMsg)},
+			want: []string{"-u @AGENT_STATE", "-u @AGENT_KIND", "-u @AGENT_MSG", "-u @AGENT_WORKED"},
+		},
+		{
+			name: "a batch with no state word gets no metadata",
+			prev: "working",
+			vars: []Var{set(varResume, "claude --resume abc")},
+			want: []string{"@AGENT_RESUME"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport, runs := fakeTmux(t, tc.prev)
+
+			if err := transport.Publish(tc.vars); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+
+			lines := runs()
+			if len(lines) != 1 {
+				t.Fatalf("runs: got %d, want one process: %v", len(lines), lines)
+			}
+			if got := optionsIn(lines[0]); !slices.Equal(got, tc.want) {
+				t.Fatalf("options:\n got %v\nwant %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// optionsIn reads the options one chained tmux command line sets, marking the
+// deletions with "-u ".
+func optionsIn(line string) []string {
+	var out []string
+	for command := range strings.SplitSeq(line, " ; ") {
+		fields := strings.Fields(command)
+		for i, f := range fields {
+			if !strings.HasPrefix(f, "@") {
+				continue
+			}
+			if slices.Contains(fields[:i], "-u") {
+				out = append(out, "-u "+f)
+				continue
+			}
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// The picker reads @AGENT_SINCE as unix seconds, and shows nothing at all for a
+// value it cannot parse.
+func TestTmuxTransportStampsUnixSeconds(t *testing.T) {
+	transport, runs := fakeTmux(t, "idle")
+	before := time.Now().Unix()
+
+	if err := transport.Publish([]Var{set(varState, "working")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	fields := strings.Fields(runs()[0])
+	i := slices.Index(fields, "@AGENT_SINCE")
+	if i < 0 || i+1 >= len(fields) {
+		t.Fatalf("no @AGENT_SINCE value in %v", fields)
+	}
+	stamp, err := strconv.ParseInt(fields[i+1], 10, 64)
+	if err != nil {
+		t.Fatalf("@AGENT_SINCE %q is not unix seconds: %v", fields[i+1], err)
+	}
+	if stamp < before || stamp > time.Now().Unix() {
+		t.Fatalf("@AGENT_SINCE %d is outside the run", stamp)
+	}
+}
+
+// A pane keeps its resume command after the agent goes, the same as a kitty
+// window: `cattery save` reads it long afterwards.
+func TestTmuxClearKeepsTheResumeCommand(t *testing.T) {
+	transport, runs := fakeTmux(t, "idle")
+
+	Writer{Stdin: blockingPipe{}, Transport: transport}.Write("clear")
+
+	line := runs()[0]
+	if strings.Contains(line, "@AGENT_RESUME") {
+		t.Fatalf("clear touched the resume command: %q", line)
+	}
+	for _, want := range []string{"@AGENT_STATE", "@AGENT_KIND", "@AGENT_MSG", "@AGENT_WORKED"} {
+		if !strings.Contains(line, "-u -t %17 "+want) {
+			t.Errorf("clear did not unset %s: %q", want, line)
 		}
 	}
 }
