@@ -10,6 +10,7 @@
 //	cattery save [path]      snapshot the kitty tab tree
 //	cattery restore [path]   put a snapshot back
 //	cattery attach <target>  watch a tmux agent read-only
+//	cattery events           print agent state transitions as JSON lines
 //
 // The picker shows every kitty window carrying AGENT_DISPLAY. The watcher
 // derives that variable from the agent's AGENT_STATE, so a window that sets
@@ -31,14 +32,19 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/alexander-akhmetov/cattery"
 	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/agents"
+	"github.com/alexander-akhmetov/cattery/internal/events"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/overlay"
 	"github.com/alexander-akhmetov/cattery/internal/session"
@@ -57,6 +63,7 @@ const (
 	cmdSave    = "save"
 	cmdRestore = "restore"
 	cmdAttach  = "attach"
+	cmdEvents  = "events"
 	cmdVersion = "version"
 )
 
@@ -115,6 +122,8 @@ func run(args []string) int {
 		return runRestore(kitty.NewClient(), os.Stdout, cmd.args)
 	case cmdAttach:
 		return runAttach(tmux.NewClient(), cmd.args)
+	case cmdEvents:
+		return runEvents(kitty.NewClient(), os.Stdout, cmd.args)
 	case cmdPrint:
 		if err := printAgents(agents.NewClient(kitty.NewClient()), os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "cattery:", err)
@@ -137,10 +146,10 @@ func run(args []string) int {
 func route(args []string, out io.Writer) (command, error) {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		switch args[0] {
-		case cmdSetup, cmdState, cmdSave, cmdRestore, cmdAttach:
+		case cmdSetup, cmdState, cmdSave, cmdRestore, cmdAttach, cmdEvents:
 			return command{name: args[0], args: args[1:]}, nil
 		default:
-			return command{}, fmt.Errorf("unknown command %q (try setup, state, save, restore, attach, or no argument for the picker)", args[0])
+			return command{}, fmt.Errorf("unknown command %q (try setup, state, save, restore, attach, events, or no argument for the picker)", args[0])
 		}
 	}
 
@@ -319,6 +328,57 @@ func printAgents(client lister, out io.Writer) error {
 			a.Project, a.Display, a.Kind, a.Host, a.ID, a.Branch, a.CWD, target)
 	}
 	return err
+}
+
+// exitKittyGone says the kitty that took the subscription has exited. It is
+// its own code because the fix is to start the command again, under a kitty
+// that is running, which a supervisor can do without reading the message.
+const exitKittyGone = 3
+
+// runEvents prints agent state transitions, one JSON object per line, until it
+// is interrupted or the pipe it writes to closes.
+//
+// The subscription is a socket registered with the running kitty, so it needs
+// the kitten `cattery setup` installed. An install that predates this version
+// has no such file, and kitty refuses the call.
+func runEvents(client events.KittenRunner, out io.Writer, args []string) int {
+	flags := flag.NewFlagSet("cattery events", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	if err := flags.Parse(args); err != nil {
+		return flagExit(err)
+	}
+	if flags.NArg() > 0 {
+		fmt.Fprintln(os.Stderr, "cattery: events takes no arguments")
+		return 2
+	}
+	kittyDir, err := setup.KittyDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return 1
+	}
+
+	// Ctrl-C is how this command normally ends, and the unregister has to run
+	// before the process does.
+	//
+	// SIGPIPE is in the list for the same reason. Go makes a broken pipe on
+	// stdout a fatal signal unless the program asks for it, so `cattery events |
+	// head -1` would die where it stands, leaving its path in kitty's registry
+	// and its socket on disk. Asking for it turns the write into an EPIPE the
+	// read loop already knows how to end on.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGPIPE)
+	defer stop()
+
+	err = events.Subscribe(ctx, client, filepath.Join(kittyDir, cattery.EventsFile), out)
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, events.ErrKittyGone):
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return exitKittyGone
+	default:
+		fmt.Fprintln(os.Stderr, "cattery:", err)
+		return 1
+	}
 }
 
 // runAttach opens a read-only view of one tmux agent, and returns when the

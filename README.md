@@ -134,3 +134,54 @@ until it works again.
 
 Snapshots stay kitty-only. `cattery save` records kitty tabs, and a tmux agent
 belongs to whatever started it.
+
+## Events
+
+`cattery events` prints one line per agent state transition, so something other
+than cattery can react to them:
+
+```console
+$ cattery events
+{"ts":1755302096,"window":363,"kind":"pi","from":"idle","to":"working","title":"~/projects/sigil","cwd":"/Users/alexander/projects/sigil","msg":"fix the picker","focused":false}
+{"ts":1755302241,"window":363,"kind":"pi","from":"working","to":"blocked","title":"~/projects/sigil","cwd":"/Users/alexander/projects/sigil","msg":"fix the picker","focused":false}
+```
+
+Each line is one JSON object:
+
+| Field | Meaning |
+|---|---|
+| `ts` | unix seconds |
+| `window` | the kitty window id |
+| `kind` | what the agent calls itself, `pi` or `claude`, and empty on a `cleared` event from Claude, which drops `AGENT_KIND` in the same batch |
+| `from` | the display state before this change, `null` the first time the window is seen |
+| `to` | `working`, `blocked`, `done`, `idle`, `cleared` when the agent dropped its state, `closed` when the window went away |
+| `title` | the window title, cut to 200 characters |
+| `cwd` | the agent's directory, the one the picker shows |
+| `msg` | the prompt the agent is on |
+| `focused` | whether you were looking at the window |
+
+One worked subscriber, a desktop notification for every agent that stops for an
+answer:
+
+```bash
+cattery events | jq -r --unbuffered 'select(.to == "blocked") | .cwd' |
+  while read -r cwd; do terminal-notifier -title "agent blocked" -message "$cwd"; done
+```
+
+The command binds a unix datagram socket and registers its path with the
+running kitty. The watcher sends one datagram per transition to every
+registered path, and keeps nothing: an event that fires while nobody is
+subscribed is gone, and there is no replay. What ran yesterday is in the
+agents' own session files.
+
+Three things to know:
+
+* tmux agents emit nothing. No watcher runs there, and the picker derives a
+  tmux agent's `done` when it reads the pane, so a writer-side event would
+  carry a state the picker disagrees with.
+* Registering goes through a kitten `cattery setup` installs, so run setup
+  again after upgrading the binary. Without it kitty has no such kitten and the
+  command says so.
+* The registry lives in the kitty process. A kitty restart drops every
+  subscription, and `cattery events` exits 3 when it notices, for a supervisor
+  to start again.

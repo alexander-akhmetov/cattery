@@ -137,6 +137,24 @@ func setUserVarsCommand(ctx context.Context, kitten string, id int, vars []strin
 	return exec.CommandContext(ctx, kitten, args...)
 }
 
+// Kitten runs a kitten inside the running kitty, as `kitten @ kitten <path>
+// <args...>`, and returns what the kitten's handle_result gave back.
+//
+// The path has to be absolute: kitty resolves a relative one against its own
+// configuration directory. Unlike Action, this is a remote-control command with
+// its own parser, so the arguments stay separate argv entries.
+func (c *Client) Kitten(ctx context.Context, path string, args ...string) (string, error) {
+	out, err := kittenCommand(ctx, c.kitten, path, args).Output()
+	if err != nil {
+		return "", fmt.Errorf("kitten %s: %w", path, commandError(err))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func kittenCommand(ctx context.Context, kitten, path string, args []string) *exec.Cmd {
+	return exec.CommandContext(ctx, kitten, append([]string{"@", "kitten", path}, args...)...)
+}
+
 // Action runs one kitty action over remote control, as `kitten @ action <arg>`.
 //
 // The action name and its arguments go in a single string, which is what

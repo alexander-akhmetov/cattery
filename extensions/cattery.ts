@@ -22,15 +22,19 @@
  *
  * Lifecycle mapping:
  *   session_start                              -> AGENT_KIND=pi, AGENT_RESUME,
- *                                                 AGENT_STATE=idle,
  *                                                 AGENT_MSG cleared,
+ *                                                 AGENT_STATE=idle,
  *                                                 @AGENT_WORKED cleared (tmux)
  *   before_agent_start                         -> AGENT_MSG=<prompt>
  *   agent_start                                -> AGENT_STATE=working
  *   tool_execution_start (interactive tool)    -> AGENT_STATE=blocked
  *   tool_execution_end   (interactive tool)    -> AGENT_STATE=working
  *   agent_settled                              -> AGENT_STATE=idle
- *   session_shutdown                           -> AGENT_STATE, AGENT_MSG cleared
+ *   session_shutdown                           -> AGENT_MSG, AGENT_STATE cleared
+ *
+ * AGENT_STATE is written last in every one of those, because writing it is what
+ * wakes the watcher: a variable written after it is missing from the transition
+ * the watcher publishes.
  *
  * Shutdown leaves AGENT_RESUME alone, because `cattery save` reads it off the
  * window long after the agent is gone.
@@ -292,10 +296,13 @@ export default function (pi: ExtensionAPI) {
     // Clear AGENT_STATE so the tab bar drops the marker at once. Keep
     // AGENT_KIND so a quick `/resume` keeps its tag; the watcher tolerates a
     // kind with no state.
+    //
+    // AGENT_MSG goes first: clearing AGENT_STATE is what wakes the watcher, and
+    // the event it publishes would otherwise carry the last prompt.
+    setUserVar("AGENT_MSG", null);
     if (lastState !== null) {
       lastState = null;
       setUserVar("AGENT_STATE", null);
     }
-    setUserVar("AGENT_MSG", null);
   });
 }

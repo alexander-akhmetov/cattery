@@ -9,12 +9,17 @@ and calls one C function, which the stub records and refuses inside
 which stores user variables the way kitty does.
 
 Notifications go through `subprocess.Popen`, which `WatcherTestCase` replaces
-with a recorder, so no test starts terminal-notifier.
+with a recorder, so no test starts terminal-notifier. The transition datagrams
+go through `socket.socket`, which `PublishTest` replaces the same way, so no
+test opens one.
 
 Run with `make test-python`.
 """
 
+import errno
 import importlib.util
+import json
+import os
 import sys
 import time
 import types
@@ -79,13 +84,34 @@ def _load_watcher():
 watcher = _load_watcher()
 
 
+class FakeChild:
+    """kitty's process handle. The watcher reads one field off it."""
+
+    def __init__(self, cwd):
+        self.current_cwd = cwd
+
+
 class FakeWindow:
-    def __init__(self, window_id=1, display=None, title="", focused=False, state=None, kind=None, os_window_id=1):
+    def __init__(
+        self,
+        window_id=1,
+        display=None,
+        title="",
+        focused=False,
+        state=None,
+        kind=None,
+        os_window_id=1,
+        cwd="",
+        msg=None,
+    ):
         self.id = window_id
         self.os_window_id = os_window_id
         self.title = title
         self.is_focused = focused
+        self.child = FakeChild(cwd)
         self.user_vars = {}
+        if msg is not None:
+            self.user_vars["AGENT_MSG"] = msg
         # Every write the watcher made, as (key, value), including the
         # deletions it makes by passing None.
         self.var_calls = []
@@ -151,6 +177,52 @@ class RecordingPopen:
             raise self.error
         self.calls.append(argv)
         return None
+
+
+class RecordingSocket:
+    """Stand-in for the watcher's datagram socket.
+
+    It records what was sent where, fails one path with an errno, or raises
+    whatever `raises` holds for every send.
+    """
+
+    def __init__(self):
+        self.sent = []  # (path, the decoded event)
+        self.raw = []  # the bytes of each datagram, which has a size limit
+        self.errors = {}  # path -> errno raised instead of sending
+        self.raises = None
+        self.blocking = None
+
+    def setblocking(self, flag):
+        self.blocking = flag
+
+    def sendto(self, payload, path):
+        if self.raises is not None:
+            raise self.raises
+        code = self.errors.get(path)
+        if code is not None:
+            raise OSError(code, os.strerror(code))
+        self.sent.append((path, json.loads(payload)))
+        self.raw.append(payload)
+        return len(payload)
+
+    def paths(self):
+        return [path for path, _ in self.sent]
+
+    def events(self):
+        return [event for _, event in self.sent]
+
+
+class SocketFactory:
+    """Stand-in for socket.socket, handing out one recorder and counting calls."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.calls = 0
+
+    def __call__(self, family, kind):
+        self.calls += 1
+        return self.sock
 
 
 class WatcherTestCase(unittest.TestCase):
@@ -366,6 +438,218 @@ class ApplyTest(WatcherTestCase):
         watcher._apply(boss, window)
 
         self.assertEqual(window.user_vars["AGENT_DISPLAY"], "done")
+
+
+class PublishTest(WatcherTestCase):
+    """The transition datagrams, and what a bad subscriber can cost kitty."""
+
+    def setUp(self):
+        super().setUp()
+        self.sock = RecordingSocket()
+        self.factory = SocketFactory(self.sock)
+        # The watcher keeps one socket for the life of the process, so a test
+        # that made it must not leave it for the next one.
+        watcher._sender = None
+        self.addCleanup(setattr, watcher, "_sender", None)
+        patcher = mock.patch.object(watcher.socket, "socket", self.factory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def subscribe(self, boss, *paths):
+        watcher._ensure_state(boss)
+        for path in paths:
+            boss._agent_subs[path] = None
+
+    def test_a_transition_carries_the_agent_and_its_prompt(self):
+        window = FakeWindow(
+            363,
+            display="working",
+            state="blocked",
+            kind="pi",
+            title="~/projects/sigil",
+            cwd="/Users/x/projects/sigil",
+            msg="fix the picker",
+        )
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+
+        self.assertEqual(self.sock.paths(), ["/tmp/one.sock"])
+        event = self.sock.events()[0]
+        self.assertEqual(event["from"], "working")
+        self.assertEqual(event["to"], "blocked")
+        self.assertEqual(event["window"], 363)
+        self.assertEqual(event["kind"], "pi")
+        self.assertEqual(event["title"], "~/projects/sigil")
+        self.assertEqual(event["cwd"], "/Users/x/projects/sigil")
+        self.assertEqual(event["msg"], "fix the picker")
+        self.assertIs(event["focused"], False)
+        self.assertAlmostEqual(event["ts"], int(time.time()), delta=5)
+
+    def test_the_event_is_one_compact_utf8_object(self):
+        window = FakeWindow(1, display="working", state="blocked", kind="pi", msg="почини пикер")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+
+        payload = self.sock.raw[0]
+        self.assertTrue(payload.startswith(b'{"ts":'), payload[:16])
+        self.assertIn(b'"kind":"pi"', payload, "no padding between the fields")
+        self.assertIn("почини пикер".encode(), payload, "the text as UTF-8, not as \\u escapes")
+
+    def test_an_event_fits_in_one_datagram(self):
+        # macOS refuses a unix datagram over net.local.dgram.maxdgram, 2048
+        # bytes by default, and its EMSGSIZE reads here as a subscriber that is
+        # behind: the event would go missing with nothing said. A title is
+        # whatever the program in the window set.
+        window = FakeWindow(
+            1,
+            display="working",
+            state="blocked",
+            kind="pi",
+            title="ф" * 900,
+            cwd="/Users/x/projects/sigil",
+            msg="п" * 900,
+        )
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+
+        self.assertLess(len(self.sock.raw[0]), 2048)
+        event = self.sock.events()[0]
+        self.assertEqual(len(event["title"]), 200)
+        self.assertTrue(event["title"].endswith("…"))
+        self.assertEqual(len(event["msg"]), 200)
+
+    def test_the_first_display_of_a_window_has_no_previous_one(self):
+        window = FakeWindow(1, state="working", kind="claude")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+
+        self.assertIsNone(self.sock.events()[0]["from"])
+
+    def test_each_subscriber_gets_its_own_copy(self):
+        window = FakeWindow(1, display="working", state="blocked", kind="claude")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock", "/tmp/two.sock")
+
+        watcher._apply(boss, window)
+
+        self.assertEqual(self.sock.paths(), ["/tmp/one.sock", "/tmp/two.sock"])
+        self.assertEqual(self.sock.events()[0], self.sock.events()[1])
+
+    def test_only_a_changed_display_is_an_event(self):
+        window = FakeWindow(1, state="blocked", kind="claude")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+        watcher._apply(boss, window)
+
+        self.assertEqual(len(self.sock.sent), 1)
+
+    def test_a_cleared_state_carries_no_prompt(self):
+        window = FakeWindow(1, display="working", state="working", kind="claude", msg="fix the picker")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+        # Both writers delete AGENT_MSG before AGENT_STATE, and deleting
+        # AGENT_STATE is what runs the watcher, so the prompt is already gone.
+        del window.user_vars["AGENT_MSG"]
+        del window.user_vars["AGENT_STATE"]
+
+        watcher._apply(boss, window)
+
+        event = self.sock.events()[0]
+        self.assertEqual(event["from"], "working")
+        self.assertEqual(event["to"], "cleared")
+        self.assertEqual(event["msg"], "")
+
+    def test_a_window_that_never_opted_in_reports_nothing(self):
+        window = FakeWindow(1)
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+        watcher.on_close(boss, window, {})
+
+        self.assertEqual(self.sock.sent, [])
+
+    def test_a_closing_window_is_reported(self):
+        window = FakeWindow(1, display="blocked", title="agent")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher.on_close(boss, window, {})
+
+        event = self.sock.events()[0]
+        self.assertEqual(event["from"], "blocked")
+        self.assertEqual(event["to"], "closed")
+
+    def test_a_departed_subscriber_is_pruned(self):
+        for name, code in (("no socket at the path", errno.ENOENT), ("nobody bound to it", errno.ECONNREFUSED)):
+            with self.subTest(name):
+                self.sock.sent.clear()
+                self.sock.errors = {"/tmp/gone.sock": code}
+                window = FakeWindow(1, display="working", state="blocked", kind="claude")
+                boss = boss_for([window])
+                self.subscribe(boss, "/tmp/gone.sock", "/tmp/alive.sock")
+
+                watcher._apply(boss, window)
+
+                self.assertEqual(list(boss._agent_subs), ["/tmp/alive.sock"])
+                self.assertEqual(self.sock.paths(), ["/tmp/alive.sock"])
+                self.assertEqual(window.user_vars["AGENT_DISPLAY"], "blocked", "the marker still moved")
+
+    def test_a_subscriber_that_is_behind_keeps_its_registration(self):
+        self.sock.errors = {"/tmp/slow.sock": errno.ENOBUFS}
+        window = FakeWindow(1, display="working", state="blocked", kind="claude")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/slow.sock")
+
+        watcher._apply(boss, window)
+
+        self.assertEqual(list(boss._agent_subs), ["/tmp/slow.sock"], "alive, just behind")
+        self.assertEqual(self.sock.sent, [], "that datagram is dropped")
+
+    def test_a_raising_send_costs_nothing(self):
+        self.sock.raises = RuntimeError("the socket layer misbehaved")
+        window = FakeWindow(1, display="working", state="idle", kind="claude")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "done")
+        self.assertEqual(boss.os_window_map[1].dirty, 1)
+        self.assertEqual(len(self.popen.calls), 1, "the notification still fired")
+
+    def test_nobody_registered_means_no_socket_at_all(self):
+        window = FakeWindow(1, state="working", kind="claude")
+        boss = boss_for([window])
+
+        watcher._apply(boss, window)
+
+        self.assertEqual(self.factory.calls, 0)
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "working", "the rest is unchanged")
+
+    def test_one_non_blocking_socket_serves_every_event(self):
+        # A blocking send on kitty's own thread would freeze the terminal.
+        window = FakeWindow(1, state="working", kind="claude")
+        boss = boss_for([window])
+        self.subscribe(boss, "/tmp/one.sock")
+
+        watcher._apply(boss, window)
+        window.user_vars["AGENT_STATE"] = "blocked"
+        watcher._apply(boss, window)
+
+        self.assertEqual(self.factory.calls, 1)
+        self.assertIs(self.sock.blocking, False)
+        self.assertEqual(len(self.sock.sent), 2)
 
 
 class EntryPointTest(WatcherTestCase):

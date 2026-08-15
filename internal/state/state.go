@@ -162,9 +162,9 @@ func (w Writer) Write(state string) {
 	// after the agent is gone.
 	if state == "clear" {
 		_ = w.Transport.Publish([]Var{
-			{Name: varState, Delete: true},
 			{Name: varKind, Delete: true},
 			{Name: varMsg, Delete: true},
+			{Name: varState, Delete: true},
 		})
 		return
 	}
@@ -172,10 +172,7 @@ func (w Writer) Write(state string) {
 	// Each hook invocation is a fresh process and cannot tell a first call from
 	// a later one. The write is one short escape sequence, so resend it always.
 	payload := parseHook(readHook(w.Stdin))
-	vars := []Var{
-		{Name: varKind, Value: kindClaude},
-		{Name: varState, Value: state},
-	}
+	vars := []Var{{Name: varKind, Value: kindClaude}}
 	// Every hook payload carries session_id, so all three live states publish
 	// the resume command.
 	if payload.SessionID != "" {
@@ -189,6 +186,10 @@ func (w Writer) Write(state string) {
 			vars = append(vars, Var{Name: varMsg, Value: prompt})
 		}
 	}
+	// AGENT_STATE goes last in the batch. Writing it is what wakes the kitty
+	// watcher, and anything written after it is missing from the transition the
+	// watcher publishes to its subscribers.
+	vars = append(vars, Var{Name: varState, Value: state})
 	_ = w.Transport.Publish(vars)
 }
 

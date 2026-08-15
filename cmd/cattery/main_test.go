@@ -54,6 +54,8 @@ func TestRoute(t *testing.T) {
 		// The target is checked where the attach runs, not here.
 		{name: "attach with no target", args: []string{"attach"}, want: cmdAttach},
 
+		{name: "events", args: []string{"events"}, want: cmdEvents},
+
 		{name: "unknown subcommand", args: []string{"install"}, wantErr: true},
 		{name: "unknown flag", args: []string{"-nope"}, wantErr: true},
 	}
@@ -508,6 +510,40 @@ func TestPrintAgentsPartialFailure(t *testing.T) {
 	if !strings.Contains(out.String(), "host=tmux") {
 		t.Errorf("dropped the rows the working host returned: %q", out.String())
 	}
+}
+
+// --- events -------------------------------------------------------------------
+
+// eventsClient stands in for the running kitty. Registration is the first thing
+// the subscriber does, so refusing it is what ends the command.
+type eventsClient struct{ err error }
+
+func (c eventsClient) Kitten(context.Context, string, ...string) (string, error) {
+	return "", c.err
+}
+
+func TestRunEvents(t *testing.T) {
+	t.Run("an unknown flag is a usage error", func(t *testing.T) {
+		if got := runEvents(eventsClient{}, io.Discard, []string{"-nope"}); got != 2 {
+			t.Fatalf("exit code: got %d, want 2", got)
+		}
+	})
+
+	t.Run("an argument is a usage error", func(t *testing.T) {
+		// It takes none, and a typed word is more likely a subcommand somebody
+		// expected than something to ignore.
+		if got := runEvents(eventsClient{}, io.Discard, []string{"register"}); got != 2 {
+			t.Fatalf("exit code: got %d, want 2", got)
+		}
+	})
+
+	t.Run("a kitty that refuses the registration exits non-zero", func(t *testing.T) {
+		client := eventsClient{err: errors.New("no listening socket")}
+
+		if got := runEvents(client, io.Discard, nil); got != 1 {
+			t.Fatalf("exit code: got %d, want 1", got)
+		}
+	})
 }
 
 // --- attach -----------------------------------------------------------------

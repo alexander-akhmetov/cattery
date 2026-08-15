@@ -40,11 +40,13 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 		want  []string // what the fake kitten saw, or nothing when it must not run
 	}{
 		{
-			name:  "working carries the kind, the state, and the prompt",
+			// AGENT_STATE comes last in every batch: writing it is what wakes
+			// the watcher, and the watcher reads the others out of the window.
+			name:  "working carries the kind, the prompt, and the state",
 			state: "working",
 			stdin: `{"prompt":"fix the picker"}`,
 			want: []string{"@", "set-user-vars", "--match", "id:7",
-				"AGENT_KIND=claude", "AGENT_STATE=working", "AGENT_MSG=fix the picker"},
+				"AGENT_KIND=claude", "AGENT_MSG=fix the picker", "AGENT_STATE=working"},
 		},
 		{
 			name:  "blocked leaves the message alone",
@@ -59,7 +61,7 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			name:  "clear deletes the three variables, in order",
 			state: "clear",
 			want: []string{"@", "set-user-vars", "--match", "id:7",
-				"AGENT_STATE", "AGENT_KIND", "AGENT_MSG"},
+				"AGENT_KIND", "AGENT_MSG", "AGENT_STATE"},
 		},
 		{
 			name:  "an unknown word publishes nothing",

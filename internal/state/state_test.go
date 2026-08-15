@@ -73,16 +73,16 @@ func TestWriteUpdateOrder(t *testing.T) {
 		want  []Var
 	}{
 		{
-			name:  "working publishes kind, state, then the prompt",
+			name:  "working publishes kind, the prompt, then the state",
 			state: "working",
 			stdin: strings.NewReader(`{"prompt":"fix the picker"}`),
-			want:  []Var{set(varKind, "claude"), set(varState, "working"), set(varMsg, "fix the picker")},
+			want:  []Var{set(varKind, "claude"), set(varMsg, "fix the picker"), set(varState, "working")},
 		},
 		{
 			name:  "working without a prompt leaves AGENT_MSG alone",
 			state: "working",
 			stdin: strings.NewReader(`{"session_id":"abc"}`),
-			want:  []Var{set(varKind, "claude"), set(varState, "working"), set(varResume, "claude --resume abc")},
+			want:  []Var{set(varKind, "claude"), set(varResume, "claude --resume abc"), set(varState, "working")},
 		},
 		{
 			name:  "working with no stdin at all",
@@ -114,9 +114,9 @@ func TestWriteUpdateOrder(t *testing.T) {
 			want:  []Var{set(varKind, "claude"), set(varState, "idle")},
 		},
 		{
-			name:  "clear deletes state, kind, then message",
+			name:  "clear deletes kind, message, then state",
 			state: "clear",
-			want:  []Var{del(varState), del(varKind), del(varMsg)},
+			want:  []Var{del(varKind), del(varMsg), del(varState)},
 		},
 		{
 			name:  "unknown word publishes nothing",
@@ -152,7 +152,7 @@ func TestClearReturnsBeforeReadingStdin(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("clear blocked on stdin")
 	}
-	assertVars(t, rec.sent(), []Var{del(varState), del(varKind), del(varMsg)})
+	assertVars(t, rec.sent(), []Var{del(varKind), del(varMsg), del(varState)})
 }
 
 // A caller in neither kitty nor tmux gets no transport from New, and the writer
@@ -171,7 +171,7 @@ func TestWriteWithoutAWayToPublish(_ *testing.T) {
 func TestWritePublishesWithoutAKittyWindow(t *testing.T) {
 	rec := &recorder{}
 	Writer{Stdin: strings.NewReader(`{"prompt":"fix the picker"}`), Transport: rec}.Write("working")
-	assertVars(t, rec.sent(), []Var{set(varKind, "claude"), set(varState, "working"), set(varMsg, "fix the picker")})
+	assertVars(t, rec.sent(), []Var{set(varKind, "claude"), set(varMsg, "fix the picker"), set(varState, "working")})
 }
 
 // AGENT_RESUME tells a snapshot how to reopen this Claude session. Every hook
@@ -273,7 +273,7 @@ func TestClearKeepsTheResumeCommand(t *testing.T) {
 		}
 	}
 	// The live variables still go, or a dead agent keeps its tab marker.
-	assertVars(t, rec.sent(), []Var{del(varState), del(varKind), del(varMsg)})
+	assertVars(t, rec.sent(), []Var{del(varKind), del(varMsg), del(varState)})
 }
 
 // New reads the override from the environment, where a shell wrapper sets it.
@@ -725,8 +725,8 @@ func TestTmuxTransportMetadata(t *testing.T) {
 			// finished.
 			name: "clear forgets the work",
 			prev: "idle",
-			vars: []Var{del(varState), del(varKind), del(varMsg)},
-			want: []string{"-u @AGENT_STATE", "-u @AGENT_KIND", "-u @AGENT_MSG", "-u @AGENT_WORKED"},
+			vars: []Var{del(varKind), del(varMsg), del(varState)},
+			want: []string{"-u @AGENT_KIND", "-u @AGENT_MSG", "-u @AGENT_STATE", "-u @AGENT_WORKED"},
 		},
 		{
 			name: "a batch with no state word gets no metadata",

@@ -12,12 +12,17 @@ import (
 	"io/fs"
 )
 
-//go:embed kitty/cattery_watcher.py kitty/cattery_tab.py kitty/cattery_jump.py kitty/tab_bar.py
+//go:embed kitty/cattery_watcher.py kitty/cattery_tab.py kitty/cattery_jump.py kitty/cattery_events.py kitty/tab_bar.py
 var embedded embed.FS
+
+// EventsFile is the kitten that adds and removes event subscribers. `cattery
+// events` runs it by path through kitty remote control, so the binary needs the
+// name setup installed it under.
+const EventsFile = "cattery_events.py"
 
 // ManagedFiles are the kitty files setup owns. It overwrites them on every run,
 // and the picker warns when an installed copy no longer matches the binary.
-var ManagedFiles = []string{"cattery_watcher.py", "cattery_tab.py", "cattery_jump.py"}
+var ManagedFiles = []string{"cattery_watcher.py", "cattery_tab.py", "cattery_jump.py", EventsFile}
 
 // TabBarFile is kitty's tab title renderer. Setup writes it only when the kitty
 // config directory has none: an existing one belongs to the user.

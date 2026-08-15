@@ -563,6 +563,69 @@ func TestSendTextCommand(t *testing.T) {
 	}
 }
 
+// `kitten @ kitten` has its own parser, so the path and each argument stay
+// separate argv entries. One joined string arrives as a kitten name nobody
+// installed.
+func TestKittenCommand(t *testing.T) {
+	args := []string{"register", "/tmp/cattery-sub-7.sock"}
+	cmd := kittenCommand(context.Background(), "kitten", "/k/cattery_events.py", args)
+	want := []string{"kitten", "@", "kitten", "/k/cattery_events.py", "register", "/tmp/cattery-sub-7.sock"}
+	if !slices.Equal(cmd.Args, want) {
+		t.Fatalf("kitten args: got %v, want %v", cmd.Args, want)
+	}
+}
+
+// The kitten answers on stdout, and `cattery events` has nowhere to go without
+// it: a registration that failed has to say why, so the caller can hear that
+// setup has not run since the upgrade.
+func TestKitten(t *testing.T) {
+	t.Run("the answer comes back trimmed", func(t *testing.T) {
+		client := &Client{kitten: fakeKitten(t, "echo registered /tmp/sub.sock")}
+
+		got, err := client.Kitten(context.Background(), "/k/cattery_events.py", "register", "/tmp/sub.sock")
+
+		if err != nil {
+			t.Fatalf("kitten: %v", err)
+		}
+		if got != "registered /tmp/sub.sock" {
+			t.Errorf("answer: got %q", got)
+		}
+	})
+
+	cases := []struct {
+		name   string
+		kitten string
+		want   []string
+	}{
+		{
+			name:   "reports kitty's own reason",
+			kitten: fakeKitten(t, "printf 'No such kitten\\navailable\\n' >&2; exit 1"),
+			want:   []string{"/k/cattery_events.py", "No such kitten available"},
+		},
+		{
+			name:   "falls back to the exit status when output is silent",
+			kitten: fakeKitten(t, "exit 3"),
+			want:   []string{"/k/cattery_events.py", "exit status 3"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &Client{kitten: tc.kitten}
+
+			_, err := client.Kitten(context.Background(), "/k/cattery_events.py", "register", "/tmp/sub.sock")
+
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error missing %q, got %q", w, err.Error())
+				}
+			}
+		})
+	}
+}
+
 // Both new commands run through the same error path as the rest of the client.
 // kitty's own reason survives on one line, so the picker's notice can show it.
 func TestActionAndSendTextErrors(t *testing.T) {

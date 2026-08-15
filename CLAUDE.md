@@ -21,11 +21,12 @@ that is what decides whether the guarded import succeeds.
 
 ## Layout
 
-`kitty/` holds the four files kitty loads directly. `extensions/cattery.ts` is
+`kitty/` holds the five files kitty loads directly. `extensions/cattery.ts` is
 the pi-side state writer. `cmd/` and `internal/` build the binary: the picker,
 `cattery setup`, `cattery state <x>` (the Claude-side writer),
-`cattery save`/`cattery restore` (the tab-tree snapshot), and `cattery attach`
-(a read-only view of a tmux agent).
+`cattery save`/`cattery restore` (the tab-tree snapshot), `cattery attach`
+(a read-only view of a tmux agent), and `cattery events` (the transitions the
+watcher pushes, as JSON lines).
 
 An agent runs in one of two hosts. `internal/agent` holds what both share: the
 `Agent` struct, its `Key()`, and the git grouping. `internal/kitty` and
@@ -165,5 +166,32 @@ the picker compares the installed files with the embedded ones and warns.
   edges in place of " │ ". That is why `previewWidths`, `previewFits` and the
   91-column threshold did not move when the box arrived. Keep it that way, or
   the drawer shows a different amount of screen in each mode.
+- `AGENT_STATE` is written last in every batch, by both writers. Writing it is
+  what wakes the watcher, so a variable written after it is missing from the
+  transition the watcher publishes: with the old order every `working` event
+  carried the previous prompt. The order is asserted in
+  `internal/state/state_test.go`, `internal/state/hook_test.go` and
+  `tests/cattery_extension_test.ts`.
+- The watcher's `_publish` runs on kitty's own thread, so it may neither raise
+  nor block. A blocking send would freeze the terminal, which is why the socket
+  is a non-blocking datagram and the whole body sits in a `try`, the way
+  `_write_os_title` does. `sendto` answers `ENOENT` for a missing path,
+  `ECONNREFUSED` for a dead owner and `ENOBUFS` for a full receiver, and none
+  of the three blocks. The first two mean the subscriber has gone and its path
+  is dropped; the third means it is alive and behind, so the datagram goes
+  instead.
+- An event has to fit in one datagram. macOS refuses a unix datagram over
+  `net.local.dgram.maxdgram`, 2048 bytes by default, with `EMSGSIZE`, which
+  reads as "alive and behind" and drops the event with nothing said. So the
+  watcher writes compact UTF-8 JSON, not the six bytes per non-ASCII character
+  `json.dumps` writes by default, and cuts the title and the prompt at 200
+  characters each.
+- `cattery events` asks for `SIGPIPE`. Go makes a broken pipe on stdout fatal
+  unless a program does, so `cattery events | head -1` would die on the spot,
+  leaving its path in kitty's registry and its socket file on disk. A socket
+  file left behind is not harmless: `Close` does not unlink a unixgram socket,
+  and the next run with the same pid binds the same name and fails
+  `EADDRINUSE`, so `internal/events` clears a path nobody answers on before it
+  binds.
 
 @README.md

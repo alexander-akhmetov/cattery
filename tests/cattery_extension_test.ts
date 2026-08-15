@@ -339,11 +339,13 @@ test("shutdown clears the state and the message but keeps the kind", async () =>
   const written = await fire(pi, "session_shutdown");
 
   assert.deepEqual(written, [
-    ["AGENT_STATE", null],
+    // AGENT_MSG first: clearing AGENT_STATE wakes the watcher, and the event it
+    // emits then carries no prompt from the session that just ended.
+    ["AGENT_MSG", null],
     // AGENT_KIND stays, so a quick resume keeps the tag. AGENT_RESUME is
     // missing from this list too, because a session that just ended is the one
     // worth restoring after a reboot.
-    ["AGENT_MSG", null],
+    ["AGENT_STATE", null],
   ]);
 });
 
@@ -466,8 +468,8 @@ test("the pane options a state change leaves behind", async () => {
   assert.deepEqual(options(idle[0]!), ["@AGENT_STATE", "@AGENT_SINCE"]);
   // Shutdown forgets the work, or the next agent in this pane would report
   // "done" the moment it starts idle. AGENT_RESUME stays.
-  assert.deepEqual(options(shutdown[0]!), ["-u @AGENT_STATE", "-u @AGENT_WORKED"]);
-  assert.deepEqual(options(shutdown[1]!), ["-u @AGENT_MSG"]);
+  assert.deepEqual(options(shutdown[0]!), ["-u @AGENT_MSG"]);
+  assert.deepEqual(options(shutdown[1]!), ["-u @AGENT_STATE", "-u @AGENT_WORKED"]);
 });
 
 test("a state already published is not published again in a pane", async () => {

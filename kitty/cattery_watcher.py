@@ -25,6 +25,10 @@ cattery_tab.py through runpy, which gives it no shared sys.path.
                                         went idle
     boss._agent_titles dict[int, str]   OS-window titles this watcher set, so
                                         it clears only its own
+    boss._agent_subs   dict[str, None]  unix datagram socket paths that asked
+                                        for the transitions, in the order they
+                                        registered. cattery_events.py puts them
+                                        there.
 
 Side effects on a transition:
     * set AGENT_DISPLAY on the window
@@ -32,11 +36,15 @@ Side effects on a transition:
     * set_os_window_title() with a "(N need you)" summary for that OS window
     * terminal-notifier on an edge into blocked or done, unless the window is
       focused
+    * one JSON datagram per registered subscriber
 
 Re-entrancy: writing AGENT_DISPLAY fires on_set_user_var again, so every key
 other than AGENT_STATE and AGENT_KIND is ignored.
 """
 
+import errno
+import json
+import socket
 import subprocess
 import time
 from typing import Any
@@ -76,6 +84,23 @@ _TITLE_TPL = {
     "idle": "Agent",
 }
 
+# sendto errors that mean the subscriber has gone: no socket file at the path,
+# or a file nobody is bound to. ENOBUFS is not one of them. It means the
+# subscriber is alive and behind, so that datagram is dropped and the
+# registration stays.
+_DEAD_SUBSCRIBER = (errno.ENOENT, errno.ECONNREFUSED)
+
+# The longest title or prompt an event carries. macOS refuses a unix datagram
+# over net.local.dgram.maxdgram, 2048 bytes by default, and answers EMSGSIZE,
+# which reads here as "alive and behind" and drops the event with nothing said.
+# Both writers already cap a prompt at 200 characters; a window title is
+# whatever the program in it set, and nothing caps that.
+_FIELD_LIMIT = 200
+
+# The socket every event goes out on, made on the first send. It is never bound
+# and never read: sendto names the receiver and a subscriber does not answer.
+_sender: socket.socket | None = None
+
 
 def _ensure_state(boss: Boss) -> None:
     """Idempotently initialize the shared blackboard on `boss`."""
@@ -83,6 +108,8 @@ def _ensure_state(boss: Boss) -> None:
         boss._agent_seen = set()
     if not hasattr(boss, "_agent_titles"):
         boss._agent_titles = {}
+    if not hasattr(boss, "_agent_subs"):
+        boss._agent_subs = {}
 
 
 def _derive_display(
@@ -148,6 +175,79 @@ def _notify(window: Window, kind: str, display: str) -> None:
         # terminal-notifier is missing or blocked by a sandbox. Stay silent;
         # the tab marker still shows the state.
         pass
+
+
+def _publish(boss: Boss, window: Window, frm: str | None, to: str) -> None:
+    """Send one transition to every registered subscriber.
+
+    The event is one JSON object per datagram, with no framing:
+
+        {"ts":1755302096,"window":363,"kind":"pi","from":"working",
+         "to":"blocked","title":"~/projects/sigil","cwd":"/Users/x/sigil",
+         "msg":"fix the picker","focused":false}
+
+    `to` is a display state, or "cleared" when the agent dropped its state and
+    "closed" when the window went away. `frm` is the previous display, null the
+    first time a window is seen.
+
+    This runs on kitty's own thread, so it must neither block nor raise. The
+    socket is non-blocking, and the body is guarded the way _write_os_title is:
+    a subscriber cannot cost the tab marker or the notification.
+
+    Nothing at all happens with an empty registry, which is every cattery
+    nobody has subscribed to.
+    """
+    try:
+        subs = boss._agent_subs
+        if not subs:
+            return
+        event = json.dumps(
+            {
+                "ts": int(time.time()),
+                "window": window.id,
+                "kind": window.user_vars.get("AGENT_KIND", ""),
+                "from": frm,
+                "to": to,
+                "title": _clip(window.title or ""),
+                # current_cwd is the field `kitten @ ls` reports, so an event
+                # and a picker row name the same directory. cwd_of_child reads
+                # the foreground process instead, which for a sandboxed agent
+                # is its log reader.
+                "cwd": getattr(getattr(window, "child", None), "current_cwd", "") or "",
+                "msg": _clip(window.user_vars.get("AGENT_MSG", "")),
+                "focused": bool(window.is_focused),
+            },
+            # One line with no padding, and the text as the UTF-8 JSON is
+            # defined to be. The default would spend six bytes on every
+            # non-ASCII character, which a datagram has no room for.
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        sender = _sender_socket()
+        for path in list(subs):
+            try:
+                sender.sendto(event, path)
+            except OSError as err:
+                if err.errno in _DEAD_SUBSCRIBER:
+                    subs.pop(path, None)
+    except Exception:
+        return
+
+
+def _clip(text: str) -> str:
+    """Cut a field to the length an event has room for."""
+    if len(text) <= _FIELD_LIMIT:
+        return text
+    return text[: _FIELD_LIMIT - 1] + "…"
+
+
+def _sender_socket() -> socket.socket:
+    global _sender
+    if _sender is None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        _sender = sock
+    return _sender
 
 
 def _update_os_title(boss: Boss, os_window_id: int, closing_window_id: int | None = None) -> None:
@@ -233,6 +333,8 @@ def _apply(boss: Boss, window: Window) -> None:
             window.set_user_var("AGENT_SINCE", None)
         _redraw(boss, window)
         _update_os_title(boss, window.os_window_id)
+        if prev is not None:
+            _publish(boss, window, prev, "cleared")
         return
 
     changed = display != prev
@@ -247,6 +349,8 @@ def _apply(boss: Boss, window: Window) -> None:
 
         if display in _ATTENTION and not window.is_focused:
             _notify(window, kind, display)
+
+        _publish(boss, window, prev, display)
 
 
 # --- watcher entry points (called by kitty) ----------------------------------
@@ -297,3 +401,8 @@ def on_close(boss: Boss, window: Window, data: dict[str, Any]) -> None:
     boss._agent_seen.discard(window.id)
     _redraw(boss, window)
     _update_os_title(boss, window.os_window_id, closing_window_id=window.id)
+    prev = window.user_vars.get("AGENT_DISPLAY")
+    if prev is not None:
+        # A window that never carried a display was never an agent, and the
+        # subscriber has nothing to close out.
+        _publish(boss, window, prev, "closed")
