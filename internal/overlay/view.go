@@ -578,28 +578,46 @@ func (m Model) previewColumn(width, avail int) []string {
 	return append(out, previewLines(m.previewScreen, width, body)...)
 }
 
-// previewHead names the agent, and in read-write says how to reach it with an
-// escape.
+// previewHead names the agent and says what the drawer is doing with it. In
+// read-only that is the key that starts typing. In read-write it is an "R/W"
+// mark in the colour of the frame, then the two ways back out.
 //
 // esc is the way back out of read-write, so it is the one key the agent cannot
 // be sent, and Claude and vim both want it. ctrl+] carries it instead. The hint
-// is the only place that says so within reach of someone already typing, and it
-// goes first when the column is too narrow for both.
+// is the only place that says so within reach of someone already typing, so of
+// the two it is the one that survives a narrow column.
 func (m Model) previewHead(a agent.Agent, width int) string {
 	name := lipgloss.NewStyle().Foreground(cSubtext).Bold(true)
-	if !m.previewWriting() {
-		return padTo(name.Render(truncate(agentName(a), width)), width)
+	dim := lipgloss.NewStyle().Foreground(cOverlay0)
+	label := agentName(a)
+
+	// Barest first for the mark, richest first for the hint: the mode is what
+	// the head is for, and the keys are what it can afford to shorten.
+	mark, hints := "", []string{"v type", ""}
+	if m.previewWriting() {
+		mark = "R/W"
+		hints = []string{"^] esc · esc read-only", "^] esc · esc back", "^] esc", ""}
 	}
 
-	const hint = "^] esc"
-	label := agentName(a)
-	if ansi.StringWidth(label)+ansi.StringWidth(hint)+1 > width {
-		return padTo(name.Render(truncate(label, width)), width)
+	for _, hint := range hints {
+		plain, right := mark, ""
+		if mark != "" {
+			right = lipgloss.NewStyle().Foreground(m.previewFrameColour()).Bold(true).Render(mark)
+		}
+		if plain != "" && hint != "" {
+			plain, right = plain+" · ", right+dim.Render(" · ")
+		}
+		if hint != "" {
+			plain, right = plain+hint, right+dim.Render(hint)
+		}
+		if plain == "" {
+			break
+		}
+		if gap := width - ansi.StringWidth(label) - ansi.StringWidth(plain); gap >= 1 {
+			return name.Render(label) + strings.Repeat(" ", gap) + right
+		}
 	}
-	gap := width - ansi.StringWidth(label) - ansi.StringWidth(hint)
-	return name.Render(label) +
-		strings.Repeat(" ", gap) +
-		lipgloss.NewStyle().Foreground(cOverlay0).Render(hint)
+	return padTo(name.Render(truncate(label, width)), width)
 }
 
 // note fills the sidebar with one dim line, for a state with no screen behind
@@ -1285,7 +1303,7 @@ func (m Model) hintTiers() []string {
 	default:
 		// In read-only esc closes the drawer rather than the picker, so the
 		// tiers have to name the key that does leave, or they lie.
-		preview, closeKey := "v type", "esc close"
+		preview, closeKey := "v preview", "esc close"
 		if m.previewOpen() {
 			preview, closeKey = "v type", "esc close preview · q quit"
 		}

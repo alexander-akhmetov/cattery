@@ -792,7 +792,7 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "enter":
 		return m.focusSelected()
 	case "v":
-		return m.enterWrite()
+		return m.enterPreview()
 	case "s":
 		return m.startSession("saving", saveCmd(m.snapshots))
 	case "R":
@@ -809,13 +809,15 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// enterWrite opens the drawer straight into read-write, and re-enters it from
-// read-only. "v" is the only way in; esc walks back out.
+// enterPreview is what "v" does, one rung at a time: it opens the drawer
+// read-only, and a second press hands the keyboard to the agent. Reading an
+// agent changes nothing, so that is what the drawer does until asked otherwise.
+// esc walks back out the same way.
 //
 // A terminal too narrow to hold both the list and a readable column of screen
 // refuses, rather than squeezing the rows down to nothing. It reports that
 // through the notice line, where "s" and "R" report themselves.
-func (m Model) enterWrite() (Model, tea.Cmd) {
+func (m Model) enterPreview() (Model, tea.Cmd) {
 	if !previewFits(m.width) {
 		return m, m.warn("terminal too narrow for the preview")
 	}
@@ -824,20 +826,19 @@ func (m Model) enterWrite() (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	fresh := m.preview == previewOff
-	m.preview, m.writeKey, m.seenSent = previewWrite, a.Key(), false
+	// Opening keeps the keyboard on the picker. The screen it captures is the
+	// one read-write starts from, so the second press blinks through nothing.
+	if m.preview == previewOff {
+		m.preview = previewRead
+		return m, m.schedulePreview()
+	}
 
-	var cmds []tea.Cmd
-	// Re-entering from read-only keeps the screen already on display. Only a
-	// drawer that was shut has nothing to show yet.
-	if fresh {
-		cmds = append(cmds, m.schedulePreview())
+	m.preview, m.writeKey, m.seenSent = previewWrite, a.Key(), false
+	if m.previewTicking {
+		return m, nil
 	}
-	if !m.previewTicking {
-		m.previewTicking = true
-		cmds = append(cmds, writeTick())
-	}
-	return m, tea.Batch(cmds...)
+	m.previewTicking = true
+	return m, writeTick()
 }
 
 // stopWriting drops back to read-only, keeping the screen on display. It is the

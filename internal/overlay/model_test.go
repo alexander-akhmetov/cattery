@@ -2212,33 +2212,32 @@ func previewModel(client *fakeClient) Model {
 	return m
 }
 
-// openWrite presses "v" and runs whatever it scheduled, up to and including the
-// capture, so a test can assert on what the drawer ended up with. "v" opens
-// straight into read-write.
-func openWrite(t *testing.T, m Model) (Model, *fakeClient) {
+// open presses "v" and runs whatever it scheduled, up to and including the
+// capture, so a test can assert on what the drawer ended up with. One "v" opens
+// read-only, which is where every test about the sidebar itself belongs.
+func open(t *testing.T, m Model) (Model, *fakeClient) {
 	t.Helper()
 	client, ok := m.client.(*fakeClient)
 	if !ok {
 		t.Fatalf("client is %T, not a fakeClient", m.client)
 	}
 	m, msg := press(t, m, runes('v'))
-	if !m.previewWriting() {
-		t.Fatal(`"v" did not open the drawer for typing`)
+	switch {
+	case !m.previewOpen():
+		t.Fatal(`"v" did not open the drawer`)
+	case m.previewWriting():
+		t.Fatal(`"v" opened the drawer for typing rather than read-only`)
 	}
 	return drain(t, m, msg), client
 }
 
-// open leaves the drawer showing the same screen with the keyboard back on the
-// picker, which is where every test about the sidebar itself belongs.
-func open(t *testing.T, m Model) (Model, *fakeClient) {
+// openWrite walks the second rung too, so the keyboard ends up on the agent.
+func openWrite(t *testing.T, m Model) (Model, *fakeClient) {
 	t.Helper()
-	m, client := openWrite(t, m)
-	m, msg := press(t, m, tea.KeyMsg{Type: tea.KeyEsc})
-	switch {
-	case m.previewWriting():
-		t.Fatal("esc did not drop out of read-write")
-	case !m.previewOpen():
-		t.Fatal("esc closed the drawer instead of dropping to read-only")
+	m, client := open(t, m)
+	m, msg := press(t, m, runes('v'))
+	if !m.previewWriting() {
+		t.Fatal(`a second "v" did not go into read-write`)
 	}
 	return drain(t, m, msg), client
 }
@@ -2292,6 +2291,20 @@ func TestPreviewToggle(t *testing.T) {
 		}
 	})
 
+	// One "v" is a look, not a hand on the keyboard. The picker keeps its keys
+	// until the second press asks for read-write.
+	t.Run("the first v leaves the keyboard on the picker", func(t *testing.T) {
+		m, client := open(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+		moved, _ := press(t, m, runes('j'))
+		if moved.selected != 1 {
+			t.Fatalf("selected %d after j, want the next row", moved.selected)
+		}
+		if len(client.typed) != 0 {
+			t.Fatalf("read-only typed %v at the agent", client.typed)
+		}
+	})
+
 	t.Run("esc closes it from read-only and forgets the screen", func(t *testing.T) {
 		m, _ := open(t, previewModel(&fakeClient{screen: "building the thing"}))
 
@@ -2307,15 +2320,15 @@ func TestPreviewToggle(t *testing.T) {
 		}
 	})
 
-	// The drawer keeps whatever it was showing, so re-entering does not blink
-	// through "loading…" for a screen that is already on hand.
-	t.Run("v re-enters read-write from read-only", func(t *testing.T) {
+	// The drawer keeps whatever it was showing, so the step into read-write does
+	// not blink through "loading…" for a screen that is already on hand.
+	t.Run("a second v enters read-write from read-only", func(t *testing.T) {
 		m, client := open(t, previewModel(&fakeClient{screen: "building the thing"}))
 		before := len(client.previewed)
 
 		again, _ := press(t, m, runes('v'))
 		if !again.previewWriting() {
-			t.Fatal(`"v" did not go back into read-write`)
+			t.Fatal(`a second "v" did not go into read-write`)
 		}
 		if again.previewScreen != "building the thing" {
 			t.Fatalf("screen: got %q, want the one already on display", again.previewScreen)
@@ -2511,6 +2524,18 @@ func TestWriteMovesNothingButTheColour(t *testing.T) {
 	}
 	if !strings.Contains(rwBody, "typing into") {
 		t.Errorf("the footer does not say the keyboard is on the agent:\n%s", rwBody)
+	}
+
+	// The drawer opens read-only, so its heading has to name the mode it is in
+	// and the key out of it. Nothing else on screen says which one is running.
+	if !strings.Contains(rwBody, "R/W") || !strings.Contains(rwBody, "esc read-only") {
+		t.Errorf("the drawer does not say it is in read-write and how to leave:\n%s", rwBody)
+	}
+	if strings.Contains(roBody, "R/W") {
+		t.Errorf("read-only calls itself read-write:\n%s", roBody)
+	}
+	if !strings.Contains(roBody, "v type") {
+		t.Errorf("read-only does not offer the key that starts typing:\n%s", roBody)
 	}
 }
 

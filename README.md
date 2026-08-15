@@ -57,10 +57,14 @@ by git repository.
 cursor. It works on a kitty window you are not looking at and on a tmux pane
 nobody is attached to.
 
-The drawer opens **read-write**, framed in red: every key you press goes to the
-agent instead of to the picker, so you can answer a blocked agent without
-leaving the list. That includes `q`, `enter` and `ctrl+c`, which interrupts the
-agent rather than closing the picker.
+The drawer opens **read-only**, framed in grey: the keys still belong to the
+picker, so you can move down the list and watch each agent in turn.
+
+A second `v` switches it to **read-write**, framed in red and marked `R/W` in
+the heading. From then on every key you press goes to the agent instead of to
+the picker, so you can answer a blocked agent without leaving the list. That
+includes `q`, `enter` and `ctrl+c`, which interrupts the agent rather than
+closing the picker. The cursor cannot move while you type.
 
 `esc` walks back out one step at a time:
 
@@ -71,7 +75,7 @@ agent rather than closing the picker.
 | no drawer | closes the picker |
 
 `q` and `ctrl+c` still close the picker outright from anywhere except
-read-write. `v` from read-only goes back into read-write.
+read-write.
 
 `esc` is the way out, so it is the one key the agent cannot be sent, and Claude
 and vim both want it. **`ctrl+]` sends a literal escape** and stays in
@@ -119,10 +123,10 @@ fight over which window the shared session shows. `cattery attach
 <session>:<window>.<pane id>` is the same thing from a shell, for example
 `cattery attach kontora:3.%17`.
 
-The viewer tab is read-only, but the picker's read-write drawer is not: `v`
-types at a tmux pane the same way it types at a kitty window. So you can watch a
-pane in a viewer tab and answer it from the drawer at the same time. This needs
-a tmux with `send-keys -H`, which is tmux 3.1 and later.
+The viewer tab is read-only, but the picker's drawer in read-write is not: `v`
+`v` types at a tmux pane the same way it types at a kitty window. So you can
+watch a pane in a viewer tab and answer it from the drawer at the same time.
+This needs a tmux with `send-keys -H`, which is tmux 3.1 and later.
 
 Attaching drops the `done` marker, because the attach marks the pane seen. A
 plain `tmux attach` does not, so an agent watched that way keeps its marker
