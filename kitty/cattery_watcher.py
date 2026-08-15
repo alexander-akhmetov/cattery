@@ -45,9 +45,15 @@ from kitty.boss import Boss
 from kitty.fast_data_types import set_os_window_title
 from kitty.window import Window
 
+# The key the picker sets to say the user has looked at an agent. The set of
+# seen windows lives in this process and nothing outside kitty can reach it, so
+# a user variable is the way in. The watcher clears it again once it has read
+# it, which keeps it from surviving as stale state on the window.
+_SEEN_KEY = "AGENT_SEEN"
+
 # The keys the watcher reacts to. AGENT_DISPLAY is its own output, and ignoring
 # it breaks the feedback loop. Other software's user variables stop here too.
-_INPUT_KEYS = ("AGENT_STATE", "AGENT_KIND")
+_INPUT_KEYS = ("AGENT_STATE", "AGENT_KIND", _SEEN_KEY)
 
 # Display states we care about for notifications and the OS-window summary.
 _ATTENTION = ("blocked", "done")
@@ -255,6 +261,15 @@ def on_set_user_var(boss: Boss, window: Window, data: dict[str, Any]) -> None:
     if key not in _INPUT_KEYS:
         # AGENT_DISPLAY, written here, and every unrelated user variable.
         return
+    if key == _SEEN_KEY:
+        _ensure_state(boss)
+        if not window.user_vars.get(_SEEN_KEY):
+            # The clearing write below arrives here as well.
+            return
+        boss._agent_seen.add(window.id)
+        # Setting it again is what the next mark has to be able to do, and a
+        # variable left behind would also travel into a session snapshot.
+        window.set_user_var(_SEEN_KEY, None)
     _apply(boss, window)
 
 

@@ -35,6 +35,14 @@ type Client interface {
 	// reaches an unfocused kitty window and a detached tmux pane alike, and
 	// leaves the user where they are.
 	Preview(context.Context, agent.Agent) (string, error)
+
+	// Send types raw terminal input at one agent. Neither host reports a send
+	// that went nowhere, so a nil error does not mean the agent received it.
+	Send(context.Context, agent.Agent, string) error
+
+	// MarkSeen records that the user has answered this agent, which drops its
+	// "done" marker.
+	MarkSeen(context.Context, agent.Agent) error
 }
 
 type (
@@ -80,6 +88,22 @@ type (
 	// a subprocess round trip, so a selection change schedules this instead of
 	// spawning at once, and only the generation that is still current fetches.
 	previewDueMsg struct{ generation uint64 }
+
+	// writeTickMsg is the read-write drawer's own refresh, faster than the
+	// list's, so an agent answering can be watched as it types.
+	writeTickMsg struct{}
+
+	// sentMsg is one send finishing. It carries the agent it went to, so a
+	// result arriving after read-write ended raises no error against a row the
+	// user has moved on from.
+	sentMsg struct {
+		key string
+		err error
+	}
+
+	// seenMsg is the one-shot "the user has answered this agent" write coming
+	// back. Nothing depends on it.
+	seenMsg struct{ err error }
 )
 
 // noticeLife is how long a save or restore result stays on screen: long enough
@@ -102,6 +126,31 @@ const previewTimeout = 2 * time.Second
 // fetches. A held movement key repeats around thirty times a second, and each
 // fetch is a process.
 const previewDebounce = 150 * time.Millisecond
+
+// sendTimeout bounds one send, the budget every other interactive round trip
+// in the picker gets.
+const sendTimeout = 2 * time.Second
+
+// writeInterval is how often the read-write drawer recaptures. Typing wants to
+// be answered within a frame or two, and an agent redraws on its own besides,
+// so this runs four times faster than the list reload. Below about 150ms the
+// captures cost more than they show.
+const writeInterval = 250 * time.Millisecond
+
+// echoDelay is how long the agent gets to redraw before the drawer looks again
+// after a send. Short enough that a keystroke shows up in the same breath, long
+// enough that the capture is not of the frame before it.
+const echoDelay = 60 * time.Millisecond
+
+// previewMode is what the drawer is doing: closed, showing an agent's screen,
+// or showing it and forwarding every key to it.
+type previewMode int
+
+const (
+	previewOff previewMode = iota
+	previewRead
+	previewWrite
+)
 
 // noticeLevel decides how a save or restore result is coloured.
 type noticeLevel int
@@ -155,14 +204,36 @@ type Model struct {
 	sessionBusy bool
 	sessionVerb string
 
-	// The preview sidebar, toggled with "v". previewKey is the agent screen
+	// The preview drawer, opened with "v". previewKey is the agent screen
 	// belongs to, so a result for an agent the cursor has left is discarded,
 	// and previewGeneration drops a result the debounce has superseded.
-	previewOpen       bool
+	preview           previewMode
 	previewScreen     string
 	previewKey        string
 	previewErr        error
 	previewGeneration uint64
+
+	// previewBusy is one capture in flight. Three things ask for captures in
+	// read-write, and without this they pile up behind each other.
+	previewBusy bool
+	// previewTicking is the fast refresh tick read-write runs on, the same
+	// guard spinning is for the spinner.
+	previewTicking bool
+
+	// The forwarding half of read-write. writeKey is the agent the drawer is
+	// bound to: the cursor cannot move in read-write, but a reload can retire
+	// the agent under it, and neither host reports a send that went nowhere.
+	writeKey string
+	// pending is what has been typed and not sent yet, and sending is one send
+	// in flight. Bubble Tea runs commands concurrently, so a second send
+	// started while the first is out could arrive first and scramble the order
+	// of what the user typed. One at a time is what keeps it in order, and it
+	// coalesces a burst into a single subprocess for free.
+	pending string
+	sending bool
+	// seenSent is the one-shot seen marker. Opening the drawer must not clear a
+	// "done": only typing at the agent counts as having answered it.
+	seenSent bool
 
 	width    int
 	height   int
@@ -295,11 +366,42 @@ func previewDue(generation uint64) tea.Cmd {
 	})
 }
 
+func writeTick() tea.Cmd {
+	return tea.Tick(writeInterval, func(time.Time) tea.Msg { return writeTickMsg{} })
+}
+
+// sendCmd types data at one agent. The key travels with the result, so a
+// failure that arrives after read-write ended is not reported against whatever
+// the cursor is on by then.
+func sendCmd(client Client, a agent.Agent, data string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+		defer cancel()
+		return sentMsg{key: a.Key(), err: client.Send(ctx, a, data)}
+	}
+}
+
+// markSeenCmd tells the host the user has answered this agent, which drops its
+// "done" marker.
+func markSeenCmd(client Client, a agent.Agent) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+		defer cancel()
+		return seenMsg{err: client.MarkSeen(ctx, a)}
+	}
+}
+
+// previewOpen reports whether the drawer is on screen at all, in either mode.
+func (m Model) previewOpen() bool { return m.preview != previewOff }
+
+// previewWriting reports whether keys go to the agent rather than to the picker.
+func (m Model) previewWriting() bool { return m.preview == previewWrite }
+
 // schedulePreview starts the debounce for whatever is under the cursor now. It
 // drops the text of the agent the cursor came from, so the sidebar never shows
 // one agent's screen under another's name.
 func (m *Model) schedulePreview() tea.Cmd {
-	if !m.previewOpen || !previewFits(m.width) {
+	if !m.previewOpen() || !previewFits(m.width) {
 		return nil
 	}
 	m.previewGeneration++
@@ -314,20 +416,22 @@ func (m *Model) schedulePreview() tea.Cmd {
 // blinking through an empty frame every second.
 func (m *Model) refreshPreview() tea.Cmd {
 	a, ok := m.selectedAgent()
-	if !m.previewOpen || !ok || !previewFits(m.width) {
+	if !m.previewOpen() || !ok || !previewFits(m.width) || m.previewBusy {
 		return nil
 	}
 	m.previewGeneration++
+	m.previewBusy = true
 	return previewCmd(m.client, m.previewGeneration, a)
 }
 
 // startPreview runs the capture a debounce timer was scheduled for, unless a
 // newer move superseded it. That move scheduled a timer of its own.
-func (m Model) startPreview(generation uint64) tea.Cmd {
+func (m *Model) startPreview(generation uint64) tea.Cmd {
 	a, ok := m.selectedAgent()
-	if generation != m.previewGeneration || !m.previewOpen || !ok {
+	if generation != m.previewGeneration || !m.previewOpen() || !ok || m.previewBusy {
 		return nil
 	}
+	m.previewBusy = true
 	return previewCmd(m.client, m.previewGeneration, a)
 }
 
@@ -335,7 +439,7 @@ func (m Model) startPreview(generation uint64) tea.Cmd {
 // for. The cursor can move between a capture and its answer without the
 // generation catching it, so the agent is checked by name too.
 func (m Model) applyPreview(msg previewMsg) Model {
-	if msg.generation != m.previewGeneration || !m.previewOpen || msg.key != m.selectedKey() {
+	if msg.generation != m.previewGeneration || !m.previewOpen() || msg.key != m.selectedKey() {
 		return m
 	}
 	m.previewKey = msg.key
@@ -350,26 +454,71 @@ func expireNotice(id uint64) tea.Cmd {
 	return tea.Tick(noticeLife, func(time.Time) tea.Msg { return noticeExpiredMsg{id: id} })
 }
 
+// applyTick is the once-a-second beat: reload the list, and refresh the drawer
+// beside it.
+//
+// The drawer does not wait on the list. A reload still in flight is no reason
+// to leave the screen a second stale. In read-write the drawer has its own
+// faster tick, and running both only doubles the captures.
+func (m Model) applyTick() (tea.Model, tea.Cmd) {
+	var preview tea.Cmd
+	if !m.previewWriting() {
+		preview = m.refreshPreview()
+	}
+	if m.loading {
+		return m, tea.Batch(preview, tick())
+	}
+	m.loading = true
+	m.reloadGeneration++
+	return m, tea.Batch(m.reload(m.reloadGeneration), preview, tick())
+}
+
+// applyAgents takes a fresh inventory, and lets the drawer catch up with what
+// the reload found gone.
+func (m Model) applyAgents(agents []agent.Agent) (tea.Model, tea.Cmd) {
+	before := m.selectedKey()
+	m.replaceAgents(agents)
+	m.resizeSearch()
+	m.loaded = true
+	m.loading = false
+	m.reloadErr = nil
+
+	var cmds []tea.Cmd
+	// The agent being typed at can end between two reloads. Neither host
+	// reports a send that went nowhere, so this is what stops the keys going
+	// quietly into a dead window.
+	if m.previewWriting() && m.selectedKey() != m.writeKey {
+		m.stopWriting()
+		cmds = append(cmds, m.warn("the agent is gone"))
+	}
+	// The previewed agent can end between two reloads. Its screen goes with it,
+	// rather than sitting under whichever row took its place.
+	if m.selectedKey() != before {
+		cmds = append(cmds, m.schedulePreview())
+	}
+	if !m.spinning && m.anyWorking() {
+		m.spinning = true
+		cmds = append(cmds, spin())
+	}
+	return m, tea.Batch(cmds...)
+}
+
 // Update handles messages and key input.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeSearch()
+		// Typing into a drawer the view no longer draws is typing blind at an
+		// agent, so a terminal that shrinks past the threshold takes the keys
+		// back before it takes the drawer away.
+		if m.previewWriting() && !previewFits(m.width) {
+			m.stopWriting()
+		}
 		return m, nil
 	case tickMsg:
 		m.now = time.Time(msg)
-		// The sidebar refreshes on the same tick as the list, so a working
-		// agent is watched live rather than sampled when it was opened. It does
-		// not wait on the list: a reload still in flight is no reason to leave
-		// the screen a second stale.
-		preview := m.refreshPreview()
-		if m.loading {
-			return m, tea.Batch(preview, tick())
-		}
-		m.loading = true
-		m.reloadGeneration++
-		return m, tea.Batch(m.reload(m.reloadGeneration), preview, tick())
+		return m.applyTick()
 	case spinMsg:
 		m.spin++
 		if !m.anyWorking() {
@@ -381,23 +530,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.generation != m.reloadGeneration {
 			return m, nil
 		}
-		before := m.selectedKey()
-		m.replaceAgents(msg.agents)
-		m.resizeSearch()
-		m.loaded = true
-		m.loading = false
-		m.reloadErr = nil
-		var cmds []tea.Cmd
-		// The previewed agent can end between two reloads. Its screen goes with
-		// it, rather than sitting under whichever row took its place.
-		if m.selectedKey() != before {
-			cmds = append(cmds, m.schedulePreview())
-		}
-		if !m.spinning && m.anyWorking() {
-			m.spinning = true
-			cmds = append(cmds, spin())
-		}
-		return m, tea.Batch(cmds...)
+		return m.applyAgents(msg.agents)
 	case reloadErrMsg:
 		if msg.generation != m.reloadGeneration {
 			return m, nil
@@ -428,9 +561,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, expireNotice(m.noticeID)
 	case previewDueMsg:
-		return m, m.startPreview(msg.generation)
+		cmd := m.startPreview(msg.generation)
+		return m, cmd
 	case previewMsg:
+		// Before applyPreview, and for every result including the ones it drops
+		// on generation or agent. Clearing this only on the accepted path
+		// latches it and the drawer stops refreshing for good.
+		m.previewBusy = false
 		return m.applyPreview(msg), nil
+	case writeTickMsg:
+		if !m.previewWriting() {
+			m.previewTicking = false
+			return m, nil
+		}
+		// On its own line: refreshPreview takes a pointer and sets the capture
+		// guard, and Go does not specify whether a plain operand of a return is
+		// read before or after a call beside it.
+		refresh := m.refreshPreview()
+		return m, tea.Batch(refresh, writeTick())
+	case sentMsg:
+		return m.applySent(msg)
+	case seenMsg:
+		// Best effort. The marker only decides whether the picker still calls
+		// this agent "done", and it is not worth a banner over the list.
+		return m, nil
 	case noticeExpiredMsg:
 		// A newer notice replaced this one and owns its own tick.
 		if msg.id == m.noticeID {
@@ -552,6 +706,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Read-write claims the keyboard, so this comes before the selection
+	// bookkeeping below: no key it handles can move the cursor.
+	if m.previewWriting() {
+		next, cmd := m.handleWriteKey(msg)
+		return next, cmd
+	}
+
 	before := m.selectedKey()
 	next, cmd := m.handleActiveKey(msg)
 	// Every key that moves the cursor lands here, so the sidebar follows the
@@ -595,7 +756,16 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "q", "esc", "ctrl+c":
+	case "esc":
+		// One rung of the ladder. Read-write has already taken its own esc by
+		// the time this runs, so from here esc closes the drawer, and only then
+		// the picker.
+		if m.previewOpen() {
+			return m.closePreview(), nil
+		}
+		m.quitting = true
+		return m, tea.Quit
+	case "q", "ctrl+c":
 		m.quitting = true
 		return m, tea.Quit
 	case "/":
@@ -622,7 +792,7 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "enter":
 		return m.focusSelected()
 	case "v":
-		return m.togglePreview()
+		return m.enterWrite()
 	case "s":
 		return m.startSession("saving", saveCmd(m.snapshots))
 	case "R":
@@ -639,26 +809,140 @@ func (m Model) handleActiveKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// togglePreview opens or closes the sidebar.
+// enterWrite opens the drawer straight into read-write, and re-enters it from
+// read-only. "v" is the only way in; esc walks back out.
 //
 // A terminal too narrow to hold both the list and a readable column of screen
 // refuses, rather than squeezing the rows down to nothing. It reports that
 // through the notice line, where "s" and "R" report themselves.
-func (m Model) togglePreview() (Model, tea.Cmd) {
-	if m.previewOpen {
-		m.previewOpen = false
-		m.previewScreen, m.previewKey, m.previewErr = "", "", nil
-		// Strand any capture already on its way back.
-		m.previewGeneration++
+func (m Model) enterWrite() (Model, tea.Cmd) {
+	if !previewFits(m.width) {
+		return m, m.warn("terminal too narrow for the preview")
+	}
+	a, ok := m.selectedAgent()
+	if !ok {
 		return m, nil
 	}
-	if !previewFits(m.width) {
-		m.noticeID++
-		m.notice, m.noticeLevel = "terminal too narrow for the preview", noticeErr
-		return m, expireNotice(m.noticeID)
+
+	fresh := m.preview == previewOff
+	m.preview, m.writeKey, m.seenSent = previewWrite, a.Key(), false
+
+	var cmds []tea.Cmd
+	// Re-entering from read-only keeps the screen already on display. Only a
+	// drawer that was shut has nothing to show yet.
+	if fresh {
+		cmds = append(cmds, m.schedulePreview())
 	}
-	m.previewOpen = true
-	return m, m.schedulePreview()
+	if !m.previewTicking {
+		m.previewTicking = true
+		cmds = append(cmds, writeTick())
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// stopWriting drops back to read-only, keeping the screen on display. It is the
+// esc rung and the way every guard takes the keyboard back.
+func (m *Model) stopWriting() {
+	m.preview = previewRead
+	m.pending, m.writeKey = "", ""
+}
+
+// closePreview shuts the drawer and forgets what was in it.
+func (m Model) closePreview() Model {
+	m.preview = previewOff
+	m.previewScreen, m.previewKey, m.previewErr = "", "", nil
+	m.pending, m.writeKey = "", ""
+	// Strand any capture already on its way back.
+	m.previewGeneration++
+	return m
+}
+
+// warn puts one line above the list, where "s" and "R" report themselves.
+func (m *Model) warn(text string) tea.Cmd {
+	m.noticeID++
+	m.notice, m.noticeLevel = text, noticeErr
+	return expireNotice(m.noticeID)
+}
+
+// handleWriteKey forwards a key to the agent. Every key belongs to it except
+// esc, which is the way out, so q, enter, "/" and even ctrl+c all reach the
+// agent. Interrupting one is a main reason to want this at all.
+func (m Model) handleWriteKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if msg.Type == tea.KeyEsc {
+		m.stopWriting()
+		return m, nil
+	}
+
+	a, ok := m.selectedAgent()
+	if !ok || a.Key() != m.writeKey {
+		return m, nil
+	}
+
+	data, ok := encodeKey(msg)
+	if !ok {
+		return m, nil
+	}
+	// ctrl+] is the way to send an escape, since esc itself is spoken for.
+	// bubbletea reports it as its own byte, so the two never collide.
+	if msg.Type == tea.KeyCtrlCloseBracket {
+		data = "\x1b"
+	}
+
+	m.pending += data
+	cmds := []tea.Cmd{m.flushSend(a)}
+	// Answering an agent is looking at it, so the "done" marker goes. Opening
+	// the drawer is not: reading it changes nothing, which is what the sidebar
+	// has always promised.
+	if !m.seenSent {
+		m.seenSent = true
+		cmds = append(cmds, markSeenCmd(m.client, a))
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// flushSend starts one send if none is running, carrying everything typed since
+// the last one. At most one in flight is what keeps the bytes in the order they
+// were typed: a tea.Cmd runs on a goroutine of its own, and two of them can
+// finish the other way round.
+func (m *Model) flushSend(a agent.Agent) tea.Cmd {
+	if m.sending || m.pending == "" {
+		return nil
+	}
+	data := m.pending
+	m.pending, m.sending = "", true
+	return sendCmd(m.client, a, data)
+}
+
+// applySent takes one send's result: whatever was typed while it was out goes
+// next, and the drawer looks again to show what it did.
+func (m Model) applySent(msg sentMsg) (tea.Model, tea.Cmd) {
+	m.sending = false
+	// A result for an agent read-write has already left says nothing about the
+	// one under the cursor now, so it is not worth reporting against it. The
+	// keys that never went go too, rather than being banked for whatever took
+	// its place.
+	if !m.previewWriting() || msg.key != m.writeKey {
+		m.pending = ""
+		return m, nil
+	}
+	if msg.err != nil {
+		// Typing at something unreachable is worse than stopping.
+		m.stopWriting()
+		return m, m.warn(oneLine(msg.err.Error()))
+	}
+
+	var cmds []tea.Cmd
+	if a, ok := m.selectedAgent(); ok {
+		cmds = append(cmds, m.flushSend(a))
+	}
+	// The echo, not a full schedule: startPreview leaves the screen alone, so
+	// the drawer updates in place rather than blinking through "loading…".
+	m.previewGeneration++
+	generation := m.previewGeneration
+	cmds = append(cmds, tea.Tick(echoDelay, func(time.Time) tea.Msg {
+		return previewDueMsg{generation: generation}
+	}))
+	return m, tea.Batch(cmds...)
 }
 
 // startSession runs a snapshot command unless one is already running, and names

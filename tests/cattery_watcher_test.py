@@ -407,6 +407,32 @@ class EntryPointTest(WatcherTestCase):
                 self.assertEqual(window.user_vars["AGENT_DISPLAY"], "idle")
                 self.assertIn(1, boss._agent_seen)
 
+    def test_the_picker_can_mark_a_window_seen(self):
+        # The set of seen windows lives in this process, so the read-write
+        # preview cannot reach it directly. It publishes AGENT_SEEN and the
+        # watcher picks it up, which is the only way in from outside kitty.
+        window = FakeWindow(1, display="done", state="idle", kind="claude")
+        boss = boss_for([window])
+        window.set_user_var("AGENT_SEEN", "1")
+
+        watcher.on_set_user_var(boss, window, {"key": "AGENT_SEEN"})
+
+        self.assertIn(1, boss._agent_seen)
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "idle", "the marker did not drop")
+        # Left behind, the variable would travel into a session snapshot and
+        # the next mark would have nothing to change.
+        self.assertNotIn("AGENT_SEEN", window.user_vars)
+
+    def test_clearing_the_seen_marker_does_not_recurse(self):
+        # The watcher's own clearing write comes back through this callback.
+        window = FakeWindow(1, display="done", state="idle", kind="claude")
+        boss = boss_for([window])
+
+        watcher.on_set_user_var(boss, window, {"key": "AGENT_SEEN"})
+
+        self.assertEqual(boss._agent_seen, set())
+        self.assertEqual(window.var_calls, [])
+
     def test_losing_focus_changes_nothing(self):
         window = FakeWindow(1, display="done", state="idle", kind="claude")
         boss = boss_for([window])

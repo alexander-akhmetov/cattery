@@ -32,6 +32,15 @@ type fakeClient struct {
 	screen     string
 	previewErr error
 
+	// The read-write half. typed records what each send carried, in order, so
+	// a test can prove both the bytes and that nothing was reordered. inFlight
+	// counts the sends running at once, which must never exceed one.
+	typed    []string
+	sendErr  error
+	inFlight int
+	maxSends int
+	marked   []string
+
 	// The session half of the interface. actionErr makes save or restore fail
 	// without a kitty. windows is what goto_session produced, so it stays empty
 	// until then and the duplicate guard sees nothing.
@@ -54,6 +63,19 @@ func (f *fakeClient) Focus(_ context.Context, a agent.Agent) error {
 func (f *fakeClient) Preview(_ context.Context, a agent.Agent) (string, error) {
 	f.previewed = append(f.previewed, a.Key())
 	return f.screen, f.previewErr
+}
+
+func (f *fakeClient) Send(_ context.Context, _ agent.Agent, data string) error {
+	f.inFlight++
+	f.maxSends = max(f.maxSends, f.inFlight)
+	f.inFlight--
+	f.typed = append(f.typed, data)
+	return f.sendErr
+}
+
+func (f *fakeClient) MarkSeen(_ context.Context, a agent.Agent) error {
+	f.marked = append(f.marked, a.Key())
+	return nil
 }
 
 func (f *fakeClient) Action(_ context.Context, arg string) error {
@@ -1299,16 +1321,16 @@ func TestViewFitsTerminal(t *testing.T) {
 			// narrow to open it at all.
 			name: "preview",
 			set: func(m *Model) {
-				m.previewOpen = true
+				m.preview = previewRead
 				m.previewKey = m.selectedKey()
 				m.previewScreen = "\x1b[31m" + strings.Repeat("wide ", 60) + "\n\x1b]0;title\x07\x1b[2Jhello\n界界界界"
 			},
 		},
-		{name: "preview loading", set: func(m *Model) { m.previewOpen = true }},
+		{name: "preview loading", set: func(m *Model) { m.preview = previewRead }},
 		{
 			name: "preview failed",
 			set: func(m *Model) {
-				m.previewOpen = true
+				m.preview = previewRead
 				m.previewKey = m.selectedKey()
 				m.previewErr = errors.New("window 42: no matching window found for id:42")
 			},
@@ -1316,7 +1338,7 @@ func TestViewFitsTerminal(t *testing.T) {
 		{
 			name: "preview with banners",
 			set: func(m *Model) {
-				m.previewOpen = true
+				m.preview = previewRead
 				m.previewKey = m.selectedKey()
 				m.previewScreen = "hello"
 				m.focusErr = errors.New("window 42: gone")
@@ -1325,7 +1347,7 @@ func TestViewFitsTerminal(t *testing.T) {
 		},
 		{
 			name: "preview of nothing selected",
-			set:  func(m *Model) { m.previewOpen = true; m.filter = "idle" },
+			set:  func(m *Model) { m.preview = previewRead; m.filter = "idle" },
 		},
 	}
 	for _, size := range sizes {
@@ -2088,37 +2110,70 @@ func previewModel(client *fakeClient) Model {
 	return m
 }
 
-// open presses "v" and runs whatever it scheduled, up to and including the
-// capture, so a test can assert on what the sidebar ended up with.
-func open(t *testing.T, m Model) (Model, *fakeClient) {
+// openWrite presses "v" and runs whatever it scheduled, up to and including the
+// capture, so a test can assert on what the drawer ended up with. "v" opens
+// straight into read-write.
+func openWrite(t *testing.T, m Model) (Model, *fakeClient) {
 	t.Helper()
 	client, ok := m.client.(*fakeClient)
 	if !ok {
 		t.Fatalf("client is %T, not a fakeClient", m.client)
 	}
 	m, msg := press(t, m, runes('v'))
-	if !m.previewOpen {
-		t.Fatal(`"v" did not open the sidebar`)
+	if !m.previewWriting() {
+		t.Fatal(`"v" did not open the drawer for typing`)
+	}
+	return drain(t, m, msg), client
+}
+
+// open leaves the drawer showing the same screen with the keyboard back on the
+// picker, which is where every test about the sidebar itself belongs.
+func open(t *testing.T, m Model) (Model, *fakeClient) {
+	t.Helper()
+	m, client := openWrite(t, m)
+	m, msg := press(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	switch {
+	case m.previewWriting():
+		t.Fatal("esc did not drop out of read-write")
+	case !m.previewOpen():
+		t.Fatal("esc closed the drawer instead of dropping to read-only")
 	}
 	return drain(t, m, msg), client
 }
 
 // drain feeds a message back and follows the commands it produces, so a
 // debounce tick and the capture behind it resolve inside one test step.
+//
+// A batch is expanded rather than fed in whole, and the read-write refresh tick
+// is dropped: it re-arms itself, so following it would never end.
 func drain(t *testing.T, m Model, msg tea.Msg) Model {
 	t.Helper()
-	for range 4 {
-		if msg == nil {
-			return m
+	queue := []tea.Msg{msg}
+	for step := 0; len(queue) > 0; step++ {
+		if step > 16 {
+			t.Fatal("the preview never settled")
 		}
-		updated, cmd := m.Update(msg)
+		next := queue[0]
+		queue = queue[1:]
+
+		switch next := next.(type) {
+		case nil, writeTickMsg:
+			continue
+		case tea.BatchMsg:
+			for _, cmd := range next {
+				if cmd != nil {
+					queue = append(queue, cmd())
+				}
+			}
+			continue
+		}
+
+		updated, cmd := m.Update(next)
 		m = updated.(Model)
-		if cmd == nil {
-			return m
+		if cmd != nil {
+			queue = append(queue, cmd())
 		}
-		msg = cmd()
 	}
-	t.Fatal("the preview never settled")
 	return m
 }
 
@@ -2135,18 +2190,36 @@ func TestPreviewToggle(t *testing.T) {
 		}
 	})
 
-	t.Run("v again closes it and forgets the screen", func(t *testing.T) {
+	t.Run("esc closes it from read-only and forgets the screen", func(t *testing.T) {
 		m, _ := open(t, previewModel(&fakeClient{screen: "building the thing"}))
 
-		closed, _ := press(t, m, runes('v'))
-		if closed.previewOpen {
-			t.Fatal(`the second "v" did not close the sidebar`)
+		closed, _ := press(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+		if closed.previewOpen() {
+			t.Fatal("esc did not close the drawer")
 		}
 		if closed.previewScreen != "" || closed.previewKey != "" {
 			t.Fatalf("kept %q for %q after closing", closed.previewScreen, closed.previewKey)
 		}
 		if out := ansi.Strip(closed.View()); strings.Contains(out, "building the thing") {
 			t.Fatalf("the screen survived the close:\n%s", out)
+		}
+	})
+
+	// The drawer keeps whatever it was showing, so re-entering does not blink
+	// through "loading…" for a screen that is already on hand.
+	t.Run("v re-enters read-write from read-only", func(t *testing.T) {
+		m, client := open(t, previewModel(&fakeClient{screen: "building the thing"}))
+		before := len(client.previewed)
+
+		again, _ := press(t, m, runes('v'))
+		if !again.previewWriting() {
+			t.Fatal(`"v" did not go back into read-write`)
+		}
+		if again.previewScreen != "building the thing" {
+			t.Fatalf("screen: got %q, want the one already on display", again.previewScreen)
+		}
+		if len(client.previewed) != before {
+			t.Fatalf("captured %v again for a screen it already had", client.previewed)
 		}
 	})
 
@@ -2158,7 +2231,7 @@ func TestPreviewToggle(t *testing.T) {
 		m.search.Focus()
 
 		typed, _ := press(t, m, runes('v'))
-		if typed.previewOpen {
+		if typed.previewOpen() {
 			t.Fatal(`"v" opened the sidebar instead of reaching the query`)
 		}
 		if typed.search.Value() != "v" {
@@ -2173,7 +2246,7 @@ func TestPreviewToggle(t *testing.T) {
 		m.width = 80
 
 		narrow, msg := press(t, m, runes('v'))
-		if narrow.previewOpen {
+		if narrow.previewOpen() {
 			t.Fatal("the sidebar opened on a terminal that cannot hold it")
 		}
 		if !strings.Contains(narrow.notice, "too narrow") {
@@ -2290,7 +2363,7 @@ func TestPreviewKeepsTheListWhole(t *testing.T) {
 	plain.width, plain.height = 140, 24
 
 	with := plain
-	with.previewOpen = true
+	with.preview = previewRead
 	with.previewKey = with.selectedKey()
 	with.previewScreen = "a screen"
 
@@ -2299,6 +2372,63 @@ func TestPreviewKeepsTheListWhole(t *testing.T) {
 	}
 	if out := ansi.Strip(with.View()); !strings.Contains(out, "project-25") {
 		t.Fatalf("the selected row left the list:\n%s", out)
+	}
+}
+
+// Read-write only changes the colour of the frame. If it changed the geometry
+// too, walking the ladder would shuffle the whole picker under the cursor, and
+// the drawer would show a different amount of the agent's screen in each mode.
+func TestWriteMovesNothingButTheColour(t *testing.T) {
+	ro := previewModel(&fakeClient{})
+	ro.preview = previewRead
+	ro.previewKey = ro.selectedKey()
+	ro.previewScreen = "\x1b[31mbuilding\x1b[0m the thing\nand more"
+
+	rw := ro
+	rw.preview = previewWrite
+	rw.writeKey = rw.selectedKey()
+
+	roLines, rwLines := strings.Split(ro.View(), "\n"), strings.Split(rw.View(), "\n")
+	if len(roLines) != len(rwLines) {
+		t.Fatalf("line count: read-only %d, read-write %d", len(roLines), len(rwLines))
+	}
+	for i := range roLines {
+		if a, b := ansi.StringWidth(roLines[i]), ansi.StringWidth(rwLines[i]); a != b {
+			t.Errorf("line %d width: read-only %d, read-write %d", i, a, b)
+		}
+	}
+
+	// The hint and the footer are the two places the mode is meant to show in
+	// the text. Everything else has to read the same.
+	roBody, rwBody := ansi.Strip(ro.View()), ansi.Strip(rw.View())
+	if strings.Contains(roBody, "^] esc") {
+		t.Error("read-only advertises the escape hatch it does not need")
+	}
+	if !strings.Contains(rwBody, "^] esc") {
+		t.Errorf("read-write does not say how to send an escape:\n%s", rwBody)
+	}
+	if !strings.Contains(rwBody, "typing into") {
+		t.Errorf("the footer does not say the keyboard is on the agent:\n%s", rwBody)
+	}
+}
+
+// The frame is red only while the keyboard belongs to the agent, which is what
+// makes the mode legible at a glance.
+func TestWriteFrameIsRed(t *testing.T) {
+	cases := []struct {
+		mode previewMode
+		want lipgloss.Color
+	}{
+		{previewOff, cBorder},
+		{previewRead, cBorder},
+		{previewWrite, cRed},
+	}
+	for _, tc := range cases {
+		m := previewModel(&fakeClient{})
+		m.preview = tc.mode
+		if got := m.previewFrameColour(); got != tc.want {
+			t.Errorf("mode %v: got %q, want %q", tc.mode, got, tc.want)
+		}
 	}
 }
 
@@ -2326,6 +2456,300 @@ func TestPreviewRefreshesOnTheTick(t *testing.T) {
 	}
 	if len(client.previewed) != 2 {
 		t.Fatalf("captured %v, want one per tick", client.previewed)
+	}
+}
+
+// The ladder is the only way out of read-write, and each rung gives back one
+// thing: the keyboard, then the drawer, then the picker.
+func TestPreviewEscLadder(t *testing.T) {
+	m, _ := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+	esc := tea.KeyMsg{Type: tea.KeyEsc}
+
+	ro, _ := press(t, m, esc)
+	if ro.preview != previewRead {
+		t.Fatalf("after one esc: got mode %v, want read-only", ro.preview)
+	}
+	if ro.previewScreen != "building the thing" {
+		t.Fatalf("the first esc dropped the screen: %q", ro.previewScreen)
+	}
+
+	closed, _ := press(t, ro, esc)
+	if closed.preview != previewOff {
+		t.Fatalf("after two escs: got mode %v, want closed", closed.preview)
+	}
+
+	quit, _ := press(t, closed, esc)
+	if !quit.quitting {
+		t.Fatal("the third esc did not close the picker")
+	}
+}
+
+// q and ctrl+c still leave outright, so a drawer left open is never a thing to
+// escape twice before the picker will close.
+func TestPreviewQuitKeysSkipTheLadder(t *testing.T) {
+	for _, key := range []tea.KeyMsg{runes('q'), {Type: tea.KeyCtrlC}} {
+		t.Run(key.String(), func(t *testing.T) {
+			m, _ := open(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+			quit, _ := press(t, m, key)
+			if !quit.quitting {
+				t.Fatalf("%s did not close the picker from an open drawer", key)
+			}
+		})
+	}
+}
+
+// typeAt presses keys in read-write and runs the commands they produced,
+// without feeding the results back into the model. A test about what is still
+// queued needs the send to have run with its answer still out.
+func typeAt(t *testing.T, m Model, keys ...tea.KeyMsg) Model {
+	t.Helper()
+	for _, key := range keys {
+		next, msg := press(t, m, key)
+		runCmds(msg)
+		m = next
+	}
+	return m
+}
+
+// runCmds executes whatever a batch is carrying and discards the answers. A
+// lone command has already run by the time press returns.
+func runCmds(msg tea.Msg) {
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return
+	}
+	for _, cmd := range batch {
+		if cmd != nil {
+			runCmds(cmd())
+		}
+	}
+}
+
+func TestWriteForwardsKeys(t *testing.T) {
+	// Every picker key belongs to the agent in read-write, ctrl+c included:
+	// interrupting an agent is a main reason to want this.
+	cases := []struct {
+		name string
+		key  tea.KeyMsg
+		want string
+	}{
+		{"a letter", runes('y'), "y"},
+		{"a movement key does not move the cursor", runes('j'), "j"},
+		{"the quit key", runes('q'), "q"},
+		{"the search key", runes('/'), "/"},
+		{"the restore key", runes('R'), "R"},
+		{"a row number", runes('2'), "2"},
+		{"enter", tea.KeyMsg{Type: tea.KeyEnter}, "\r"},
+		{"ctrl+c interrupts the agent instead of closing the picker", tea.KeyMsg{Type: tea.KeyCtrlC}, "\x03"},
+		{"an arrow", tea.KeyMsg{Type: tea.KeyUp}, "\x1b[A"},
+		// esc is spoken for by the ladder, so this is the only way to send one.
+		{"ctrl+] carries the escape esc cannot", tea.KeyMsg{Type: tea.KeyCtrlCloseBracket}, "\x1b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, client := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+			before := m.selectedKey()
+
+			typed := typeAt(t, m, tc.key)
+
+			if !slices.Equal(client.typed, []string{tc.want}) {
+				t.Fatalf("sent: got %q, want [%q]", client.typed, tc.want)
+			}
+			if typed.selectedKey() != before {
+				t.Fatalf("the cursor moved to %s", typed.selectedKey())
+			}
+			if typed.quitting || typed.searching || !typed.previewWriting() {
+				t.Fatal("the key reached the picker as well as the agent")
+			}
+			if len(client.focused) != 0 {
+				t.Fatalf("focused %v from read-write", client.focused)
+			}
+		})
+	}
+
+	t.Run("a key with no encoding sends nothing", func(t *testing.T) {
+		m, client := openWrite(t, previewModel(&fakeClient{}))
+
+		typeAt(t, m, tea.KeyMsg{Type: tea.KeyF20})
+
+		if len(client.typed) != 0 {
+			t.Fatalf("sent %q for a key with no bytes", client.typed)
+		}
+	})
+}
+
+// Bubble Tea runs commands on their own goroutines, so two sends in flight
+// could finish the other way round and scramble what the user typed.
+func TestWriteKeepsOneSendInFlight(t *testing.T) {
+	m, client := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+	// Three keys with no result fed back between them: only the first can go.
+	m = typeAt(t, m, runes('a'), runes('b'), runes('c'))
+	if !slices.Equal(client.typed, []string{"a"}) {
+		t.Fatalf("sent: got %q, want [a] while the first was out", client.typed)
+	}
+	if m.pending != "bc" {
+		t.Fatalf("pending: got %q, want %q", m.pending, "bc")
+	}
+
+	// The result arrives and takes everything typed meanwhile, in one send and
+	// in order.
+	updated, cmd := m.Update(sentMsg{key: m.writeKey})
+	m = updated.(Model)
+	if cmd != nil {
+		drain(t, m, cmd())
+	}
+	if !slices.Equal(client.typed, []string{"a", "bc"}) {
+		t.Fatalf("sent: got %q, want [a bc]", client.typed)
+	}
+	if client.maxSends > 1 {
+		t.Fatalf("%d sends ran at once", client.maxSends)
+	}
+	if m.pending != "" {
+		t.Fatalf("pending: got %q, want it drained", m.pending)
+	}
+}
+
+// Answering an agent is looking at it. Opening the drawer is not: the sidebar
+// has always promised that reading changes nothing.
+func TestWriteMarksTheAgentSeen(t *testing.T) {
+	m, client := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+	if len(client.marked) != 0 {
+		t.Fatalf("marked %v for a drawer nobody has typed into", client.marked)
+	}
+
+	m = typeAt(t, m, runes('y'))
+	if !slices.Equal(client.marked, []string{"kitty:3"}) {
+		t.Fatalf("marked: got %v, want [kitty:3]", client.marked)
+	}
+
+	// Once per session, not once per keystroke.
+	typeAt(t, m, runes('e'))
+	if !slices.Equal(client.marked, []string{"kitty:3"}) {
+		t.Fatalf("marked: got %v, want the one write", client.marked)
+	}
+}
+
+func TestWriteStopsWhenItCannotReachTheAgent(t *testing.T) {
+	// Typing at something unreachable is worse than stopping, and the keys that
+	// never went must not be banked for whatever takes its place.
+	t.Run("a failed send drops to read-only and says why", func(t *testing.T) {
+		m, _ := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+		m.pending = "still queued"
+
+		updated, cmd := m.Update(sentMsg{key: m.writeKey, err: errors.New("window 3: no matching window\nfor id:3")})
+		got := updated.(Model)
+
+		if got.previewWriting() {
+			t.Fatal("a failed send left the keyboard on the agent")
+		}
+		if !got.previewOpen() {
+			t.Fatal("a failed send closed the drawer instead of dropping to read-only")
+		}
+		if got.pending != "" {
+			t.Fatalf("pending: got %q, want the dead target's keys dropped", got.pending)
+		}
+		if !strings.Contains(got.notice, "no matching window") || strings.Contains(got.notice, "\n") {
+			t.Fatalf("notice: got %q", got.notice)
+		}
+		if cmd == nil {
+			t.Fatal("the notice was not scheduled to clear")
+		}
+	})
+
+	// Neither host reports a send that went nowhere, so the reload is what
+	// notices the window closing under the drawer.
+	t.Run("the agent leaving the list ends read-write", func(t *testing.T) {
+		m, _ := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+		updated, _ := m.Update(agentsMsg{
+			generation: m.reloadGeneration,
+			agents:     []agent.Agent{checkout(2, "pi", "working", "dotfiles", "main")},
+		})
+		got := updated.(Model)
+
+		if got.previewWriting() {
+			t.Fatalf("still typing at %s after it left the list", got.writeKey)
+		}
+		if !strings.Contains(got.notice, "gone") {
+			t.Fatalf("notice: got %q", got.notice)
+		}
+	})
+
+	// A drawer the view no longer draws is one the user would be typing into
+	// blind.
+	t.Run("a terminal shrinking past the threshold ends read-write", func(t *testing.T) {
+		m, _ := openWrite(t, previewModel(&fakeClient{screen: "building the thing"}))
+
+		updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+		if got := updated.(Model); got.previewWriting() {
+			t.Fatal("still typing at an agent the view cannot show")
+		}
+	})
+}
+
+// Three things ask for captures in read-write. Without the single-flight guard
+// they queue up behind each other, and a guard cleared only on the accepted
+// path latches and stops the drawer refreshing for good.
+func TestWriteCapturesOneAtATime(t *testing.T) {
+	m, client := openWrite(t, previewModel(&fakeClient{screen: "first frame"}))
+	before := len(client.previewed)
+
+	first := m.refreshPreview()
+	if first == nil {
+		t.Fatal("the first refresh did not run")
+	}
+	if second := m.refreshPreview(); second != nil {
+		t.Fatal("a second capture started while one was in flight")
+	}
+	first()
+	if len(client.previewed) != before+1 {
+		t.Fatalf("captured %v, want the one capture", client.previewed)
+	}
+
+	// A result for an agent the cursor has left is dropped, and it still has to
+	// free the guard.
+	updated, _ := m.Update(previewMsg{generation: m.previewGeneration, key: "kitty:99", screen: "somewhere else"})
+	m = updated.(Model)
+	if m.previewBusy {
+		t.Fatal("a dropped result left the guard set")
+	}
+	next := m.refreshPreview()
+	if next == nil {
+		t.Fatal("the drawer stopped refreshing after one dropped result")
+	}
+	next()
+	if len(client.previewed) != before+2 {
+		t.Fatalf("captured %v", client.previewed)
+	}
+}
+
+// The fast tick is the one path that would spawn captures four times a second,
+// so it is the one that most needs the guard to survive the return statement it
+// is written in.
+func TestWriteTickHoldsTheCaptureGuard(t *testing.T) {
+	m, _ := openWrite(t, previewModel(&fakeClient{screen: "first frame"}))
+	m.previewBusy = false
+
+	updated, cmd := m.Update(writeTickMsg{})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("the tick scheduled nothing")
+	}
+	if !m.previewBusy {
+		t.Fatal("the tick started a capture without holding the guard")
+	}
+
+	// And it re-arms itself, or read-write refreshes once and never again.
+	updated, _ = m.Update(previewMsg{generation: m.previewGeneration, key: m.selectedKey(), screen: "second frame"})
+	m = updated.(Model)
+	if m.previewBusy {
+		t.Fatal("the result did not free the guard")
+	}
+	if !m.previewTicking {
+		t.Fatal("read-write stopped ticking")
 	}
 }
 

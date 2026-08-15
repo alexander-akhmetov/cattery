@@ -121,5 +121,41 @@ the picker compares the installed files with the embedded ones and warns.
   nothing else. `@AGENT_MSG` carries raw prompt text, so both writers escape a
   trailing ";" as `\;`. Without that escape a prompt ending in ";" loses that
   character, and a prompt that is only ";" drops every update chained behind it.
+- The read-write drawer types at an agent, which reverses what the rest of the
+  tmux path is careful about: `cattery attach` is read-only on purpose.
+  `send-keys` is a server-side command and is not constrained by that, so the
+  drawer can type into a pane the user is watching in a read-only viewer tab.
+- `tmux send-keys -H` reads each argument as one **byte**, not a code point. A
+  value above 0xff is dropped without a word, and 0xe9 arrives as a raw byte
+  rather than as UTF-8. `internal/tmux` encodes per byte, so anything non-ASCII
+  goes out as the UTF-8 it already is. `-H` is also why no argument can end in
+  ";" and why NUL is expressible at all.
+- tmux from 3.3 to at least 3.7 resolves a target client for `send-keys` even
+  when none was asked for, and refuses if that client is read-only. With no
+  `$TMUX` to go on, as the picker has, it picks the most recently active client
+  of the most recently active session, and `cattery attach` creates exactly such
+  a client. So one open viewer tab makes every send fail, whatever session the
+  target pane is in. An empty `-c` matches no client, and `send-keys` carries
+  CMD_CLIENT_CANFAIL, so the lookup fails quietly and the command runs with no
+  client. `retryUnclaimed` does that once and remembers the answer.
+- Neither host reports a send that went nowhere. kitty documents `send-text` as
+  always succeeding, even when its match found no window, and tmux delivers to a
+  pane in copy mode without the program ever seeing it. So `Send` returning nil
+  does not mean the agent received anything, and read-write is bound to an agent
+  key that every reload rechecks.
+- The kitty watcher keeps its seen windows in `boss._agent_seen`, a set inside
+  kitty's own process. Nothing outside kitty can reach it, so the picker
+  publishes `AGENT_SEEN` and `on_set_user_var` picks it up and clears it. That
+  path only exists after `cattery setup` has installed the new watcher.
+- A `tea.KeyMsg` carries no raw bytes, so `internal/overlay/keys.go` rebuilds
+  them. The control keys are free: bubbletea defines `KeyCtrlA` as SOH and
+  `KeyBackspace` as DEL, so for a type of 0-31 or 127 the type *is* the byte.
+  Arrows go out in CSI form (`\x1b[A`), never SS3: the picker cannot know the
+  target's application-cursor-key mode, and CSI is the form every parser has to
+  accept.
+- The drawer's box costs exactly what the plain rule cost, a space and two
+  edges in place of " │ ". That is why `previewWidths`, `previewFits` and the
+  91-column threshold did not move when the box arrived. Keep it that way, or
+  the drawer shows a different amount of screen in each mode.
 
 @README.md

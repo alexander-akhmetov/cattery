@@ -20,6 +20,12 @@ import (
 // that already shows it.
 const varView = "AGENT_VIEW"
 
+// varSeen is how the picker tells the kitty watcher that the user has looked at
+// an agent. The watcher keeps its seen windows in its own process, where
+// nothing outside kitty can reach them, so this is the way in. The watcher
+// clears the variable once it has read it.
+const varSeen = "AGENT_SEEN"
+
 // KittyClient is the kitty remote control this package needs.
 type KittyClient interface {
 	ListAgents(ctx context.Context) ([]agent.Agent, error)
@@ -27,6 +33,8 @@ type KittyClient interface {
 	Windows(ctx context.Context) ([]kitty.Window, error)
 	Launch(ctx context.Context, args []string) error
 	Text(ctx context.Context, id int) (string, error)
+	SendText(ctx context.Context, id int, text string) error
+	SetUserVars(ctx context.Context, id int, vars []string) error
 }
 
 // TmuxClient is the tmux half.
@@ -34,6 +42,8 @@ type TmuxClient interface {
 	ListAgents(ctx context.Context) ([]agent.Agent, error)
 	Alive(ctx context.Context, target string) (bool, error)
 	Capture(ctx context.Context, target string) (string, error)
+	SendKeys(ctx context.Context, target, data string) error
+	MarkSeen(ctx context.Context, target string) error
 }
 
 // Client lists and reaches agents in every host.
@@ -147,6 +157,40 @@ func (c *Client) Preview(ctx context.Context, a agent.Agent) (string, error) {
 		return "", fmt.Errorf("tmux agent %d has no pane to read", a.ID)
 	}
 	return c.tmux.Capture(ctx, a.Target)
+}
+
+// Send types raw terminal input at one agent, the bytes a terminal would have
+// delivered for those keys. It is what the read-write preview forwards through,
+// and the only thing in the picker that changes what an agent is doing.
+//
+// Neither host reports a send that went nowhere. kitty documents send-text as
+// always succeeding, even when its match found no window, and tmux delivers to
+// a pane in copy mode without the program ever seeing it. The caller cannot
+// treat a nil error as "the agent received this".
+func (c *Client) Send(ctx context.Context, a agent.Agent, data string) error {
+	if a.Host != agent.HostTmux {
+		return c.kitty.SendText(ctx, a.ID, data)
+	}
+	if a.Target == "" {
+		return fmt.Errorf("tmux agent %d has no pane to type into", a.ID)
+	}
+	return c.tmux.SendKeys(ctx, a.Target, data)
+}
+
+// MarkSeen records that the user has looked at an agent, which drops its "done"
+// marker. Typing at one counts, the same way jumping to it does.
+//
+// The kitty half goes through the watcher rather than around it: the set of
+// seen windows lives in the watcher's own process, so the picker publishes a
+// user variable and the watcher picks it up, clears it, and redraws the tab.
+func (c *Client) MarkSeen(ctx context.Context, a agent.Agent) error {
+	if a.Host != agent.HostTmux {
+		return c.kitty.SetUserVars(ctx, a.ID, []string{varSeen + "=1"})
+	}
+	if a.Target == "" {
+		return fmt.Errorf("tmux agent %d has no pane to mark", a.ID)
+	}
+	return c.tmux.MarkSeen(ctx, a.Target)
 }
 
 // viewerArgs is the kitty tab that shows one tmux agent. The title says the

@@ -410,7 +410,7 @@ func (m Model) View() string {
 	// The sidebar splits the body horizontally and leaves the vertical
 	// geometry alone, so the list keeps every line it had.
 	listInner, sideInner, sidebar := inner, 0, false
-	if m.previewOpen {
+	if m.previewOpen() {
 		listInner, sideInner, sidebar = previewWidths(inner)
 	}
 	body := m.listLines(listInner, avail)
@@ -473,22 +473,68 @@ func previewFits(width int) bool {
 	return ok
 }
 
-// joinPreview puts the sidebar beside the list, one line at a time.
+// previewFrameColour is what the drawer's box is drawn in: red while the
+// keyboard belongs to the agent, and the picker's own border colour otherwise.
+// The glyphs are the same either way, so the mode costs no space and moves
+// nothing.
+func (m Model) previewFrameColour() lipgloss.Color {
+	if m.previewWriting() {
+		return cRed
+	}
+	return cBorder
+}
+
+// joinPreview puts the drawer beside the list, one line at a time.
 //
 // Each list line is padded to its own column first. A row pads itself through
 // composeLine, but the banner lines above the list are plain truncations, and
-// an unpadded one would drag the rule left on that line alone.
+// an unpadded one would drag the frame left on that line alone.
+//
+// The box costs exactly what the plain rule cost: a space, a left edge, and a
+// right edge in place of " │ ". So the geometry, and every width threshold that
+// depends on it, is the same whether the drawer is boxed or not.
 func (m Model) joinPreview(body []string, listWidth, previewWidth, avail int) []string {
-	side := m.previewColumn(previewWidth, avail)
-	rule := lipgloss.NewStyle().Foreground(cBorder).Render("│")
+	frame := lipgloss.NewStyle().Foreground(m.previewFrameColour())
+
+	listLine := func(i int) string {
+		if i < len(body) {
+			return padTo(body[i], listWidth)
+		}
+		return strings.Repeat(" ", listWidth)
+	}
+
+	// Two lines is not a box. Below that the drawer keeps the plain rule it had
+	// before, still recoloured, so the mode is never invisible.
+	if avail < 3 {
+		side := m.previewColumn(previewWidth, avail)
+		rule := frame.Render("│")
+		out := make([]string, avail)
+		for i := range out {
+			out[i] = listLine(i) + " " + rule + " " + side[i]
+		}
+		return out
+	}
+
+	side := m.previewColumn(previewWidth, avail-2)
+	var (
+		top    = frame.Render("┌" + strings.Repeat("─", previewWidth) + "┐")
+		bottom = frame.Render("└" + strings.Repeat("─", previewWidth) + "┘")
+		edge   = frame.Render("│")
+	)
 
 	out := make([]string, avail)
 	for i := range out {
-		line := ""
-		if i < len(body) {
-			line = body[i]
+		switch i {
+		case 0:
+			out[i] = listLine(i) + " " + top
+		case avail - 1:
+			out[i] = listLine(i) + " " + bottom
+		default:
+			// padTo defends the right edge: a preview line already ends reset,
+			// and if that ever stops being true a stray background would run
+			// out through the frame rather than stop at it.
+			out[i] = listLine(i) + " " + edge + padTo(side[i-1], previewWidth) + edge
 		}
-		out[i] = padTo(line, listWidth) + " " + rule + " " + side[i]
 	}
 	return out
 }
@@ -506,8 +552,7 @@ func (m Model) previewColumn(width, avail int) []string {
 		return fill(nil, blankLine, avail)
 	}
 
-	head := lipgloss.NewStyle().Foreground(cSubtext).Bold(true).Render(truncate(agentName(a), width))
-	out := []string{padTo(head, width)}
+	out := []string{m.previewHead(a, width)}
 	if avail >= 4 {
 		out = append(out, divider(width))
 	}
@@ -525,6 +570,30 @@ func (m Model) previewColumn(width, avail int) []string {
 		return append(out, note(width, body, "no output", cOverlay0)...)
 	}
 	return append(out, previewLines(m.previewScreen, width, body)...)
+}
+
+// previewHead names the agent, and in read-write says how to reach it with an
+// escape.
+//
+// esc is the way back out of read-write, so it is the one key the agent cannot
+// be sent, and Claude and vim both want it. ctrl+] carries it instead. The hint
+// is the only place that says so within reach of someone already typing, and it
+// goes first when the column is too narrow for both.
+func (m Model) previewHead(a agent.Agent, width int) string {
+	name := lipgloss.NewStyle().Foreground(cSubtext).Bold(true)
+	if !m.previewWriting() {
+		return padTo(name.Render(truncate(agentName(a), width)), width)
+	}
+
+	const hint = "^] esc"
+	label := agentName(a)
+	if ansi.StringWidth(label)+ansi.StringWidth(hint)+1 > width {
+		return padTo(name.Render(truncate(label, width)), width)
+	}
+	gap := width - ansi.StringWidth(label) - ansi.StringWidth(hint)
+	return name.Render(label) +
+		strings.Repeat(" ", gap) +
+		lipgloss.NewStyle().Foreground(cOverlay0).Render(hint)
 }
 
 // note fills the sidebar with one dim line, for a state with no screen behind
@@ -625,8 +694,12 @@ func (m Model) renderTitleBar(width int) string {
 			verb = actionVerb(a)
 		}
 		rightTiers = []string{verb}
+	case m.previewWriting():
+		rightTiers = []string{"esc read-only"}
 	case m.searching:
 		rightTiers = []string{"esc clear · ^c close", "esc clear"}
+	case m.previewOpen():
+		rightTiers = []string{"esc close preview", "esc preview"}
 	}
 
 	inner := width - 4
@@ -1110,6 +1183,19 @@ func (m Model) hintTiers() []string {
 	switch {
 	case m.focusing:
 		return []string{verb + " selected agent…", verb + "…"}
+	case m.previewWriting():
+		// Every key goes to the agent, ctrl+c included, so esc is the only way
+		// back and the footer has to say so on every tier.
+		name := "the agent"
+		if a, ok := m.selectedAgent(); ok {
+			name = agentName(a)
+		}
+		return []string{
+			"typing into " + name + " · every key goes to it · ^] esc · esc read-only",
+			"typing into " + name + " · ^] esc · esc read-only",
+			"typing · ^] esc · esc read-only",
+			"esc read-only",
+		}
 	case m.searching:
 		return []string{"↑↓ move · " + action + " · esc clear · ^c close", action + " · esc clear", "esc clear"}
 	case m.sessionBusy:
@@ -1117,16 +1203,19 @@ func (m Model) hintTiers() []string {
 		// makes one.
 		return []string{m.sessionVerb + " the session snapshot…", m.sessionVerb + "…"}
 	default:
-		preview := "v preview"
-		if m.previewOpen {
-			preview = "v close preview"
+		// In read-only esc closes the drawer rather than the picker, so the
+		// tiers have to name the key that does leave, or they lie.
+		preview, closeKey := "v type", "esc close"
+		if m.previewOpen() {
+			preview, closeKey = "v type", "esc close preview · q quit"
 		}
 		return []string{
-			"↑↓ / j k move · 1-9 select · " + action + " · " + preview + " · / search · f filter · s save · R restore · esc close",
-			"j k move · " + action + " · " + preview + " · / search · f filter · s save · R restore · esc close",
-			"j k move · " + action + " · " + preview + " · / search · f filter · esc close",
-			"j k move · " + action + " · / search · f filter · esc close",
-			action + " · / search · esc close",
+			"↑↓ / j k move · 1-9 select · " + action + " · " + preview + " · / search · f filter · s save · R restore · " + closeKey,
+			"j k move · " + action + " · " + preview + " · / search · f filter · s save · R restore · " + closeKey,
+			"j k move · " + action + " · " + preview + " · / search · f filter · " + closeKey,
+			"j k move · " + action + " · / search · f filter · " + closeKey,
+			action + " · / search · " + closeKey,
+			closeKey,
 			"esc close",
 		}
 	}

@@ -411,6 +411,214 @@ func TestViewName(t *testing.T) {
 	}
 }
 
+func TestSendKeys(t *testing.T) {
+	// tmux reads each -H argument as one byte, not as a code point: a value
+	// above 0xff is dropped without a word. So a multibyte rune goes out as the
+	// UTF-8 bytes it already is.
+	cases := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{
+			name: "plain text",
+			data: "hi",
+			want: []string{"send-keys -H -t %17 68 69"},
+		},
+		{
+			name: "an escape sequence",
+			data: "\x1b[A",
+			want: []string{"send-keys -H -t %17 1b 5b 41"},
+		},
+		{
+			name: "a multibyte rune goes out as its bytes",
+			data: "界",
+			want: []string{"send-keys -H -t %17 e7 95 8c"},
+		},
+		// A literal argument ending in ";" would end the command there and take
+		// every key after it. Hex digits cannot.
+		{
+			name: "a semicolon is only a number",
+			data: ";",
+			want: []string{"send-keys -H -t %17 3b"},
+		},
+		// NUL cannot travel through argv inside a literal string at all.
+		{
+			name: "NUL survives",
+			data: "\x00",
+			want: []string{"send-keys -H -t %17 00"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			log := filepath.Join(t.TempDir(), "argv")
+			client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
+
+			if err := client.SendKeys(context.Background(), "kontora:3.%17", tc.data); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			if got := readLines(t, log); !slices.Equal(got, tc.want) {
+				t.Fatalf("commands: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// A paste is longer than one command should carry, and tmux gets an argv
+	// rather than stdin.
+	t.Run("a long payload is split", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
+
+		if err := client.SendKeys(context.Background(), "kontora:3.%17", strings.Repeat("x", sendChunk+1)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		got := readLines(t, log)
+		if len(got) != 2 {
+			t.Fatalf("commands: got %d, want 2", len(got))
+		}
+		if want := "send-keys -H -t %17 " + strings.TrimSpace(strings.Repeat("78 ", sendChunk)); got[0] != want {
+			t.Fatalf("first command: got %q", got[0])
+		}
+		if got[1] != "send-keys -H -t %17 78" {
+			t.Fatalf("second command: got %q", got[1])
+		}
+	})
+
+	t.Run("nothing to send runs no command", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
+
+		if err := client.SendKeys(context.Background(), "kontora:3.%17", ""); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		if _, err := os.Stat(log); err == nil {
+			t.Fatalf("ran %v for an empty payload", readLines(t, log))
+		}
+	})
+
+	t.Run("a failure keeps tmux's reason on one line", func(t *testing.T) {
+		client := &Client{tmux: fakeTmux(t, "printf \"can't find pane: %%17\\nand more\\n\" >&2; exit 1")}
+
+		err := client.SendKeys(context.Background(), "kontora:3.%17", "hi")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !strings.Contains(err.Error(), "find pane") || strings.Contains(err.Error(), "\n") {
+			t.Fatalf("error: %q", err)
+		}
+	})
+
+	t.Run("a malformed target is a failure", func(t *testing.T) {
+		if err := (&Client{tmux: "tmux"}).SendKeys(context.Background(), "kontora", "hi"); err == nil {
+			t.Fatal("expected an error")
+		}
+	})
+}
+
+// tmux resolves a client for send-keys even though none was asked for, and
+// refuses when that client is read-only. `cattery attach` creates read-only
+// clients, so an open viewer tab would otherwise break every send from the
+// picker, whatever session the target pane is in.
+func TestSendKeysSurvivesAReadOnlyClient(t *testing.T) {
+	// The fake refuses any send-keys without "-c", the way tmux 3.3 to 3.7 do
+	// when the client they picked is read-only.
+	const refuseWithoutC = `
+printf '%s\n' "$*" >> LOG
+case "$*" in
+  *" -c "*) exit 0 ;;
+esac
+printf 'client is read-only\n' >&2
+exit 1
+`
+
+	t.Run("the send is retried at no client at all", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, strings.ReplaceAll(refuseWithoutC, "LOG", log))}
+
+		if err := client.SendKeys(context.Background(), "kontora:3.%17", "h"); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		want := []string{
+			"send-keys -H -t %17 68",
+			"send-keys -c  -H -t %17 68",
+		}
+		if got := readLines(t, log); !slices.Equal(got, want) {
+			t.Fatalf("commands: got %v, want %v", got, want)
+		}
+	})
+
+	// Paying for a failed send before every real one would double the latency
+	// of typing for as long as a viewer tab is open.
+	t.Run("the answer sticks for the rest of the session", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, strings.ReplaceAll(refuseWithoutC, "LOG", log))}
+
+		for range 2 {
+			if err := client.SendKeys(context.Background(), "kontora:3.%17", "h"); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+		}
+		want := []string{
+			"send-keys -H -t %17 68",
+			"send-keys -c  -H -t %17 68",
+			"send-keys -c  -H -t %17 68",
+		}
+		if got := readLines(t, log); !slices.Equal(got, want) {
+			t.Fatalf("commands: got %v, want %v", got, want)
+		}
+	})
+
+	// An older tmux has neither the check nor -c, so the retry must not turn a
+	// plain failure into a second confusing one.
+	t.Run("another failure is not retried", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log+`; printf "can't find pane: %%17\n" >&2; exit 1`)}
+
+		if err := client.SendKeys(context.Background(), "kontora:3.%17", "h"); err == nil {
+			t.Fatal("expected an error")
+		}
+		if got := readLines(t, log); len(got) != 1 {
+			t.Fatalf("commands: got %v, want one", got)
+		}
+	})
+
+	// If the retry fails too, the first reason is the one worth reporting: it
+	// is what tmux said about the command the user's tmux actually supports.
+	t.Run("a failed retry keeps the original reason", func(t *testing.T) {
+		client := &Client{tmux: fakeTmux(t, `printf 'client is read-only\n' >&2; exit 1`)}
+
+		err := client.SendKeys(context.Background(), "kontora:3.%17", "h")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !strings.Contains(err.Error(), readOnlyClient) {
+			t.Fatalf("error: %q", err)
+		}
+	})
+}
+
+func TestMarkSeen(t *testing.T) {
+	// On the pane, not the window: a window target resolves to whichever pane
+	// is active, which is the other agent's in a split window.
+	t.Run("the pane carries the marker", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "argv")
+		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
+
+		if err := client.MarkSeen(context.Background(), "kontora:3.%17"); err != nil {
+			t.Fatalf("mark seen: %v", err)
+		}
+		if got, want := readLines(t, log), []string{"set -p -t %17 @AGENT_SEEN 1"}; !slices.Equal(got, want) {
+			t.Fatalf("commands: got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a malformed target is a failure", func(t *testing.T) {
+		if err := (&Client{tmux: "tmux"}).MarkSeen(context.Background(), "kontora"); err == nil {
+			t.Fatal("expected an error")
+		}
+	})
+}
+
 func TestAttach(t *testing.T) {
 	view := viewName("kontora")
 

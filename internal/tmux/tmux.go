@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,6 +74,11 @@ const (
 // Client runs tmux commands.
 type Client struct {
 	tmux string
+
+	// unclaimed records that this tmux needs send-keys addressed at no client
+	// at all. See retryUnclaimed: the first send finds out, and the rest of the
+	// session skips the failed attempt.
+	unclaimed atomic.Bool
 }
 
 // installPrefixes are the tmux locations to try when PATH has none.
@@ -307,6 +313,110 @@ func (c *Client) Capture(ctx context.Context, target string) (string, error) {
 	return string(out), nil
 }
 
+// sendChunk caps the keys one send-keys command carries. A burst of typing is
+// a handful of bytes; a paste is not, and these go in argv rather than on
+// stdin.
+const sendChunk = 256
+
+// SendKeys types raw terminal input at one pane, the bytes a terminal would
+// have delivered for those keys.
+//
+// -H, so every argument is hex digits. That makes four hazards structurally
+// impossible rather than merely handled: no argument can end in ";", which
+// tmux reads as the end of a command whatever the rest of the argument is; no
+// argument can start with "-"; NUL is expressible, which it is not inside a
+// literal argv string; and there is no version-dependent question about which
+// backslash escapes -l still interprets.
+//
+// tmux reads each hex number as one byte, not as a code point: a value above
+// 0xff is dropped without a word, and 0xe9 arrives as the raw byte rather than
+// as UTF-8. So the string is encoded per byte, which sends anything non-ASCII
+// as the UTF-8 it already is.
+func (c *Client) SendKeys(ctx context.Context, target, data string) error {
+	// The pane id alone, as Capture and Alive do: a bare pane id is a valid
+	// target and survives the pane moving to another window.
+	_, _, pane, err := splitTarget(target)
+	if err != nil {
+		return err
+	}
+
+	keys := make([]string, 0, sendChunk)
+	flush := func() error {
+		if len(keys) == 0 {
+			return nil
+		}
+		args := append(c.sendPrefix(), append([]string{"-H", "-t", pane}, keys...)...)
+		keys = keys[:0]
+		if err := c.run(ctx, args...); err != nil {
+			return c.retryUnclaimed(ctx, err, args)
+		}
+		return nil
+	}
+	for i := range len(data) {
+		keys = append(keys, fmt.Sprintf("%02x", data[i]))
+		if len(keys) == sendChunk {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
+// readOnlyClient is what tmux says when it refuses a send on account of the
+// client it picked, rather than the pane it was asked about.
+const readOnlyClient = "client is read-only"
+
+// sendPrefix is the start of a send-keys command line, with the empty -c once
+// it is known to be needed.
+func (c *Client) sendPrefix() []string {
+	if c.unclaimed.Load() {
+		return []string{"send-keys", "-c", ""}
+	}
+	return []string{"send-keys"}
+}
+
+// retryUnclaimed works around tmux refusing a send because of a client that has
+// nothing to do with the target pane.
+//
+// From tmux 3.3 to at least 3.7, send-keys resolves a target client even when
+// none was asked for, and errors out if that client is read-only. With no
+// $TMUX to go on, as the picker has, tmux picks the most recently active client
+// of the most recently active session. `cattery attach` creates exactly such a
+// client, `attach-session -r`, so an open viewer tab makes every send from the
+// picker fail, whatever session the target pane is in.
+//
+// An empty -c matches no client. send-keys carries CMD_CLIENT_CANFAIL, so the
+// lookup fails quietly and the command runs with no client at all, which is
+// what it should have done to begin with. Neither the check nor -c exists
+// before 3.3, so the retry only ever runs where it works, and the answer sticks
+// for the rest of the session.
+func (c *Client) retryUnclaimed(ctx context.Context, err error, args []string) error {
+	if c.unclaimed.Load() || !strings.Contains(err.Error(), readOnlyClient) {
+		return err
+	}
+	retry := append([]string{"send-keys", "-c", ""}, args[1:]...)
+	if retryErr := c.run(ctx, retry...); retryErr != nil {
+		return err
+	}
+	c.unclaimed.Store(true)
+	return nil
+}
+
+// MarkSeen records that the user has looked at this agent, which is what drops
+// its "done" marker. Attaching does it, and so does the first key the
+// read-write preview sends.
+//
+// On the pane, not on the window: a window target resolves to whichever pane is
+// active, which is another agent's when the window is split.
+func (c *Client) MarkSeen(ctx context.Context, target string) error {
+	_, _, pane, err := splitTarget(target)
+	if err != nil {
+		return err
+	}
+	return c.run(ctx, "set", "-p", "-t", pane, optSeen, "1")
+}
+
 // Attach opens a read-only view of the window named by target
 // ("<session>:<window index>.<pane id>") and returns when the viewer detaches.
 //
@@ -316,7 +426,7 @@ func (c *Client) Capture(ctx context.Context, target string) (string, error) {
 // tmux's "read-only,ignore-size" pair, which is what keeps the viewer from
 // typing at the agent and from resizing its pane.
 func (c *Client) Attach(ctx context.Context, target string) error {
-	session, index, pane, err := splitTarget(target)
+	session, index, _, err := splitTarget(target)
 	if err != nil {
 		return err
 	}
@@ -345,11 +455,9 @@ func (c *Client) Attach(ctx context.Context, target string) error {
 	if err := c.run(ctx, "select-window", "-t", view+":"+index); err != nil {
 		return err
 	}
-	// On the pane, not on the window: a window target resolves to whichever pane
-	// is active, which is another agent's when the window is split. Best effort,
-	// because the marker only decides whether the picker still calls this agent
-	// "done", and a pane that went away is not worth failing the attach.
-	_ = c.run(ctx, "set", "-p", "-t", pane, optSeen, "1")
+	// Best effort: the marker only decides whether the picker still calls this
+	// agent "done", and a pane that went away is not worth failing the attach.
+	_ = c.MarkSeen(ctx, target)
 
 	// A child process, not syscall.Exec: the deferred cleanup has to run.
 	attach := exec.CommandContext(ctx, c.tmux, "attach-session", "-r", "-t", view)

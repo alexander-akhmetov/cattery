@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -33,6 +34,12 @@ type fakeKitty struct {
 	read    []int
 	screen  string
 	textErr error
+
+	// sent records what Send typed, per window, and vars records the user
+	// variables the seen marker published.
+	sent    []string
+	sendErr error
+	vars    []string
 }
 
 func (f *fakeKitty) ListAgents(context.Context) ([]agent.Agent, error) {
@@ -64,6 +71,16 @@ func (f *fakeKitty) Text(_ context.Context, id int) (string, error) {
 	return f.screen, f.textErr
 }
 
+func (f *fakeKitty) SendText(_ context.Context, id int, text string) error {
+	f.sent = append(f.sent, fmt.Sprintf("%d:%q", id, text))
+	return f.sendErr
+}
+
+func (f *fakeKitty) SetUserVars(_ context.Context, id int, vars []string) error {
+	f.vars = append(f.vars, fmt.Sprintf("%d:%s", id, strings.Join(vars, " ")))
+	return nil
+}
+
 type fakeTmux struct {
 	agents  []agent.Agent
 	err     error
@@ -81,6 +98,12 @@ type fakeTmux struct {
 	captured   []string
 	screen     string
 	captureErr error
+
+	// sent records what SendKeys typed, per target, and marked the targets
+	// MarkSeen was called for.
+	sent    []string
+	sendErr error
+	marked  []string
 }
 
 func (f *fakeTmux) ListAgents(context.Context) ([]agent.Agent, error) {
@@ -101,6 +124,16 @@ func (f *fakeTmux) Alive(_ context.Context, target string) (bool, error) {
 func (f *fakeTmux) Capture(_ context.Context, target string) (string, error) {
 	f.captured = append(f.captured, target)
 	return f.screen, f.captureErr
+}
+
+func (f *fakeTmux) SendKeys(_ context.Context, target, data string) error {
+	f.sent = append(f.sent, fmt.Sprintf("%s:%q", target, data))
+	return f.sendErr
+}
+
+func (f *fakeTmux) MarkSeen(_ context.Context, target string) error {
+	f.marked = append(f.marked, target)
+	return nil
 }
 
 func newTestClient(k *fakeKitty, tm *fakeTmux) *Client {
@@ -393,6 +426,98 @@ func TestPreview(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSend(t *testing.T) {
+	cases := []struct {
+		name      string
+		a         agent.Agent
+		wantKitty []string
+		wantTmux  []string
+		wantErr   string
+	}{
+		{
+			name:      "a kitty agent is typed at by window id",
+			a:         agent.Agent{ID: 12, Host: agent.HostKitty},
+			wantKitty: []string{`12:"\x1b[A"`},
+		},
+		{
+			name:      "an agent with no host reads as kitty",
+			a:         agent.Agent{ID: 5},
+			wantKitty: []string{`5:"\x1b[A"`},
+		},
+		{
+			name:     "a tmux agent is typed at by target",
+			a:        agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"},
+			wantTmux: []string{`kontora:3.%17:"\x1b[A"`},
+		},
+		{
+			name:    "a tmux agent with no target reaches neither host",
+			a:       agent.Agent{ID: 17, Host: agent.HostTmux},
+			wantErr: "no pane to type into",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k, tm := &fakeKitty{}, &fakeTmux{}
+
+			err := newTestClient(k, tm).Send(context.Background(), tc.a, "\x1b[A")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error: got %v, want one containing %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			if !slices.Equal(k.sent, tc.wantKitty) {
+				t.Errorf("kitty sent: got %v, want %v", k.sent, tc.wantKitty)
+			}
+			if !slices.Equal(tm.sent, tc.wantTmux) {
+				t.Errorf("tmux sent: got %v, want %v", tm.sent, tc.wantTmux)
+			}
+		})
+	}
+}
+
+// The kitty half cannot write the marker itself: the set of seen windows lives
+// inside the watcher's process. It publishes a user variable and lets the
+// watcher pick it up.
+func TestMarkSeen(t *testing.T) {
+	t.Run("a kitty agent is marked through a user variable", func(t *testing.T) {
+		k, tm := &fakeKitty{}, &fakeTmux{}
+
+		if err := newTestClient(k, tm).MarkSeen(context.Background(), agent.Agent{ID: 12, Host: agent.HostKitty}); err != nil {
+			t.Fatalf("mark seen: %v", err)
+		}
+		if want := []string{"12:AGENT_SEEN=1"}; !slices.Equal(k.vars, want) {
+			t.Fatalf("vars: got %v, want %v", k.vars, want)
+		}
+		if len(tm.marked) != 0 {
+			t.Fatalf("marked %v on the wrong host", tm.marked)
+		}
+	})
+
+	t.Run("a tmux agent is marked on its pane", func(t *testing.T) {
+		k, tm := &fakeKitty{}, &fakeTmux{}
+		a := agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"}
+
+		if err := newTestClient(k, tm).MarkSeen(context.Background(), a); err != nil {
+			t.Fatalf("mark seen: %v", err)
+		}
+		if want := []string{"kontora:3.%17"}; !slices.Equal(tm.marked, want) {
+			t.Fatalf("marked: got %v, want %v", tm.marked, want)
+		}
+		if len(k.vars) != 0 {
+			t.Fatalf("published %v on the wrong host", k.vars)
+		}
+	})
+
+	t.Run("a tmux agent with no target reaches neither host", func(t *testing.T) {
+		err := newTestClient(&fakeKitty{}, &fakeTmux{}).MarkSeen(context.Background(), agent.Agent{ID: 17, Host: agent.HostTmux})
+		if err == nil || !strings.Contains(err.Error(), "no pane to mark") {
+			t.Fatalf("error: got %v", err)
+		}
+	})
 }
 
 func initRepo(t *testing.T) string {
