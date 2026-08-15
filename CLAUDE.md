@@ -100,6 +100,12 @@ the picker compares the installed files with the embedded ones and warns.
   the picker would match a viewer tab showing a different pane. tmux allows both
   ":" and "." in a session name and reads its own targets from the end;
   `splitTarget` does the same.
+- The picker and `cattery attach` run as the command of a kitty window, with no
+  shell in between, so they get kitty's own PATH. A kitty started from the Dock
+  has launchd's (`/usr/bin:/bin:/usr/sbin:/sbin`), which has no Homebrew.
+  `internal/kitty` and `internal/tmux` both fall back to known install prefixes
+  when the lookup fails. Without that, `noServer` reads the missing binary as
+  "no tmux on this machine" and every tmux agent leaves the picker silently.
 - tmux ends a command at any argument that ends in ";", not only at one that is
   nothing else. `@AGENT_MSG` carries raw prompt text, so both writers escape a
   trailing ";" as `\;`. Without that escape a prompt ending in ";" loses that

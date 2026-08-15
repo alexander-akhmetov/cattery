@@ -504,6 +504,33 @@ func waitForFile(t *testing.T, path string) {
 }
 
 // fakeTmux writes a stub tmux script running body, and returns its path.
+// The picker runs as a kitty window command, with kitty's own PATH. On a Dock
+// -started kitty that PATH is launchd's, which carries no Homebrew.
+func TestTmuxPath(t *testing.T) {
+	onPath := fakeTmux(t, "")
+	installed := fakeTmux(t, "")
+	absent := filepath.Join(t.TempDir(), "tmux")
+
+	tests := []struct {
+		name      string
+		path      string
+		fallbacks []string
+		want      string
+	}{
+		{name: "found on PATH", path: filepath.Dir(onPath), fallbacks: []string{installed}, want: onPath},
+		{name: "PATH without homebrew", fallbacks: []string{absent, installed}, want: installed},
+		{name: "not installed at all", fallbacks: []string{absent}, want: "tmux"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", tc.path)
+			if got := tmuxPath(tc.fallbacks); got != tc.want {
+				t.Errorf("tmuxPath: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func fakeTmux(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "tmux")
