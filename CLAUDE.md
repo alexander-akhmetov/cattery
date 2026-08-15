@@ -153,6 +153,14 @@ the picker compares the installed files with the embedded ones and warns.
   Arrows go out in CSI form (`\x1b[A`), never SS3: the picker cannot know the
   target's application-cursor-key mode, and CSI is the form every parser has to
   accept.
+- A row's prompt wraps, so a row is not two lines any more. `blocks` takes each
+  row's height from `rowHeight`, which runs the same wrap `renderRow` will run.
+  If those two disagree the viewport scrolls by the wrong amount and the list
+  tears at the bottom edge.
+- `ansi.Wrap` returns text already broken at the width you gave it. A row's
+  first prompt line is narrower than the lines under it, because the cwd shares
+  it, so `splitWrap` flattens the remainder before it is wrapped again. Without
+  that the wider lines keep the narrow line's breaks and sit half empty.
 - The drawer's box costs exactly what the plain rule cost, a space and two
   edges in place of " │ ". That is why `previewWidths`, `previewFits` and the
   91-column threshold did not move when the box arrived. Keep it that way, or

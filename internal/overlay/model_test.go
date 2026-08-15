@@ -747,9 +747,9 @@ func TestRowTimeColumnHoldsStill(t *testing.T) {
 			m.now = now
 
 			m.selected = 0
-			selected, _ := m.renderRow(0, agent, tc.inner, true)
+			selected := m.renderRow(0, agent, tc.inner, true)[0]
 			m.selected = 1
-			unselected, _ := m.renderRow(0, agent, tc.inner, true)
+			unselected := m.renderRow(0, agent, tc.inner, true)[0]
 			selected, unselected = ansi.Strip(selected), ansi.Strip(unselected)
 
 			if !strings.Contains(selected, jumpHint) {
@@ -808,11 +808,113 @@ func TestIdleRowLine2(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := sampleModel()
-			_, line2 := m.renderRow(0, tc.agent, 80, true)
+			line2 := m.renderRow(0, tc.agent, 80, true)[1]
 			if got := strings.TrimRight(ansi.Strip(line2), " "); got != tc.want {
 				t.Fatalf("idle line 2: got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A prompt too long for line 2 continues on the lines under it instead of being
+// cut at the right edge. Only the last line can still end in an ellipsis, and
+// only once the prompt outruns maxActivityLines.
+func TestRowWrapsTheActivityText(t *testing.T) {
+	const prompt = "make the agent view wider by 25% and fix the left column so the " +
+		"description text wraps onto the next line instead of being truncated at " +
+		"the edge of the list, which loses the end of every prompt"
+	cases := []struct {
+		name      string
+		msg       string
+		inner     int
+		wantLines int
+		wantCut   bool
+	}{
+		{name: "short prompt stays on line 2", msg: "tidy the notes", inner: 80, wantLines: 2},
+		{name: "long prompt wraps whole", msg: prompt, inner: 80, wantLines: 1 + maxActivityLines},
+		{name: "wrapping stops at the cap", msg: strings.Repeat("word ", 200), inner: 80, wantLines: 1 + maxActivityLines, wantCut: true},
+		{name: "a narrow list wraps too", msg: prompt, inner: 44, wantLines: 1 + maxActivityLines, wantCut: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := agent.Agent{ID: 1, Kind: "claude", Display: "working", CWD: "/p/cattery", Msg: tc.msg}
+			m := sampleModel()
+			lines := m.renderRow(0, a, tc.inner, true)
+
+			if got := len(lines); got != tc.wantLines {
+				t.Fatalf("row height: got %d lines, want %d:\n%s", got, tc.wantLines, strings.Join(lines, "\n"))
+			}
+			if got := rowHeight(a, tc.inner); got != len(lines) {
+				t.Fatalf("rowHeight says %d, renderRow drew %d", got, len(lines))
+			}
+			for i, line := range lines {
+				if w := ansi.StringWidth(line); w != tc.inner {
+					t.Errorf("line %d is %d cells wide, want %d", i, w, tc.inner)
+				}
+			}
+
+			last := strings.TrimRight(ansi.Strip(lines[len(lines)-1]), " ")
+			if got := strings.HasSuffix(last, "…"); got != tc.wantCut {
+				t.Errorf("last line cut: got %v, want %v: %q", got, tc.wantCut, last)
+			}
+			// Every word before the cut survives, in order, across the lines.
+			text := strings.Join(lines[1:], " ")
+			if !strings.Contains(oneLine(ansi.Strip(text)), firstWords(tc.msg, 12)) {
+				t.Errorf("the prompt did not carry onto the wrapped lines:\n%s", strings.Join(lines, "\n"))
+			}
+		})
+	}
+}
+
+// The prompt's first line is narrow, because the cwd shares it with the text.
+// The lines under it are wider, and have to fill that width: the wrap of the
+// first line must not carry its breaks into them.
+func TestWrapActivityFillsTheContinuationWidth(t *testing.T) {
+	lines := wrapActivity(strings.Repeat("word ", 40), 20, 60, 3)
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3: %q", len(lines), lines)
+	}
+	for i, line := range lines[1:] {
+		if w := ansi.StringWidth(line); w < 55 || w > 60 {
+			t.Errorf("continuation line %d is %d cells, want it to fill 60: %q", i+1, w, line)
+		}
+	}
+}
+
+func firstWords(s string, n int) string {
+	f := strings.Fields(s)
+	return strings.Join(f[:min(n, len(f))], " ")
+}
+
+// The drawer takes more of the width than the list does, and the list still
+// keeps enough for a full-length name. The width it opens at is unchanged: the
+// share moves, the threshold does not.
+func TestPreviewWidths(t *testing.T) {
+	for inner := minListWidth + previewGutter + minPreviewWidth; inner < 400; inner++ {
+		list, preview, ok := previewWidths(inner)
+		if !ok {
+			t.Fatalf("inner %d: the sidebar should fit", inner)
+		}
+		if list+previewGutter+preview != inner {
+			t.Fatalf("inner %d: %d + %d + %d does not add up", inner, list, previewGutter, preview)
+		}
+		if list < minListWidth {
+			t.Fatalf("inner %d: list squeezed to %d", inner, list)
+		}
+		if preview < minPreviewWidth {
+			t.Fatalf("inner %d: sidebar squeezed to %d", inner, preview)
+		}
+		// At the narrowest the list holds its own minimum and the sidebar takes
+		// what is left. Above that the sidebar is the wider of the two.
+		if inner > 2*minListWidth+previewGutter && preview <= list {
+			t.Fatalf("inner %d: sidebar %d is not wider than the list %d", inner, preview, list)
+		}
+	}
+	if previewFits(90) {
+		t.Error("the sidebar should not open at 90 columns")
+	}
+	if !previewFits(91) {
+		t.Error("the sidebar should open at 91 columns")
 	}
 }
 
@@ -1977,7 +2079,7 @@ func TestRowHostChip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := sampleModel()
 			for _, grouped := range []bool{true, false} {
-				line1, _ := m.renderRow(0, tc.in, 100, grouped)
+				line1 := m.renderRow(0, tc.in, 100, grouped)[0]
 				got := ansi.Strip(line1)
 				if strings.Contains(got, " tmux ") != tc.want {
 					t.Errorf("grouped=%v row %q: tmux chip present=%v, want %v", grouped, got, !tc.want, tc.want)
@@ -1999,7 +2101,7 @@ func TestTmuxRowSaysItAttaches(t *testing.T) {
 	m.width, m.height = 120, 40
 	m.agents = []agent.Agent{tmuxAgent()}
 
-	line1, _ := m.renderRow(0, m.agents[0], 100, true)
+	line1 := m.renderRow(0, m.agents[0], 100, true)[0]
 	if got := ansi.Strip(line1); !strings.Contains(got, attachHint) {
 		t.Errorf("selected tmux row %q does not offer %q", got, attachHint)
 	}
@@ -2013,7 +2115,7 @@ func TestTmuxRowSaysItAttaches(t *testing.T) {
 
 	// A kitty row keeps the old wording and shows no target.
 	m.agents = []agent.Agent{checkout(3, "pi", "working", "dotfiles", "main")}
-	line1, _ = m.renderRow(0, m.agents[0], 100, true)
+	line1 = m.renderRow(0, m.agents[0], 100, true)[0]
 	if got := ansi.Strip(line1); !strings.Contains(got, jumpHint) || strings.Contains(got, attachHint) {
 		t.Errorf("kitty row %q should offer %q", got, jumpHint)
 	}
@@ -2033,7 +2135,7 @@ func TestTmuxRowInFlightVerb(t *testing.T) {
 	m.agents = []agent.Agent{tmuxAgent()}
 	m.focusing = true
 
-	line1, _ := m.renderRow(0, m.agents[0], 100, true)
+	line1 := m.renderRow(0, m.agents[0], 100, true)[0]
 	for name, got := range map[string]string{
 		"row":       ansi.Strip(line1),
 		"footer":    ansi.Strip(m.renderHints(120)),
@@ -2065,7 +2167,7 @@ func TestTmuxRowDegradesWithWidth(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			line1, _ := m.renderRow(0, a, tc.inner, true)
+			line1 := m.renderRow(0, a, tc.inner, true)[0]
 			got := ansi.Strip(line1)
 			if width := ansi.StringWidth(got); width > tc.inner {
 				t.Fatalf("row is %d cells wide, over the %d it was given: %q", width, tc.inner, got)

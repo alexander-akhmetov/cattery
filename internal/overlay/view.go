@@ -53,9 +53,15 @@ const (
 	minGroupRuleWidth = 4
 
 	// A project heading takes its own line plus the blank before its first
-	// row. A row takes two lines.
+	// row. A row takes two lines, plus one for each wrapped activity line.
 	headerBlockLines = 2
 	rowContentLines  = 2
+
+	// A row's prompt wraps onto at most this many lines, and every line after
+	// the first is indented past the row's status column. A prompt longer than
+	// that is truncated on its last line, as before.
+	maxActivityLines = 3
+	activityIndent   = rowIndent + 2
 
 	// Below this inner width the padded status word is dropped from a row. A
 	// row carrying a host chip needs hostChipWidth more before it fits.
@@ -81,7 +87,7 @@ const (
 	minListWidth    = 44
 	minPreviewWidth = 40
 	previewGutter   = 3
-	previewShare    = 45 // percent of the inner width the sidebar asks for
+	previewShare    = 56 // percent of the inner width the sidebar asks for
 
 	// What Enter does, per host. A kitty window is focused; a tmux pane opens a
 	// read-only view, and the hint says so before the user presses it.
@@ -831,18 +837,19 @@ func (m Model) blocks(vis []agent.Agent, inner int) ([]block, int) {
 		if i+1 < len(vis) && !sameProject(vis[i+1], a) {
 			trailing = 2
 		}
+		// A wrapped prompt makes a row taller than two lines, so the block takes
+		// its height from the same wrap renderRow will do.
+		height := rowHeight(a, inner)
 		out = append(out, block{
 			render: func() []string {
-				l1, l2 := m.renderRow(i, a, inner, true)
-				lines := make([]string, 0, rowContentLines+trailing)
-				lines = append(lines, l1, l2)
+				lines := m.renderRow(i, a, inner, true)
 				for range trailing {
 					lines = append(lines, "")
 				}
 				return lines
 			},
-			count:   rowContentLines + trailing,
-			content: rowContentLines,
+			count:   height + trailing,
+			content: height,
 			header:  header,
 		})
 	}
@@ -958,10 +965,11 @@ func (m Model) listLines(inner, avail int) []string {
 	// Too short for a project heading and a row together. The list drops to the
 	// selected row alone, which names itself by directory.
 	if remaining < headerBlockLines+rowContentLines {
-		l1, l2 := m.renderRow(m.selected, vis[m.selected], inner, false)
-		lines = append(lines, l1)
-		if remaining > 1 {
-			lines = append(lines, l2)
+		for _, line := range m.renderRow(m.selected, vis[m.selected], inner, false) {
+			if len(lines) >= avail {
+				break
+			}
+			lines = append(lines, line)
 		}
 		return lines
 	}
@@ -1034,9 +1042,79 @@ func centeredState(inner, avail int, message, hint string) []string {
 	return append(out, lines...)
 }
 
-// renderRow returns the two lines for one agent row. grouped says whether a
-// project heading sits above it, which decides how the row names itself.
-func (m Model) renderRow(i int, a agent.Agent, inner int, grouped bool) (string, string) {
+// activityWidths are the columns a row gives its prompt: what is left of line 2
+// after the cwd, and what each wrapped line after it gets.
+func activityWidths(a agent.Agent, inner int) (first, cont int) {
+	head := rowIndent + lipgloss.Width(rowCwd(a, inner))
+	if rowCwd(a, inner) != "" {
+		head += 3 // " · "
+	}
+	if activityGlyph(a, 0) != "" {
+		head += 2 // the glyph and the space after it
+	}
+	return max(inner-head, 1), max(inner-activityIndent, 1)
+}
+
+func rowCwd(a agent.Agent, inner int) string {
+	return truncate(shortenHome(a.CWD), max(min(inner/3, maxCwd), 4))
+}
+
+// splitWrap returns the first wrapped line of s at this width and the rest of
+// the text. ansi.Wrap breaks on spaces and falls back to breaking a word that
+// is longer than the whole line, which a path or a URL in a prompt can be.
+//
+// The remainder is flattened again. It comes out of ansi.Wrap already broken at
+// this width, and wrapping it a second time at a wider one would keep those
+// breaks instead of filling the wider line.
+func splitWrap(s string, width int) (string, string) {
+	head, rest, _ := strings.Cut(ansi.Wrap(s, width, ""), "\n")
+	return head, oneLine(rest)
+}
+
+// wrapActivity lays a prompt over at most maxLines lines. The first shares line
+// 2 with the cwd and so is narrower; the rest are indented under it. Text past
+// the last line is dropped and the line ends in an ellipsis, which is what the
+// row did with the whole overflow before.
+func wrapActivity(text string, first, cont, maxLines int) []string {
+	if text == "" || maxLines < 1 {
+		return nil
+	}
+	head, rest := splitWrap(text, first)
+	if rest == "" {
+		return []string{head}
+	}
+	if maxLines == 1 {
+		return []string{truncate(text, first)}
+	}
+	out := []string{head}
+	for line := range strings.SplitSeq(ansi.Wrap(rest, cont, ""), "\n") {
+		if len(out) == maxLines {
+			last := out[len(out)-1]
+			out[len(out)-1] = truncate(last+" "+strings.TrimSpace(line), cont)
+			break
+		}
+		out = append(out, strings.TrimSpace(line))
+	}
+	return out
+}
+
+// rowActivity is a row's prompt, wrapped to the row's own columns.
+func rowActivity(a agent.Agent, inner int) []string {
+	first, cont := activityWidths(a, inner)
+	return wrapActivity(oneLine(activity(a)), first, cont, maxActivityLines)
+}
+
+// rowHeight is how many lines renderRow returns for this agent, without drawing
+// it. windowBlocks sizes blocks it may never render.
+func rowHeight(a agent.Agent, inner int) int {
+	return 1 + max(len(rowActivity(a, inner)), 1)
+}
+
+// renderRow returns the lines for one agent row: the status line, the cwd and
+// prompt line, and one more line for each line the prompt wraps onto. grouped
+// says whether a project heading sits above it, which decides how the row names
+// itself.
+func (m Model) renderRow(i int, a agent.Agent, inner int, grouped bool) []string {
 	sc := statusColor(a.Display)
 	selected := i == m.selected
 
@@ -1107,33 +1185,35 @@ func (m Model) renderRow(i int, a agent.Agent, inner int, grouped bool) (string,
 	}
 	line1 := composeLine(left1, right1, inner, bg)
 
-	// Line 2: cwd · glyph + the agent's current prompt.
-	cwdMax := max(min(inner/3, maxCwd), 4)
-	cwd := truncate(shortenHome(a.CWD), cwdMax)
+	// Line 2: cwd · glyph + the agent's current prompt, which wraps onto the
+	// lines after it rather than being cut at the right edge.
+	cwd := rowCwd(a, inner)
 	sep := " · "
 	if cwd == "" {
 		sep = ""
 	}
 	glyph := activityGlyph(a, m.spin)
-	glyphWidth := 0
-	if glyph != "" {
-		glyphWidth = lipgloss.Width(glyph) + 1 // glyph and the space after it
-	}
-	actWidth := max(inner-(rowIndent+lipgloss.Width(cwd)+lipgloss.Width(sep)+glyphWidth), 1)
 	left2 := []span{
 		{strings.Repeat(" ", rowIndent), cText, false, ""},
 		{cwd, cOverlay0, false, ""},
 	}
-	if act := truncate(activity(a), actWidth); act != "" {
+	act := rowActivity(a, inner)
+	if len(act) > 0 {
 		left2 = append(left2, span{sep, cFaint, false, ""})
 		if glyph != "" {
 			left2 = append(left2, span{glyph, sc, false, ""}, span{" ", cText, false, ""})
 		}
-		left2 = append(left2, span{act, activityColor(a.Display), false, ""})
+		left2 = append(left2, span{act[0], activityColor(a.Display), false, ""})
 	}
-	line2 := composeLine(left2, nil, inner, bg)
 
-	return line1, line2
+	lines := []string{line1, composeLine(left2, nil, inner, bg)}
+	for n := 1; n < len(act); n++ {
+		lines = append(lines, composeLine([]span{
+			{strings.Repeat(" ", activityIndent), cText, false, ""},
+			{act[n], activityColor(a.Display), false, ""},
+		}, nil, inner, bg))
+	}
+	return lines
 }
 
 // renderSummary is the footer's selected-agent line: status glyph, name,
