@@ -2,8 +2,8 @@ class Cattery < Formula
   desc "Agent state in the kitty tab bar, plus a picker for jumping between agents"
   homepage "https://github.com/alexander-akhmetov/cattery"
   url "https://github.com/alexander-akhmetov/cattery.git",
-      tag:      "v0.3.0",
-      revision: "4c47495eb18608f80a15556c7bbac56394d97597",
+      tag:      "v0.5.0",
+      revision: "fb81118efd9969e05a801e97f1311a9c9ecf12ae",
       using:    :git
   license "MIT"
   head "https://github.com/alexander-akhmetov/cattery.git", branch: "main", using: :git
