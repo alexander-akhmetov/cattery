@@ -75,9 +75,35 @@ type Client struct {
 	tmux string
 }
 
-// NewClient returns a client that runs tmux from PATH.
+// installPrefixes are the tmux locations to try when PATH has none.
+var installPrefixes = []string{
+	"/opt/homebrew/bin/tmux",              // Homebrew, Apple silicon
+	"/usr/local/bin/tmux",                 // Homebrew, Intel
+	"/home/linuxbrew/.linuxbrew/bin/tmux", // Linuxbrew
+}
+
+// NewClient resolves the tmux binary and returns a ready client.
 func NewClient() *Client {
-	return &Client{tmux: "tmux"}
+	return &Client{tmux: tmuxPath(installPrefixes)}
+}
+
+// tmuxPath finds tmux for a process kitty started itself.
+//
+// The picker and `cattery attach` both run as the command of a kitty window,
+// which means no shell and no shell profile: their PATH is kitty's own. A kitty
+// started from the Dock has the launchd PATH (/usr/bin:/bin:/usr/sbin:/sbin),
+// which carries no Homebrew, so the lookup fails, ListAgents reads that as "no
+// tmux on this machine", and every tmux agent leaves the picker without a word.
+func tmuxPath(fallbacks []string) string {
+	if p, err := exec.LookPath("tmux"); err == nil {
+		return p
+	}
+	for _, fallback := range fallbacks {
+		if _, err := os.Stat(fallback); err == nil {
+			return fallback
+		}
+	}
+	return "tmux"
 }
 
 // ListAgents returns every tmux pane publishing @AGENT_STATE.
