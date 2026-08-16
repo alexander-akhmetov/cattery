@@ -1,0 +1,17 @@
+{
+  "name": "cattery-codex",
+  "version": "0.1.0",
+  "description": "Report Codex session state to cattery, for the kitty tab marker and the agent picker",
+  "author": {
+    "name": "Alexander Akhmetov"
+  },
+  "repository": "https://github.com/alexander-akhmetov/cattery",
+  "homepage": "https://github.com/alexander-akhmetov/cattery/tree/main/codex",
+  "license": "MIT",
+  "keywords": ["kitty", "tmux", "codex", "status"],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "cattery",
+    "category": "Coding"
+  }
+}

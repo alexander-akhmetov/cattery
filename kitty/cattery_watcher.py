@@ -1,10 +1,10 @@
 """
 cattery_watcher: kitty global watcher. It turns the per-window AGENT_STATE that
-pi and Claude Code publish into a display state that also knows whether the user
-has looked at the window.
+pi, Claude Code and Codex publish into a display state that also knows whether
+the user has looked at the window.
 
 Contract:
-    AGENT_KIND        "pi" | "claude"                    (set by the agent)
+    AGENT_KIND        "pi" | "claude" | "codex"          (set by the agent)
     AGENT_STATE       "working" | "blocked" | "idle"     (set by the agent)
     AGENT_TOOL        the tool call running now          (set by the agent, pi only)
     AGENT_TOOL_SINCE  unix seconds when that call started (set by the agent)
@@ -176,7 +176,7 @@ def _derive_display(
 
     `tool_since` is when the tool call in flight started, and None when the
     agent publishes none. An agent without one never reads as stalled, which is
-    what keeps Claude agents out of that state with no special case.
+    what keeps Claude and Codex agents out of that state with no special case.
     """
     if state in ("working", "blocked"):
         # Activity beats "seen". An agent that went back to work should remind

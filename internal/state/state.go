@@ -1,7 +1,9 @@
 // Package state publishes agent state to kitty as AGENT_* user variables. It
-// backs `cattery state <working|blocked|idle|clear>`. Claude Code runs it from
-// five hooks (SessionStart, Notification, UserPromptSubmit, Stop, SessionEnd),
-// and shell wrappers run `clear` after any agent process returns, which catches
+// backs `cattery state <working|blocked|idle|clear> [--kind <claude|codex>]`.
+// Claude Code runs it from five hooks (SessionStart, Notification,
+// UserPromptSubmit, Stop, SessionEnd) and Codex from five of its own
+// (SessionStart, PermissionRequest, UserPromptSubmit, Stop, SessionEnd), and
+// shell wrappers run `clear` after any agent process returns, which catches
 // crashes and force-quits the agent's own cleanup never saw.
 //
 // Nothing here fails loudly. A hook error would surface in the agent's
@@ -26,8 +28,8 @@ import (
 )
 
 // The user-variable contract, shared with the watcher, the tab bar, the picker,
-// and every running pi and Claude session. Any other program that writes these
-// names works too.
+// and every running pi, Claude and Codex session. Any other program that
+// writes these names works too.
 const (
 	varKind   = "AGENT_KIND"
 	varState  = "AGENT_STATE"
@@ -35,21 +37,54 @@ const (
 	varResume = "AGENT_RESUME"
 
 	kindClaude = "claude"
+	kindCodex  = "codex"
 )
 
-// The command AGENT_RESUME starts with. The default "claude" is wrong for
-// anyone who reaches Claude through a wrapper, such as a sandbox or a profile
-// that moves CLAUDE_CONFIG_DIR: a session id resolves only under the
+// The command AGENT_RESUME starts with. The default, the agent's own name, is
+// wrong for anyone who reaches it through a wrapper, such as a sandbox or a
+// profile that moves CLAUDE_CONFIG_DIR: a session id resolves only under the
 // configuration directory that created it.
 //
-// The Claude-only name wins over the shared one. pi's writer appends
-// "--session <file>" to the same prefix, so an exported
-// CATTERY_RESUME_PREFIX="nono run claude" would make every pi session in that
-// shell publish a Claude command aimed at a pi transcript.
+// A per-agent name wins over the shared one, which now has three claimants.
+// The three compose different arguments onto the prefix: Claude takes
+// "--resume <id>", Codex "resume <id>", and pi's writer "--session <file>". So
+// an exported CATTERY_RESUME_PREFIX="nono run claude" would make every pi and
+// Codex session in that shell publish a Claude command aimed at another
+// agent's session.
 const (
 	envResumePrefix       = "CATTERY_RESUME_PREFIX"
 	envResumePrefixClaude = "CATTERY_RESUME_PREFIX_CLAUDE"
+	envResumePrefixCodex  = "CATTERY_RESUME_PREFIX_CODEX"
 )
+
+// kind is one agent this writer speaks for. The agents differ in two things:
+// the word they publish as AGENT_KIND, and where the session id sits in the
+// resume command.
+type kind struct {
+	name string
+	// resumeArg goes between the prefix and the session id. Codex takes the id
+	// as a positional argument of a "resume" subcommand, Claude after a
+	// "--resume" flag.
+	resumeArg string
+	prefixEnv string
+}
+
+var kinds = map[string]kind{
+	kindClaude: {name: kindClaude, resumeArg: "--resume", prefixEnv: envResumePrefixClaude},
+	kindCodex:  {name: kindCodex, resumeArg: "resume", prefixEnv: envResumePrefixCodex},
+}
+
+// resolveKind reads a --kind value, falling back to Claude. An unknown word
+// must not reach AGENT_KIND: the picker draws that value in the row's chip as
+// it stands, so a typo would put itself on the row. Claude is the fallback
+// because the bare `cattery state <word>` form is what every install predating
+// the flag runs.
+func resolveKind(name string) kind {
+	if k, ok := kinds[name]; ok {
+		return k
+	}
+	return kinds[kindClaude]
+}
 
 // The SessionStart sources cattery reads. Claude fires that hook for five.
 // startup, resume and clear open a session waiting for a prompt. compact fires
@@ -65,6 +100,9 @@ const (
 //
 // The settings.json matcher keeps compact and fork away; these cover an older
 // Claude and a settings.json the user edited.
+//
+// Codex fires the same hook for four sources, startup, resume, clear and
+// compact, and has no fork. So these two lists cover it as they stand.
 var (
 	startSources   = []string{"startup", "resume", "clear"}
 	midTurnSources = []string{"compact", "fork"}
@@ -98,6 +136,10 @@ type Transport interface {
 
 // Writer publishes the AGENT_* variables of a single agent window or pane.
 type Writer struct {
+	// Kind is the agent this writer speaks for. Empty, or a word no kind
+	// carries, is Claude.
+	Kind string
+
 	// WindowID is KITTY_WINDOW_ID, which the kitty transports match on. It says
 	// nothing about where the state goes: New picks tmux over kitty.
 	WindowID string
@@ -110,25 +152,48 @@ type Writer struct {
 	// nothing: the agent could not act on the failure anyway.
 	Transport Transport
 
-	// ResumePrefix is what AGENT_RESUME starts with, before "--resume <id>".
-	// Empty means "claude".
+	// ResumePrefix is what AGENT_RESUME starts with, before the resume argument
+	// and the session id. Empty means the kind's own name.
 	ResumePrefix string
 }
 
-// Run is the `cattery state <x>` entry point.
+// Run is the `cattery state <x> [--kind <claude|codex>]` entry point.
 func Run(args []string) {
-	if len(args) == 0 {
+	state, kindName := parseArgs(args)
+	if state == "" {
 		return
 	}
-	New().Write(args[0])
+	New(kindName).Write(state)
+}
+
+// parseArgs reads the state word and the --kind value out of the argv. Written
+// out rather than handed to the flag package, which stops at the first
+// operand: the state word stands in front of the flag, so flag.Parse would see
+// no flags at all. This argv is written by `cattery setup` and by the Codex
+// plugin manifest, never typed.
+func parseArgs(args []string) (state, kindName string) {
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--kind" && i+1 < len(args):
+			i++
+			kindName = args[i]
+		case strings.HasPrefix(arg, "--kind="):
+			kindName = strings.TrimPrefix(arg, "--kind=")
+		case state == "":
+			state = arg
+		}
+	}
+	return state, kindName
 }
 
 // New builds the writer for this process from its environment.
-func New() Writer {
+func New(kindName string) Writer {
+	k := resolveKind(kindName)
 	w := Writer{
+		Kind:         k.name,
 		WindowID:     os.Getenv("KITTY_WINDOW_ID"),
 		Stdin:        os.Stdin,
-		ResumePrefix: resumePrefix(),
+		ResumePrefix: resumePrefix(k),
 	}
 	// tmux first, and the kitty window id is not even consulted. A tmux server
 	// inherits the environment of whatever started it, so every pane under a
@@ -206,7 +271,7 @@ func (w Writer) Write(state string) {
 		}
 	}
 
-	vars := []Var{{Name: varKind, Value: kindClaude}}
+	vars := []Var{{Name: varKind, Value: w.kind().name}}
 	// Every hook payload carries session_id, so all three live states publish
 	// the resume command.
 	if payload.SessionID != "" {
@@ -245,25 +310,29 @@ func (w Writer) Write(state string) {
 	_ = w.Transport.Publish(vars)
 }
 
-// resumeCommand reopens this Claude session. `cattery restore` types it at the
-// prompt of the restored window.
+// kind is the agent this writer speaks for.
+func (w Writer) kind() kind { return resolveKind(w.Kind) }
+
+// resumeCommand reopens this agent's session. `cattery restore` types it at
+// the prompt of the restored window.
 //
 // Only the session id is quoted. The prefix is a raw command fragment: an
 // override adds words the writer cannot guess ("nono run claude --profile
 // personal"), and quoting would turn those into one filename.
 func (w Writer) resumeCommand(sessionID string) string {
+	k := w.kind()
 	prefix := w.ResumePrefix
 	if prefix == "" {
-		prefix = kindClaude
+		prefix = k.name
 	}
-	return prefix + " --resume " + shellquote.Quote(sessionID)
+	return prefix + " " + k.resumeArg + " " + shellquote.Quote(sessionID)
 }
 
-// resumePrefix reads the override, Claude's own name first. An empty value
+// resumePrefix reads the override, the agent's own name first. An empty value
 // counts as unset: an exported-but-cleared variable would otherwise publish a
 // command with no program in front of it.
-func resumePrefix() string {
-	if prefix := os.Getenv(envResumePrefixClaude); prefix != "" {
+func resumePrefix(k kind) string {
+	if prefix := os.Getenv(k.prefixEnv); prefix != "" {
 		return prefix
 	}
 	return os.Getenv(envResumePrefix)

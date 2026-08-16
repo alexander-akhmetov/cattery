@@ -200,7 +200,7 @@ func activityGlyph(a agent.Agent, spin int) string {
 // toolCell is what the agent is running right now, laid into the columns the
 // row has for it: the tool it published and, once that one call has run past
 // minToolElapsed, how long it has taken. Empty for an agent that publishes no
-// tool, which is every Claude agent and every pi between calls.
+// tool, which is every Claude and Codex agent and every pi between calls.
 //
 // The label is what gets cut, never the time. A label cut in the middle still
 // names the tool, and the number is the reason the line is drawn at all: a long

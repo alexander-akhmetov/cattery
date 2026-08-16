@@ -1,0 +1,16 @@
+{
+  "name": "cattery",
+  "interface": {
+    "displayName": "cattery"
+  },
+  "plugins": [
+    {
+      "name": "cattery-codex",
+      "source": {
+        "source": "local",
+        "path": "./codex"
+      },
+      "category": "Coding"
+    }
+  ]
+}

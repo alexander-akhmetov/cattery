@@ -68,6 +68,7 @@ func del(name string) Var        { return Var{Name: name, Delete: true} }
 func TestWriteUpdateOrder(t *testing.T) {
 	cases := []struct {
 		name  string
+		kind  string
 		state string
 		stdin io.Reader
 		want  []Var
@@ -77,6 +78,65 @@ func TestWriteUpdateOrder(t *testing.T) {
 			state: "working",
 			stdin: strings.NewReader(`{"prompt":"fix the picker"}`),
 			want:  []Var{set(varKind, "claude"), set(varMsg, "fix the picker"), set(varState, "working")},
+		},
+		{
+			name:  "a Codex agent publishes its own kind and resume command",
+			kind:  "codex",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"s1","prompt":"fix the picker"}`),
+			want: []Var{
+				set(varKind, "codex"),
+				set(varResume, "codex resume s1"),
+				set(varMsg, "fix the picker"),
+				set(varState, "working"),
+			},
+		},
+		{
+			// The picker draws AGENT_KIND in the row's chip as it stands, so a
+			// word no kind carries must not reach it.
+			name:  "an unrecognised kind falls back to claude",
+			kind:  "gpt",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"s1"}`),
+			want:  []Var{set(varKind, "claude"), set(varResume, "claude --resume s1"), set(varState, "working")},
+		},
+		{
+			name:  "a Codex session start publishes the same shape as Claude's",
+			kind:  "codex",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"startup"}`),
+			want: []Var{
+				set(varKind, "codex"),
+				set(varResume, "codex resume s1"),
+				del(varMsg),
+				del(varWorked),
+				set(varState, "idle"),
+			},
+		},
+		{
+			// Codex fires SessionStart for a compaction too, and an idle there
+			// would mark a running agent finished.
+			name:  "a Codex compaction publishes nothing",
+			kind:  "codex",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"compact"}`),
+		},
+		{
+			// Codex's PermissionRequest hook. It leaves the prompt alone, so the
+			// row keeps saying what the agent is waiting to be allowed to do.
+			name:  "a Codex approval request is blocked",
+			kind:  "codex",
+			state: "blocked",
+			stdin: strings.NewReader(`{"session_id":"s1","prompt":"ignored"}`),
+			want:  []Var{set(varKind, "codex"), set(varResume, "codex resume s1"), set(varState, "blocked")},
+		},
+		{
+			// The deletes carry no kind, so `cattery state clear --kind codex`
+			// leaves the same window a Claude clear would.
+			name:  "a Codex clear deletes the same three",
+			kind:  "codex",
+			state: "clear",
+			want:  []Var{del(varKind), del(varMsg), del(varState)},
 		},
 		{
 			name:  "working without a prompt leaves AGENT_MSG alone",
@@ -204,7 +264,7 @@ func TestWriteUpdateOrder(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &recorder{}
-			Writer{WindowID: "7", Stdin: tc.stdin, Transport: rec}.Write(tc.state)
+			Writer{Kind: tc.kind, WindowID: "7", Stdin: tc.stdin, Transport: rec}.Write(tc.state)
 			assertVars(t, rec.sent(), tc.want)
 		})
 	}
@@ -247,11 +307,12 @@ func TestWritePublishesWithoutAKittyWindow(t *testing.T) {
 	assertVars(t, rec.sent(), []Var{set(varKind, "claude"), set(varMsg, "fix the picker"), set(varState, "working")})
 }
 
-// AGENT_RESUME tells a snapshot how to reopen this Claude session. Every hook
-// payload carries session_id, so every live state publishes it.
+// AGENT_RESUME tells a snapshot how to reopen this session. Every hook payload
+// carries session_id, so every live state publishes it.
 func TestWriteResumeCommand(t *testing.T) {
 	cases := []struct {
 		name   string
+		kind   string
 		state  string
 		prefix string
 		stdin  io.Reader
@@ -262,6 +323,23 @@ func TestWriteResumeCommand(t *testing.T) {
 			state: "working",
 			stdin: strings.NewReader(`{"session_id":"abc-123"}`),
 			want:  "claude --resume abc-123",
+		},
+		{
+			// Codex takes the session id as a positional argument of a
+			// subcommand, not after a flag.
+			name:  "Codex puts the id after a resume subcommand",
+			kind:  "codex",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"01a007b7-8332-7823-8d0b-8466548d24dc"}`),
+			want:  "codex resume 01a007b7-8332-7823-8d0b-8466548d24dc",
+		},
+		{
+			name:   "a Codex prefix carries the wrapper",
+			kind:   "codex",
+			state:  "working",
+			prefix: "nono run codex",
+			stdin:  strings.NewReader(`{"session_id":"abc-123"}`),
+			want:   "nono run codex resume abc-123",
 		},
 		{
 			name:   "the prefix override carries the wrapper and the profile flag",
@@ -316,7 +394,7 @@ func TestWriteResumeCommand(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &recorder{}
-			Writer{WindowID: "7", Stdin: tc.stdin, Transport: rec, ResumePrefix: tc.prefix}.Write(tc.state)
+			Writer{Kind: tc.kind, WindowID: "7", Stdin: tc.stdin, Transport: rec, ResumePrefix: tc.prefix}.Write(tc.state)
 
 			got, found := "", false
 			for _, v := range rec.sent() {
@@ -357,14 +435,16 @@ func TestClearKeepsTheResumeCommand(t *testing.T) {
 }
 
 // New reads the override from the environment, where a shell wrapper sets it.
-// The Claude-only name wins, because pi's writer appends different arguments to
+// A per-agent name wins, because the three agents append different arguments to
 // the same prefix. An exported CATTERY_RESUME_PREFIX aimed at one agent would
-// otherwise publish that agent's command for the other.
+// otherwise publish that agent's command for the others.
 func TestNewReadsTheResumePrefix(t *testing.T) {
 	cases := []struct {
 		name         string
+		kind         string
 		shared       string
 		claude       string
+		codex        string
 		want         string
 		wantResumeIn string
 	}{
@@ -388,19 +468,91 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 			want:         "",
 			wantResumeIn: "claude --resume abc",
 		},
+		{
+			name:         "the Codex name wins for a Codex writer",
+			kind:         "codex",
+			claude:       "nono run claude",
+			codex:        "nono run codex",
+			want:         "nono run codex",
+			wantResumeIn: "nono run codex resume abc",
+		},
+		{
+			// The shared name is the fallback for every agent that has no name
+			// of its own exported.
+			name:         "Codex falls back to the shared name",
+			kind:         "codex",
+			shared:       "nono run",
+			want:         "nono run",
+			wantResumeIn: "nono run resume abc",
+		},
+		{
+			name:         "the Claude name does not reach a Codex writer",
+			kind:         "codex",
+			claude:       "nono run claude",
+			want:         "",
+			wantResumeIn: "codex resume abc",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("KITTY_WINDOW_ID", "7")
 			t.Setenv(envResumePrefix, tc.shared)
 			t.Setenv(envResumePrefixClaude, tc.claude)
+			t.Setenv(envResumePrefixCodex, tc.codex)
 
-			w := New()
+			w := New(tc.kind)
 			if w.ResumePrefix != tc.want {
 				t.Fatalf("ResumePrefix: got %q, want %q", w.ResumePrefix, tc.want)
 			}
 			if got := w.resumeCommand("abc"); got != tc.wantResumeIn {
 				t.Fatalf("resumeCommand: got %q, want %q", got, tc.wantResumeIn)
+			}
+		})
+	}
+}
+
+// The state word stands in front of the flag, so the flag package would see no
+// flags at all.
+func TestParseArgs(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantState string
+		wantKind  string
+	}{
+		{name: "no arguments at all"},
+		{name: "the bare form every Claude install runs", args: []string{"working"}, wantState: "working"},
+		{
+			name:      "the form the Codex plugin runs",
+			args:      []string{"working", "--kind", "codex"},
+			wantState: "working",
+			wantKind:  "codex",
+		},
+		{
+			name:      "the joined form",
+			args:      []string{"working", "--kind=codex"},
+			wantState: "working",
+			wantKind:  "codex",
+		},
+		{
+			name:      "the flag in front of the word",
+			args:      []string{"--kind", "codex", "clear"},
+			wantState: "clear",
+			wantKind:  "codex",
+		},
+		{
+			// Nothing follows it to read, so it is not a kind. The state word
+			// still publishes, as Claude.
+			name:      "a trailing --kind with no value",
+			args:      []string{"working", "--kind"},
+			wantState: "working",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state, kindName := parseArgs(tc.args)
+			if state != tc.wantState || kindName != tc.wantKind {
+				t.Fatalf("parseArgs(%q): got (%q, %q), want (%q, %q)", tc.args, state, kindName, tc.wantState, tc.wantKind)
 			}
 		})
 	}
@@ -582,7 +734,7 @@ func TestNewPicksTheTransport(t *testing.T) {
 			t.Setenv("KITTY_WINDOW_ID", tc.windowID)
 			t.Setenv("KITTY_LISTEN_ON", tc.listenOn)
 
-			w := New()
+			w := New("claude")
 
 			if w.WindowID != tc.windowID {
 				t.Errorf("window id: got %q, want %q", w.WindowID, tc.windowID)
@@ -828,6 +980,13 @@ func TestTmuxTransportMetadata(t *testing.T) {
 			prev: "working",
 			vars: []Var{set(varResume, "claude --resume abc")},
 			want: []string{"@AGENT_RESUME"},
+		},
+		{
+			// A pane carries the same options whichever agent publishes them.
+			name: "a Codex batch keeps the same options",
+			prev: "idle",
+			vars: []Var{set(varKind, "codex"), set(varResume, "codex resume s1"), set(varState, "working")},
+			want: []string{"@AGENT_KIND", "@AGENT_RESUME", "@AGENT_STATE", "@AGENT_SINCE", "@AGENT_WORKED", "-u @AGENT_SEEN"},
 		},
 	}
 	for _, tc := range cases {

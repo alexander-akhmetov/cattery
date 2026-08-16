@@ -22,9 +22,11 @@ that is what decides whether the guarded import succeeds.
 ## Layout
 
 `kitty/` holds the five files kitty loads directly. `extensions/cattery.ts` is
-the pi-side state writer. `cmd/` and `internal/` build the binary: the picker,
-`cattery setup`, `cattery state <x>` (the Claude-side writer),
-`cattery save`/`cattery restore` (the tab-tree snapshot), `cattery attach`
+the pi-side state writer. `codex/` and `.agents/plugins/marketplace.json` are
+the Codex plugin. It holds nothing but the five hook entries; the writer they
+run is the binary. `cmd/` and `internal/` build that binary: the picker, `cattery setup`,
+`cattery state <x> [--kind <claude|codex>]` (the writer both Claude and Codex
+run), `cattery save`/`cattery restore` (the tab-tree snapshot), `cattery attach`
 (a read-only view of a tmux agent), and `cattery events` (the transitions the
 watcher pushes, as JSON lines).
 
@@ -40,7 +42,7 @@ the picker compares the installed files with the embedded ones and warns.
 ## Things that bite
 
 - The user variables are named `AGENT_*`. They are a live contract with running
-  pi and Claude sessions, so renaming them breaks sessions mid-flight.
+  pi, Claude and Codex sessions, so renaming them breaks sessions mid-flight.
 - kitty loads `tab_bar.py` with `runpy.run_path`, which does not extend
   `sys.path`. `tab_bar.py` must insert its own directory before importing
   `cattery_tab`, and must guard that import.
@@ -107,6 +109,11 @@ the picker compares the installed files with the embedded ones and warns.
   `internal/kitty` and `internal/tmux` both fall back to known install prefixes
   when the lookup fails. Without that, `noServer` reads the missing binary as
   "no tmux on this machine" and every tmux agent leaves the picker silently.
+- The Codex hooks are the one exception to that rule: they run the bare name
+  `cattery` off PATH. `codex/hooks/hooks.json` is a static file with no way to
+  learn the install path, the way `env CATTERY_BIN` teaches the watcher, and a
+  Codex hook is a child of the Codex process, which a shell started. So it gets
+  that shell's PATH and not launchd's.
 - The preview sidebar draws text the picker did not write, inside its own
   frame. `internal/overlay/preview.go` passes SGR through and drops every other
   escape and control byte. One cursor movement or one OSC would corrupt the
@@ -239,6 +246,14 @@ the picker compares the installed files with the embedded ones and warns.
   payload does not separate them, so both guards drop the whole word, and a
   forked session gets no picker row until its first prompt. Claude before
   2.1.214 reported a fork as `resume`, which passes both guards.
+- Codex fires `SessionStart` for four sources, Claude's five without `fork`, so
+  `startSources` and `midTurnSources` cover it as they stand. Its own guard is
+  the `"matcher": "startup|resume|clear"` in `codex/hooks/hooks.json`, not the
+  one `cattery setup` writes: setup never edits Codex's `hooks.json`.
+- Codex trust-gates a plugin's hooks. It records a hash and skips an untrusted
+  hook without a word, until the user opens `/hooks` in the TUI and trusts each
+  entry. Nothing can automate that, so `cattery setup` prints it. A Codex agent
+  showing no tab marker at all is untrusted hooks before it is anything else.
 - The session-start batch deletes `AGENT_MSG` and `AGENT_WORKED`, which resets
   what a killed agent left on a tmux pane and nothing on a kitty window. The
   "has worked" fact the watcher reads is `AGENT_DISPLAY`, its own output, and no
@@ -294,11 +309,18 @@ the picker compares the installed files with the embedded ones and warns.
 - A colour name `fmt.fg` does not carry raises inside `agent_prefix`, whose
   `except Exception` returns `""`, so a typo in `_AGENT_STATE_STYLE` costs the
   tab marker with nothing said. `magenta` is in kitty 0.48.1's table.
-- The pi extension is a second rollout. `cattery setup` offers to run
-  `pi install git:github.com/alexander-akhmetov/cattery`, which fetches the
-  published copy and not this checkout, and `setup.Stale` covers only the
-  installed `kitty/*.py`, so nothing notices an out-of-date extension. Test a
-  local one with `pi --no-extensions -e ./extensions/cattery.ts`.
+- The pi extension and the Codex plugin are two more rollouts. `cattery setup`
+  offers to run `pi install git:github.com/alexander-akhmetov/cattery` and
+  `codex plugin add cattery-codex@cattery`, both of which fetch the published
+  copy and not this checkout, and `setup.Stale` covers only the installed
+  `kitty/*.py`, so nothing notices either going out of date. Test a local
+  extension with `pi --no-extensions -e ./extensions/cattery.ts`, and a local
+  plugin with `codex plugin marketplace add .` from the repository root.
+- `codex plugin marketplace add` on a source already configured exits 0 and
+  leaves the snapshot it fetched alone, so a re-run after a release would
+  install the old plugin again. `codex plugin marketplace upgrade cattery` is
+  what refreshes it, and it fails on a marketplace nothing has added yet, which
+  is why `codexArgs` runs the two in that order.
 - A display value missing from `filters` is reachable only from the `all` tab
   and is missing from the footer's "N active".
 - `cattery events` asks for `SIGPIPE`. Go makes a broken pipe on stdout fatal

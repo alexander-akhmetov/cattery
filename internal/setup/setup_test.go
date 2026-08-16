@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -15,33 +17,53 @@ import (
 
 const testBinary = "/opt/bin/cattery"
 
-// harness is one setup run against temporary directories, with pi faked so it
-// launches nothing.
+// harness is one setup run against temporary directories, with codex and pi
+// faked so nothing launches.
 type harness struct {
 	t         *testing.T
 	kittyDir  string
 	claudeDir string
+	codexDir  string
 	opts      Options
 	out       strings.Builder
-	piRuns    [][]string
+	runs      [][]string
+
+	// failRun makes chosen commands fail. The harness records every run either
+	// way, so a test can check what came after the failure.
+	failRun func(name string, args []string) error
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, kittyDir: t.TempDir(), claudeDir: t.TempDir()}
+	h := &harness{t: t, kittyDir: t.TempDir(), claudeDir: t.TempDir(), codexDir: t.TempDir()}
 	h.opts = Options{
 		KittyDir:    h.kittyDir,
 		ClaudeDir:   h.claudeDir,
+		CodexDir:    h.codexDir,
 		Binary:      testBinary,
 		Yes:         true,
 		LegacyPaths: []string{},
-		LookPath:    func(string) (string, error) { return "/usr/bin/pi", nil },
+		LookPath:    func(file string) (string, error) { return "/usr/bin/" + file, nil },
 		RunCommand: func(name string, args ...string) error {
-			h.piRuns = append(h.piRuns, append([]string{name}, args...))
-			return nil
+			h.runs = append(h.runs, append([]string{name}, args...))
+			if h.failRun == nil {
+				return nil
+			}
+			return h.failRun(name, args)
 		},
 	}
 	return h
+}
+
+// ran is what one binary was launched with, one entry per run.
+func (h *harness) ran(name string) [][]string {
+	var out [][]string
+	for _, run := range h.runs {
+		if filepath.Base(run[0]) == name {
+			out = append(out, run)
+		}
+	}
+	return out
 }
 
 func (h *harness) run() string {
@@ -56,6 +78,7 @@ func (h *harness) run() string {
 
 func (h *harness) kittyPath(name string) string  { return filepath.Join(h.kittyDir, name) }
 func (h *harness) claudePath(name string) string { return filepath.Join(h.claudeDir, name) }
+func (h *harness) codexPath(name string) string  { return filepath.Join(h.codexDir, name) }
 
 func (h *harness) read(path string) string {
 	h.t.Helper()
@@ -156,8 +179,11 @@ func TestRerunIsIdempotent(t *testing.T) {
 	if n := strings.Count(before["kitty.conf"], blockStart); n != 1 {
 		t.Errorf("kitty.conf holds %d cattery blocks, want 1", n)
 	}
-	if len(h.piRuns) != 2 {
-		t.Errorf("pi runs: got %d, want one per setup run", len(h.piRuns))
+	if n := len(h.ran("pi")); n != 2 {
+		t.Errorf("pi runs: got %d, want one per setup run", n)
+	}
+	if n := len(h.ran("codex")); n != 2*len(codexArgs) {
+		t.Errorf("codex runs: got %d, want %d per setup run", n, len(codexArgs))
 	}
 }
 
@@ -519,15 +545,20 @@ func TestDryRunWritesNothing(t *testing.T) {
 	if _, err := os.Stat(h.claudePath("settings.json.cattery-bak")); !errors.Is(err, os.ErrNotExist) {
 		t.Error("a backup was created")
 	}
-	if len(h.piRuns) != 0 {
-		t.Errorf("pi was launched: %v", h.piRuns)
+	if len(h.runs) != 0 {
+		t.Errorf("a command was launched: %v", h.runs)
 	}
 
-	for _, want := range []string{
-		"would write", "would update", "would run", "kitty.conf", "settings.json", "pi install " + piPackage,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("dry-run report missing %q, got:\n%s", want, out)
+	want := make([]string, 0, 6+len(codexArgs))
+	want = append(want,
+		"would write", "would update", "would run", "kitty.conf", "settings.json", "pi install "+piPackage,
+	)
+	for _, args := range codexArgs {
+		want = append(want, codexCommand(args))
+	}
+	for _, phrase := range want {
+		if !strings.Contains(out, phrase) {
+			t.Errorf("dry-run report missing %q, got:\n%s", phrase, out)
 		}
 	}
 }
@@ -799,18 +830,20 @@ func TestClaudeInvalidJSONIsLeftAlone(t *testing.T) {
 func TestConsent(t *testing.T) {
 	cases := []struct {
 		name       string
-		answers    string // empty with stdin means an empty answer to both
+		answers    string // empty with stdin means an empty answer to all three
 		noStdin    bool
 		yes        bool
 		wantClaude bool
+		wantCodex  bool
 		wantPi     bool
 	}{
-		{name: "empty answers accept both", answers: "\n\n", wantClaude: true, wantPi: true},
-		{name: "explicit yes", answers: "y\nyes\n", wantClaude: true, wantPi: true},
-		{name: "explicit decline", answers: "n\nn\n", wantClaude: false, wantPi: false},
-		{name: "declines Claude, accepts pi", answers: "no\n\n", wantClaude: false, wantPi: true},
-		{name: "--yes skips the questions", noStdin: true, yes: true, wantClaude: true, wantPi: true},
-		{name: "no terminal and no --yes skips both", noStdin: true},
+		{name: "empty answers accept all three", answers: "\n\n\n", wantClaude: true, wantCodex: true, wantPi: true},
+		{name: "explicit yes", answers: "y\ny\nyes\n", wantClaude: true, wantCodex: true, wantPi: true},
+		{name: "explicit decline", answers: "n\nn\nn\n"},
+		{name: "declines Claude, accepts the rest", answers: "no\n\n\n", wantCodex: true, wantPi: true},
+		{name: "declines Codex only", answers: "\nn\n\n", wantClaude: true, wantPi: true},
+		{name: "--yes skips the questions", noStdin: true, yes: true, wantClaude: true, wantCodex: true, wantPi: true},
+		{name: "no terminal and no --yes skips all three", noStdin: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -826,8 +859,11 @@ func TestConsent(t *testing.T) {
 			if merged := err == nil; merged != tc.wantClaude {
 				t.Errorf("settings.json written=%v, want %v; output:\n%s", merged, tc.wantClaude, out)
 			}
-			if ran := len(h.piRuns) > 0; ran != tc.wantPi {
+			if ran := len(h.ran("pi")) > 0; ran != tc.wantPi {
 				t.Errorf("pi install ran=%v, want %v; output:\n%s", ran, tc.wantPi, out)
+			}
+			if ran := len(h.ran("codex")) > 0; ran != tc.wantCodex {
+				t.Errorf("codex plugin install ran=%v, want %v; output:\n%s", ran, tc.wantCodex, out)
 			}
 			// A skipped step says what to run by hand.
 			if !tc.wantClaude {
@@ -845,6 +881,13 @@ func TestConsent(t *testing.T) {
 			if !tc.wantPi && !strings.Contains(out, "pi install "+piPackage) {
 				t.Errorf("report missing the manual pi command, got:\n%s", out)
 			}
+			if !tc.wantCodex {
+				for _, args := range codexArgs {
+					if !strings.Contains(out, codexCommand(args)) {
+						t.Errorf("report missing the manual %q, got:\n%s", codexCommand(args), out)
+					}
+				}
+			}
 			// The kitty side never asks, because it is the install itself.
 			if _, err := os.Stat(h.kittyPath("cattery_tab.py")); err != nil {
 				t.Errorf("kitty files were skipped: %v", err)
@@ -859,26 +902,251 @@ func TestPiInstallCommand(t *testing.T) {
 	h := newHarness(t)
 	h.run()
 
-	if len(h.piRuns) != 1 {
-		t.Fatalf("pi runs: got %v, want one", h.piRuns)
+	runs := h.ran("pi")
+	if len(runs) != 1 {
+		t.Fatalf("pi runs: got %v, want one", runs)
 	}
 	want := []string{"/usr/bin/pi", "install", piPackage}
-	if !equal(h.piRuns[0], want) {
-		t.Fatalf("pi command: got %v, want %v", h.piRuns[0], want)
+	if !equal(runs[0], want) {
+		t.Fatalf("pi command: got %v, want %v", runs[0], want)
 	}
 }
 
 func TestPiMissingFromPath(t *testing.T) {
 	h := newHarness(t)
-	h.opts.LookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+	h.opts.LookPath = func(file string) (string, error) {
+		if file == "pi" {
+			return "", exec.ErrNotFound
+		}
+		return "/usr/bin/" + file, nil
+	}
 
 	out := h.run()
 
-	if len(h.piRuns) != 0 {
-		t.Fatalf("pi was launched: %v", h.piRuns)
+	if runs := h.ran("pi"); len(runs) != 0 {
+		t.Fatalf("pi was launched: %v", runs)
 	}
 	if !strings.Contains(out, "pi is not on PATH") || !strings.Contains(out, "pi install "+piPackage) {
 		t.Errorf("report does not explain the skip, got:\n%s", out)
+	}
+}
+
+// --- codex ------------------------------------------------------------------
+
+// The marketplace has to be added before the plugin can be installed from it,
+// and upgraded in between, because `marketplace add` on a source already
+// configured leaves its snapshot alone.
+func TestCodexPluginCommand(t *testing.T) {
+	h := newHarness(t)
+	out := h.run()
+
+	runs := h.ran("codex")
+	want := [][]string{
+		{"/usr/bin/codex", "plugin", "marketplace", "add", codexSource},
+		{"/usr/bin/codex", "plugin", "marketplace", "upgrade", codexMarketplace},
+		{"/usr/bin/codex", "plugin", "add", codexPlugin},
+	}
+	if len(runs) != len(want) {
+		t.Fatalf("codex runs: got %v, want %v", runs, want)
+	}
+	for i := range want {
+		if !equal(runs[i], want[i]) {
+			t.Errorf("codex run %d: got %v, want %v", i, runs[i], want[i])
+		}
+	}
+	// The trust gate and the stale plugin: neither can be automated, so both
+	// have to be said.
+	for _, phrase := range []string{"/hooks", "trust", "stale"} {
+		if !strings.Contains(out, phrase) {
+			t.Errorf("report missing %q, got:\n%s", phrase, out)
+		}
+	}
+}
+
+func TestCodexMissingFromPath(t *testing.T) {
+	h := newHarness(t)
+	h.opts.LookPath = func(file string) (string, error) {
+		if file == "codex" {
+			return "", exec.ErrNotFound
+		}
+		return "/usr/bin/" + file, nil
+	}
+
+	out := h.run()
+
+	if runs := h.ran("codex"); len(runs) != 0 {
+		t.Fatalf("codex was launched: %v", runs)
+	}
+	if !strings.Contains(out, "codex is not on PATH") {
+		t.Errorf("report does not name the skip, got:\n%s", out)
+	}
+	for _, args := range codexArgs {
+		if !strings.Contains(out, codexCommand(args)) {
+			t.Errorf("report missing %q, got:\n%s", codexCommand(args), out)
+		}
+	}
+}
+
+// A failing step is reported and the ones behind it still run. `plugin add`
+// works off the snapshot an earlier run left, so a marketplace fetch that
+// fails offline does not have to take the install with it.
+func TestCodexFailureIsReported(t *testing.T) {
+	h := newHarness(t)
+	h.failRun = func(name string, args []string) error {
+		if filepath.Base(name) == "codex" && slices.Equal(args, codexArgs[0]) {
+			return errors.New("network unreachable")
+		}
+		return nil
+	}
+
+	out := h.run()
+
+	if runs := h.ran("codex"); len(runs) != len(codexArgs) {
+		t.Fatalf("codex runs: got %v, want %d", runs, len(codexArgs))
+	}
+	if !strings.Contains(out, "failed") || !strings.Contains(out, "network unreachable") {
+		t.Errorf("report does not name the failure, got:\n%s", out)
+	}
+}
+
+// Codex's own hooks.json is the user's. Hand-written cattery entries there
+// double up with the plugin, so setup names them and changes nothing.
+func TestCodexHandWrittenHooksAreReported(t *testing.T) {
+	cases := []struct {
+		name     string
+		hooks    string // "" writes no file at all
+		wantNote bool
+	}{
+		{
+			name:     "an entry cattery would double",
+			hooks:    `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery state idle"}]}]}}`,
+			wantNote: true,
+		},
+		{
+			name:  "somebody else's hooks",
+			hooks: `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"notify-send done"}]}]}}`,
+		},
+		{name: "no hooks.json at all"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			path := h.codexPath("hooks.json")
+			if tc.hooks != "" {
+				h.write(path, tc.hooks)
+			}
+
+			out := h.run()
+
+			if got := strings.Contains(out, "double up with the plugin"); got != tc.wantNote {
+				t.Errorf("reported=%v, want %v; output:\n%s", got, tc.wantNote, out)
+			}
+			if tc.hooks != "" && h.read(path) != tc.hooks {
+				t.Errorf("hooks.json was changed:\n%s", h.read(path))
+			}
+		})
+	}
+}
+
+// The plugin is fetched from the published repository, so the manifests in
+// this checkout are the release. A drift between them and what the writer
+// accepts is silent: Codex would run a command that publishes nothing.
+func TestCodexPluginManifests(t *testing.T) {
+	var manifest struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+				Timeout int    `json:"timeout"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	read(t, filepath.Join("..", "..", "codex", "hooks", "hooks.json"), &manifest)
+
+	// The same five states the Claude hooks publish, on Codex's own events.
+	// SessionStart takes a matcher for the same reason Claude's does: an idle
+	// published for a compaction marks a running agent finished.
+	want := []struct{ Event, State, Matcher string }{
+		{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
+		{Event: "UserPromptSubmit", State: "working"},
+		{Event: "PermissionRequest", State: "blocked", Matcher: "*"},
+		{Event: "Stop", State: "idle"},
+		{Event: "SessionEnd", State: "clear"},
+	}
+	if len(manifest.Hooks) != len(want) {
+		t.Fatalf("events: got %v, want %d", slices.Sorted(maps.Keys(manifest.Hooks)), len(want))
+	}
+	for _, w := range want {
+		groups, ok := manifest.Hooks[w.Event]
+		if !ok || len(groups) != 1 || len(groups[0].Hooks) != 1 {
+			t.Fatalf("hooks.%s: got %v, want one command", w.Event, groups)
+		}
+		entry := groups[0].Hooks[0]
+		// The bare name off PATH: a static manifest cannot know where the
+		// binary is, and a Codex hook is a child of a process a shell started.
+		if command := "cattery state " + w.State + " --kind codex"; entry.Command != command {
+			t.Errorf("hooks.%s command: got %q, want %q", w.Event, entry.Command, command)
+		}
+		if groups[0].Matcher != w.Matcher {
+			t.Errorf("hooks.%s matcher: got %q, want %q", w.Event, groups[0].Matcher, w.Matcher)
+		}
+		// A hook that hangs holds up the turn, and the writer's own publish
+		// gives up after two seconds.
+		if entry.Timeout != 5 {
+			t.Errorf("hooks.%s timeout: got %d, want 5", w.Event, entry.Timeout)
+		}
+		if entry.Type != "command" {
+			t.Errorf("hooks.%s type: got %q, want %q", w.Event, entry.Type, "command")
+		}
+	}
+
+	// The two manifests name the plugin and reach the hooks file. A rename
+	// leaves `codex plugin add` naming something the marketplace does not hold.
+	var plugin struct {
+		Name  string `json:"name"`
+		Hooks string `json:"hooks"`
+	}
+	read(t, filepath.Join("..", "..", "codex", ".codex-plugin", "plugin.json"), &plugin)
+	wantName, _, _ := strings.Cut(codexPlugin, "@")
+	if plugin.Name != wantName {
+		t.Errorf("plugin name: got %q, want %q", plugin.Name, wantName)
+	}
+	if plugin.Hooks != "./hooks/hooks.json" {
+		t.Errorf("plugin hooks path: got %q", plugin.Hooks)
+	}
+
+	var market struct {
+		Name    string `json:"name"`
+		Plugins []struct {
+			Name   string `json:"name"`
+			Source struct {
+				Source string `json:"source"`
+				Path   string `json:"path"`
+			} `json:"source"`
+		} `json:"plugins"`
+	}
+	read(t, filepath.Join("..", "..", ".agents", "plugins", "marketplace.json"), &market)
+	if market.Name != codexMarketplace {
+		t.Errorf("marketplace name: got %q, want %q", market.Name, codexMarketplace)
+	}
+	if len(market.Plugins) != 1 || market.Plugins[0].Name != plugin.Name {
+		t.Fatalf("marketplace plugins: got %+v, want one named %q", market.Plugins, plugin.Name)
+	}
+	if got := market.Plugins[0].Source; got.Source != "local" || got.Path != "./codex" {
+		t.Errorf("marketplace source: got %+v", got)
+	}
+}
+
+// read decodes a JSON file of this repository into v.
+func read(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
 	}
 }
 
@@ -886,7 +1154,12 @@ func TestPiMissingFromPath(t *testing.T) {
 // stands, so setup does not fail.
 func TestPiInstallFailureIsReported(t *testing.T) {
 	h := newHarness(t)
-	h.opts.RunCommand = func(string, ...string) error { return errors.New("network unreachable") }
+	h.failRun = func(name string, _ []string) error {
+		if filepath.Base(name) == "pi" {
+			return errors.New("network unreachable")
+		}
+		return nil
+	}
 
 	out := h.run()
 

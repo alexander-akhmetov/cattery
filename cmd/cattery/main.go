@@ -91,25 +91,29 @@ var subcommands = []subcommand{
 		name:    cmdSetup,
 		summary: "install the kitty files and the config they need",
 		details: `Copies the watcher and the kittens into kitty's config directory, keeps its
-own block in kitty.conf, and offers to wire the Claude Code hooks and the pi
-extension. It writes tab_bar.py only when that directory has none, because an
-existing one is yours.
+own block in kitty.conf, and offers to wire the Claude Code hooks, the Codex
+plugin and the pi extension. It writes tab_bar.py only when that directory has
+none, because an existing one is yours.
 
 Those are copies, and upgrading the binary does not touch them, so run setup
 again after every upgrade. Reload kitty afterwards.`,
 	},
 	{
 		name:     cmdState,
-		operands: "<working|blocked|idle|clear>",
+		operands: "<working|blocked|idle|clear> [--kind <claude|codex>]",
 		summary:  "publish this window's agent state",
 		details: `Writes the AGENT_* variables that the tab marker and the picker read, on the
 tmux pane when $TMUX and $TMUX_PANE are set and on the kitty window
 otherwise.
 
-Claude Code runs this from five hooks, and the shell wrappers run "clear"
-after the agent exits. It is meant to be called by an agent rather than
-typed, and it exits 0 whatever happens: a failure here would show up in the
-agent's own transcript.`,
+--kind names the agent calling, which decides the AGENT_KIND the picker draws
+and the shape of the resume command. It defaults to claude, and a word no
+agent carries reads as claude too.
+
+Claude Code and Codex each run this from five hooks, and the shell wrappers
+run "clear" after the agent exits. It is meant to be called by an agent
+rather than typed, and it exits 0 whatever happens: a failure here would show
+up in the agent's own transcript.`,
 	},
 	{
 		name:     cmdSave,
@@ -456,7 +460,7 @@ func setupFlags() (*flag.FlagSet, *setup.Options) {
 	var opts setup.Options
 	flags := newFlagSet(cmdSetup)
 	flags.BoolVar(&opts.DryRun, "dry-run", false, "report every action without changing anything")
-	flags.BoolVar(&opts.Yes, "yes", false, "answer yes to the Claude Code and pi questions")
+	flags.BoolVar(&opts.Yes, "yes", false, "answer yes to the Claude Code, Codex and pi questions")
 	flags.StringVar(&opts.KittyDir, "kitty-dir", "", "kitty config `directory` (default $KITTY_CONFIG_DIRECTORY, else ~/.config/kitty)")
 	return flags, &opts
 }

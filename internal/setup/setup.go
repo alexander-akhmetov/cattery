@@ -1,6 +1,6 @@
 // Package setup installs cattery. It writes the embedded kitty files into the
 // kitty config directory, keeps a marked block in kitty.conf, and offers to
-// wire up Claude Code and pi. It backs `cattery setup`.
+// wire up Claude Code, Codex and pi. It backs `cattery setup`.
 //
 // The installed kitty files are copies, so an install does not depend on where
 // the source lives. A copy does not follow a binary upgrade, so the picker
@@ -9,6 +9,7 @@ package setup
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,28 @@ import (
 // piPackage is the cattery pi package. pi fetches it from git, so setup never
 // parses pi's settings file.
 const piPackage = "git:github.com/alexander-akhmetov/cattery"
+
+// The Codex plugin, as its CLI names it. codexSource is the repository the
+// marketplace comes from, codexMarketplace the name the manifest gives it, and
+// codexPlugin the selector `codex plugin add` takes.
+const (
+	codexSource      = "alexander-akhmetov/cattery"
+	codexMarketplace = "cattery"
+	codexPlugin      = "cattery-codex@" + codexMarketplace
+)
+
+// codexArgs are what setup runs, in order, checked against codex-cli 0.147.0.
+//
+// `marketplace add` on a source already configured exits 0 and says so, but it
+// leaves the snapshot it fetched alone. The upgrade behind it is what a re-run
+// after a cattery release needs, and it is second because it fails on a
+// marketplace nothing has added yet. `plugin add` on an installed plugin
+// re-installs it, so the whole sequence is safe to repeat.
+var codexArgs = [][]string{
+	{"plugin", "marketplace", "add", codexSource},
+	{"plugin", "marketplace", "upgrade", codexMarketplace},
+	{"plugin", "add", codexPlugin},
+}
 
 // assetMode makes the installed kitty files readable by kitty and writable only
 // by their owner. None of them is executed.
@@ -44,7 +67,7 @@ type Options struct {
 	// no backup, and runs no external command.
 	DryRun bool
 
-	// Yes answers the Claude and pi questions without asking.
+	// Yes answers the Claude, Codex and pi questions without asking.
 	Yes bool
 
 	// Binary is the path setup writes into the kitty map and the Claude hooks.
@@ -54,6 +77,10 @@ type Options struct {
 	// ClaudeDir is where settings.json lives. Empty falls back to
 	// $CLAUDE_CONFIG_DIR, then ~/.claude.
 	ClaudeDir string
+
+	// CodexDir is where Codex's own hooks.json lives. Empty falls back to
+	// $CODEX_HOME, then ~/.codex. Setup reads that file and never writes it.
+	CodexDir string
 
 	// LegacyPaths are the files the shell installer left behind. Nil uses the
 	// real ones. Setup reports them and never touches them.
@@ -67,18 +94,18 @@ type Options struct {
 	// Out receives the report. Nil means os.Stdout.
 	Out io.Writer
 
-	// LookPath and RunCommand find and run pi. A test replaces them to record
-	// the install command without launching anything.
+	// LookPath and RunCommand find and run codex and pi. A test replaces them
+	// to record the install commands without launching anything.
 	LookPath   func(file string) (string, error)
 	RunCommand func(name string, args ...string) error
 }
 
 // Run installs cattery and reports what it did.
 //
-// It fails only on the kitty side, which is the install itself. The Claude and
-// pi steps belong to other tools. When one of them cannot be done, setup says
-// so, prints the command to run by hand, and still reports success for its own
-// part.
+// It fails only on the kitty side, which is the install itself. The Claude,
+// Codex and pi steps belong to other tools. When one of them cannot be done,
+// setup says so, prints the command to run by hand, and still reports success
+// for its own part.
 func Run(opts Options) error {
 	s, err := newSession(opts)
 	if err != nil {
@@ -88,6 +115,7 @@ func Run(opts Options) error {
 		return err
 	}
 	s.claude()
+	s.codex()
 	s.pi()
 	s.reportLegacy()
 	s.out.line("")
@@ -102,6 +130,7 @@ type session struct {
 	answers   *bufio.Reader // nil when there is nobody to ask
 	kittyDir  string
 	claudeDir string
+	codexDir  string
 	binary    string
 	legacy    []string
 	lookPath  func(string) (string, error)
@@ -129,19 +158,24 @@ func newSession(opts Options) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
+	codexDir, err := resolveDir(opts.CodexDir, "CODEX_HOME", ".codex")
+	if err != nil {
+		return nil, err
+	}
 
 	s := &session{
 		opts:      opts,
 		out:       &reporter{w: out, dry: opts.DryRun},
 		kittyDir:  kittyDir,
 		claudeDir: claudeDir,
+		codexDir:  codexDir,
 		binary:    binary,
 		legacy:    opts.LegacyPaths,
 		lookPath:  opts.LookPath,
 		run:       opts.RunCommand,
 	}
-	// One reader for both questions. A fresh bufio.Reader per question would
-	// buffer past the first answer and swallow the second.
+	// One reader for every question. A fresh bufio.Reader per question would
+	// buffer past the first answer and swallow the next.
 	if opts.In != nil {
 		s.answers = bufio.NewReader(opts.In)
 	}
@@ -429,6 +463,79 @@ func claudeInstructions(binary string) string {
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// codex installs the Codex plugin through Codex's own CLI. The plugin comes
+// from the published repository rather than from this checkout, so a run here
+// fetches whatever that repository holds now.
+//
+// Two things it cannot do, which is why both are printed rather than done.
+// Codex hashes a plugin's hooks and skips them without a word until the user
+// trusts them in /hooks. And nothing notices the published plugin going stale:
+// Stale compares the installed kitty files, which this step does not touch.
+func (s *session) codex() {
+	s.out.line("")
+	path, err := s.lookPath("codex")
+	if err != nil {
+		s.out.plain("skipped", "codex is not on PATH")
+		s.out.block(codexInstructions())
+		return
+	}
+	if !s.consent("Install the cattery Codex plugin?") {
+		// One line per command, so a decline still leaves the three to run by
+		// hand. Only the trust step needs the block behind them.
+		for _, args := range codexArgs {
+			s.out.plain("skipped", codexCommand(args))
+		}
+		s.out.block(codexTrustInstructions)
+		return
+	}
+	for _, args := range codexArgs {
+		command := codexCommand(args)
+		s.out.act("ran", "would run", command)
+		if s.opts.DryRun {
+			continue
+		}
+		if err := s.run(path, args...); err != nil {
+			s.out.plain("failed", command+": "+err.Error())
+		}
+	}
+	s.out.block(codexTrustInstructions)
+	s.reportCodexHooks()
+}
+
+// codexCommand renders one step as the line a user would type.
+func codexCommand(args []string) string { return "codex " + strings.Join(args, " ") }
+
+// codexInstructions lists the steps for a user without codex on PATH.
+func codexInstructions() string {
+	lines := make([]string, 0, 1+len(codexArgs))
+	lines = append(lines, "    Once codex is installed, run:")
+	for _, args := range codexArgs {
+		lines = append(lines, "      "+codexCommand(args))
+	}
+	return strings.Join(lines, "\n") + "\n\n" + codexTrustInstructions
+}
+
+// codexTrustInstructions is what setup cannot do for the user.
+const codexTrustInstructions = `    Then open /hooks in Codex and trust each cattery-codex@cattery entry.
+    Codex skips an untrusted hook without a word.
+
+    The plugin is fetched from the published repository, so nothing notices it
+    going stale. Run these again after every cattery upgrade.`
+
+// reportCodexHooks names hand-written cattery entries in Codex's own
+// hooks.json. Those fire beside the plugin's and publish every state twice,
+// and a hand-written one predating this release carries no --kind, so it tags
+// the session claude and publishes `claude --resume <codex id>`, which reopens
+// nothing. Setup does not own that file, so it says so and leaves it alone.
+func (s *session) reportCodexHooks() {
+	path := filepath.Join(s.codexDir, "hooks.json")
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Contains(data, []byte("cattery state")) {
+		return
+	}
+	s.out.plain("note", shorten(path)+" also runs `cattery state`; those entries double up with the plugin, and one without --kind tags a Codex session as Claude. Remove them.")
 }
 
 func (s *session) pi() {

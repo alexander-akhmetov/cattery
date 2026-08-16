@@ -14,8 +14,8 @@ import (
 )
 
 // subprocessState turns the test binary into `cattery state <x>`. The child
-// reads the word from here, publishes it, and exits before the test framework
-// runs anything.
+// reads the argv from here, one argument per space, publishes it, and exits
+// before the test framework runs anything.
 const subprocessState = "CATTERY_TEST_STATE"
 
 // argvFile is where the fake kitten records the arguments it was called with.
@@ -26,16 +26,18 @@ const argvFile = "CATTERY_TEST_ARGV"
 // over kitty remote control. Only a separate process can be without a terminal,
 // so the test re-execs itself in a new session.
 func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
-	if word := os.Getenv(subprocessState); word != "" {
-		Run([]string{word})
+	if argv := os.Getenv(subprocessState); argv != "" {
+		Run(strings.Fields(argv))
 		// Exit before the test framework prints its own result. Claude captures
 		// a hook's stdout into the transcript, which has to stay empty.
 		os.Exit(0)
 	}
 
 	cases := []struct {
-		name  string
-		state string
+		name string
+		// argv is everything after `cattery state`, so a case can carry the
+		// --kind flag the Codex plugin passes.
+		argv  string
 		stdin string
 		want  []string // what the fake kitten saw, or nothing when it must not run
 	}{
@@ -43,14 +45,14 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			// AGENT_STATE comes last in every batch: writing it is what wakes
 			// the watcher, and the watcher reads the others out of the window.
 			name:  "working carries the kind, the prompt, and the state",
-			state: "working",
+			argv:  "working",
 			stdin: `{"prompt":"fix the picker"}`,
 			want: []string{"@", "set-user-vars", "--match", "id:7",
 				"AGENT_KIND=claude", "AGENT_MSG=fix the picker", "AGENT_STATE=working"},
 		},
 		{
 			name:  "blocked leaves the message alone",
-			state: "blocked",
+			argv:  "blocked",
 			stdin: `{"prompt":"ignored"}`,
 			want: []string{"@", "set-user-vars", "--match", "id:7",
 				"AGENT_KIND=claude", "AGENT_STATE=blocked"},
@@ -58,8 +60,8 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 		{
 			// Bare names. That is how both kitty and the OSC escape spell
 			// "remove this variable"; an empty value means something else.
-			name:  "clear deletes the three variables, in order",
-			state: "clear",
+			name: "clear deletes the three variables, in order",
+			argv: "clear",
 			want: []string{"@", "set-user-vars", "--match", "id:7",
 				"AGENT_KIND", "AGENT_MSG", "AGENT_STATE"},
 		},
@@ -67,7 +69,7 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			// The deletes are bare names here too, between the resume command
 			// and the state.
 			name:  "a session start deletes the prompt and the worked flag",
-			state: "idle",
+			argv:  "idle",
 			stdin: `{"session_id":"s1","source":"startup"}`,
 			want: []string{"@", "set-user-vars", "--match", "id:7",
 				"AGENT_KIND=claude", "AGENT_RESUME=claude --resume s1",
@@ -75,12 +77,34 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 		},
 		{
 			name:  "a compaction publishes nothing",
-			state: "idle",
+			argv:  "idle",
 			stdin: `{"session_id":"s1","source":"compact"}`,
 		},
 		{
-			name:  "an unknown word publishes nothing",
-			state: "sleeping",
+			name: "an unknown word publishes nothing",
+			argv: "sleeping",
+		},
+		{
+			// What the Codex plugin's UserPromptSubmit hook runs.
+			name:  "--kind codex carries the kind and Codex's own resume command",
+			argv:  "working --kind codex",
+			stdin: `{"session_id":"s1","prompt":"fix the picker"}`,
+			want: []string{"@", "set-user-vars", "--match", "id:7",
+				"AGENT_KIND=codex", "AGENT_RESUME=codex resume s1",
+				"AGENT_MSG=fix the picker", "AGENT_STATE=working"},
+		},
+		{
+			name: "a Codex clear deletes the same three",
+			argv: "clear --kind codex",
+			want: []string{"@", "set-user-vars", "--match", "id:7",
+				"AGENT_KIND", "AGENT_MSG", "AGENT_STATE"},
+		},
+		{
+			name:  "an unrecognised kind publishes claude",
+			argv:  "working --kind gpt",
+			stdin: `{"session_id":"s1"}`,
+			want: []string{"@", "set-user-vars", "--match", "id:7",
+				"AGENT_KIND=claude", "AGENT_RESUME=claude --resume s1", "AGENT_STATE=working"},
 		},
 	}
 	for _, tc := range cases {
@@ -93,7 +117,7 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			// PATH holds the fake kitten and nothing else, so a real kitty on
 			// this machine cannot answer instead of it.
 			cmd.Env = []string{
-				subprocessState + "=" + tc.state,
+				subprocessState + "=" + tc.argv,
 				argvFile + "=" + argv,
 				"PATH=" + dir,
 				"KITTY_WINDOW_ID=7",
@@ -112,7 +136,7 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			stdout, err := cmd.Output()
 
 			if err != nil {
-				t.Fatalf("cattery state %s: %v\n%s", tc.state, err, stderr.String())
+				t.Fatalf("cattery state %s: %v\n%s", tc.argv, err, stderr.String())
 			}
 			if len(stdout) > 0 {
 				t.Errorf("the hook wrote to stdout: %q", stdout)

@@ -37,10 +37,21 @@ Reload kitty afterwards.
 `cattery setup` installs copies of the kitty files, and an upgrade of the binary
 does not update those copies. Run it again after every upgrade. Restart kitty after.
 
-`cattery setup` also offers to run
-`pi install git:github.com/alexander-akhmetov/cattery`. Say yes after every
-upgrade: the picker warns about stale kitty files, but nothing notices a stale
-pi extension.
+`cattery setup` also offers to install the pi extension and the Codex plugin:
+
+```bash
+pi install git:github.com/alexander-akhmetov/cattery
+codex plugin marketplace add alexander-akhmetov/cattery
+codex plugin marketplace upgrade cattery
+codex plugin add cattery-codex@cattery
+```
+
+Say yes after every upgrade. The picker warns about stale kitty files, but
+nothing notices a stale pi extension or a stale Codex plugin: both are fetched
+from the published repository rather than from the binary.
+
+Codex hooks are trust-gated. Open `/hooks` in Codex and trust each
+`cattery-codex@cattery` entry. Until you do, Codex skips them without a word.
 
 `cattery -version` prints the release the binary was built from. `cattery help`
 lists the commands, and `cattery help <command>` says what one of them does.
@@ -48,12 +59,12 @@ lists the commands, and `cattery help <command>` says what one of them does.
 ## Quick start
 
 1. Run `cattery setup` and restart kitty.
-2. Start an agent in a kitty tab. Currently only Claude Code and Pi are supported.
+2. Start an agent in a kitty tab. Currently only Claude Code, Codex and Pi are supported.
 3. Press `opt+a` (`alt+a`) twice for the overlay in any kitty tab, which lists every running agent.
 
 There is nothing to configure per agent or per project. `cattery setup` wires up
-Claude Code, the pi extension covers pi, and from then on every agent you start
-reports itself.
+Claude Code and Codex, the pi extension covers pi, and from then on every agent
+you start reports itself.
 
 ## The overlay
 
@@ -115,16 +126,16 @@ session file. `R` opens those tabs again and types each resume command at its
 prompt, without pressing return. `cattery save` and `cattery restore` do the
 same from a shell.
 
-The resume command is `claude --resume <id>` or `pi --session <file>`. If you
-start agents through a wrapper, export the command cattery should write instead,
-before the agent starts:
+The resume command is `claude --resume <id>`, `codex resume <id>` or
+`pi --session <file>`. If you start agents through a wrapper, export the command
+cattery should write instead, before the agent starts:
 
 ```bash
 export CATTERY_RESUME_PREFIX_CLAUDE="claude --profile personal"
 ```
 
-`CATTERY_RESUME_PREFIX_PI` does the same for pi, and `CATTERY_RESUME_PREFIX` for
-both kinds.
+`CATTERY_RESUME_PREFIX_CODEX` and `CATTERY_RESUME_PREFIX_PI` do the same for
+Codex and pi, and `CATTERY_RESUME_PREFIX` for all three.
 
 tmux agents are not recorded: a pane belongs to whatever started it.
 
@@ -145,7 +156,11 @@ that way. An OS window with a `blocked`, `stalled` or `done` agent in it gets a
 `(N need you)` title prefix, which the Dock and the ⌘-Tab switcher pick up.
 
 Focus a `done` window and the marker goes away. Only pi reports which tool it is
-running, so a Claude agent never reaches `stalled`.
+running, so a Claude or Codex agent never reaches `stalled`.
+
+A Claude or Codex tab that goes `blocked` stays red until the turn ends, even
+after you answer. Neither agent reports going back to work, so the next thing
+cattery hears is the end of the turn.
 
 ## Notifications
 
@@ -202,7 +217,7 @@ Each line is one JSON object:
 |---|---|
 | `ts` | unix seconds |
 | `window` | the kitty window id |
-| `kind` | what the agent calls itself, `pi` or `claude`, empty on a `cleared` event from Claude |
+| `kind` | what the agent calls itself, `pi`, `claude` or `codex`, empty on a `cleared` event from Claude or Codex |
 | `from` | the state before this change, `null` the first time the window is seen |
 | `to` | `working`, `stalled`, `blocked`, `done`, `idle`, `cleared` when the agent dropped its state, `closed` when the window went away |
 | `title` | the window title, cut to 200 characters |
