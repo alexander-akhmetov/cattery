@@ -34,8 +34,8 @@ Side effects on a transition:
     * set AGENT_DISPLAY on the window
     * mark_tab_bar_dirty() on the window's tab manager
     * set_os_window_title() with a "(N need you)" summary for that OS window
-    * terminal-notifier on an edge into blocked or done, unless the window is
-      focused
+    * a notification through kitty's own notification manager on an edge into
+      blocked or done, unless the window is focused
     * one JSON datagram per registered subscriber
 
 Re-entrancy: writing AGENT_DISPLAY fires on_set_user_var again, so every key
@@ -45,13 +45,19 @@ other than AGENT_STATE and AGENT_KIND is ignored.
 import errno
 import json
 import socket
-import subprocess
 import time
+from functools import partial
 from typing import Any
 
 from kitty.boss import Boss
-from kitty.fast_data_types import set_os_window_title
+from kitty.fast_data_types import get_options, set_os_window_title
+from kitty.utils import log_error
 from kitty.window import Window
+
+try:
+    from kitty.notifications import OnlyWhen, Urgency
+except ImportError:  # kitty older than the notification manager
+    OnlyWhen = None
 
 # The key the picker sets to say the user has looked at an agent. The set of
 # seen windows lives in this process and nothing outside kitty can reach it, so
@@ -69,13 +75,6 @@ _ATTENTION = ("blocked", "done")
 # Displays meaning "this agent has done something", which can turn into "done"
 # when the agent goes idle unseen.
 _WORKED = ("working", "blocked", "done")
-
-# One sound per state, so the user can tell them apart without looking.
-# terminal-notifier maps these names to macOS system sounds.
-_SOUND = {
-    "blocked": "Funk",
-    "done": "Glass",
-}
 
 _TITLE_TPL = {
     "blocked": "Agent needs input",
@@ -147,34 +146,88 @@ def _derive_display(
     return None
 
 
-def _notify(window: Window, kind: str, display: str) -> None:
-    """Fire an edge-triggered desktop notification via terminal-notifier."""
-    title = _TITLE_TPL.get(display, "Agent")
+def _notify(boss: Boss, window: Window, kind: str, display: str) -> None:
+    """Fire an edge-triggered notification through kitty's own manager."""
+    if OnlyWhen is None:
+        return
+    manager = getattr(boss, "notification_manager", None)
+    if manager is None:
+        return
     label = (kind or "agent").strip() or "agent"
-    title_text = window.title or label
-    # -group keeps one notification per window and state, instead of a stack in
-    # Notification Center. Activating one focuses kitty, which is the default.
     try:
-        subprocess.Popen(
-            [
-                "terminal-notifier",
-                "-title",
-                f"{title} ({label})",
-                "-message",
-                title_text,
-                "-sound",
-                _SOUND.get(display, "default"),
-                "-group",
-                f"kitty-agent-{window.id}-{display}",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
+        cmd = manager.create_notification_cmd()
+        cmd.title = f"{_TITLE_TPL.get(display, 'Agent')} ({label})"
+        # A window title is whatever the program in it last wrote. kitty
+        # sanitizes both title and body itself, in finalise().
+        cmd.body = window.title or label
+        # One identifier per window and state, so a repeat of the same state
+        # replaces its own banner and blocked and done coexist.
+        cmd.identifier = f"cattery-{window.id}-{display}"
+        cmd.application_name = "cattery"
+        cmd.notification_types = (f"agent-{display}",)
+        # For Linux. kitty's cocoa switch on urgency has no break, so on macOS
+        # every notification arrives at the same level whatever is asked for.
+        cmd.urgency = Urgency.Critical if display == "blocked" else Urgency.Normal
+        # macOS cannot pick a sound per state, only sound or no sound.
+        cmd.sound_name = "silent"
+        # Already the default, which does not gate on focus either. Said out
+        # loud because _apply has decided this window is unfocused, and a
+        # default that began consulting kitty's own idea of focus would ask
+        # that question a second time.
+        cmd.only_when = OnlyWhen.always
+        # No Action.focus: _activated focuses instead, so pressing the button
+        # does not also drag the user to the agent window.
+        cmd.actions = frozenset()
+        # No button when there is nothing to launch, rather than one that
+        # silently does nothing.
+        cmd.buttons = ("Open picker",) if _picker_binary() else ()
+        cmd.on_activation = partial(_activated, boss, window.id)
+        manager.notify_with_command(cmd, window.id)
+    except Exception as err:
+        # kitty's notification API is internal and can change shape. The tab
+        # marker still shows the state, so this is the only trace left of a
+        # notification path that has stopped working.
+        log_error(f"cattery: notification failed: {err}")
+
+
+def _activated(boss: Boss, window_id: int, cmd: Any, button: int) -> None:
+    """Handle a press on the banner. Button 0 is the body, 1 the first button."""
+    if button == 1:
+        _open_picker(boss)
+        return
+    # The window may have closed between the notification and the press.
+    target = boss.window_id_map.get(window_id)
+    if target is not None:
+        # on_focus_change marks it seen, which drops the done marker.
+        #
+        # The token comes from the command because kitty's own focus path,
+        # which is the only other thing that passes one, is off: `actions` is
+        # empty. A Wayland compositor with focus-stealing prevention discards a
+        # raise that carries no token.
+        boss.set_active_window(
+            target,
+            switch_os_window_if_needed=True,
+            activation_token=getattr(cmd, "activation_token", ""),
         )
-    except (OSError, FileNotFoundError):
-        # terminal-notifier is missing or blocked by a sandbox. Stay silent;
-        # the tab marker still shows the state.
-        pass
+
+
+def _open_picker(boss: Boss) -> None:
+    """Launch the picker, which setup names in the managed kitty.conf block."""
+    binary = _picker_binary()
+    if not binary:
+        # An install predating the env line. There is nothing to launch.
+        return
+    boss.launch("--type=overlay", "--copy-colors", binary)
+
+
+def _picker_binary() -> str:
+    """Where the picker is, as setup wrote it into the managed kitty.conf block.
+
+    The watcher is a static installed file with no way to know where the binary
+    lives, and it cannot look it up on PATH: a kitty started from the Dock has
+    launchd's, which has no Homebrew.
+    """
+    return get_options().env.get("CATTERY_BIN", "")
 
 
 def _publish(boss: Boss, window: Window, frm: str | None, to: str) -> None:
@@ -348,7 +401,7 @@ def _apply(boss: Boss, window: Window) -> None:
         _update_os_title(boss, window.os_window_id)
 
         if display in _ATTENTION and not window.is_focused:
-            _notify(window, kind, display)
+            _notify(boss, window, kind, display)
 
         _publish(boss, window, prev, display)
 

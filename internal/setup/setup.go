@@ -182,8 +182,9 @@ func KittyDir() (string, error) {
 	return resolveDir("", "KITTY_CONFIG_DIRECTORY", ".config", "kitty")
 }
 
-// Stale reports whether the kitty files installed in dir have fallen behind the
-// copies embedded in this binary. That happens when an upgrade changes one of
+// Stale reports whether the install in dir has fallen behind this binary: the
+// copies of the kitty files, and the managed kitty.conf block, which carries
+// settings those files depend on. That happens when an upgrade changes one of
 // them and setup has not run since.
 //
 // A directory holding none of the files is not stale: cattery may not be
@@ -208,7 +209,17 @@ func Stale(dir string) bool {
 			return true
 		}
 	}
-	return installed > 0 && missing > 0
+	if installed == 0 {
+		return false
+	}
+	if missing > 0 {
+		return true
+	}
+	conf, err := os.ReadFile(filepath.Join(dir, "kitty.conf"))
+	if err != nil {
+		return false
+	}
+	return blockStale(string(conf))
 }
 
 // legacyPaths are what install.sh linked into place.

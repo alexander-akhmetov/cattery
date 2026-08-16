@@ -1,21 +1,22 @@
 """Unit tests for kitty/cattery_watcher.py, the kitty agent-state watcher.
 
 The watcher imports kitty internals that exist only inside a running kitty, so
-this stubs `kitty.boss`, `kitty.window`, and `kitty.fast_data_types` before
-loading it. Everything under test then runs outside kitty. `_derive_display` is
-a function of state plus bookkeeping. `_update_os_title` walks the tab manager
-and calls one C function, which the stub records and refuses inside
-`FAIL_TITLE_WRITES`. `_apply` and the watcher entry points drive `FakeWindow`,
-which stores user variables the way kitty does.
+this stubs `kitty.boss`, `kitty.window`, `kitty.fast_data_types`, `kitty.utils`,
+and `kitty.notifications` before loading it. Everything under test then runs
+outside kitty. `_derive_display` is a function of state plus bookkeeping.
+`_update_os_title` walks the tab manager and calls one C function, which the
+stub records and refuses inside `FAIL_TITLE_WRITES`. `_apply` and the watcher
+entry points drive `FakeWindow`, which stores user variables the way kitty does.
 
-Notifications go through `subprocess.Popen`, which `WatcherTestCase` replaces
-with a recorder, so no test starts terminal-notifier. The transition datagrams
-go through `socket.socket`, which `PublishTest` replaces the same way, so no
-test opens one.
+Notifications go through `boss.notification_manager`, which `FakeBoss` supplies
+as a `RecordingNotifications`, so no test reaches a desktop. The transition
+datagrams go through `socket.socket`, which `PublishTest` replaces with a
+recorder, so no test opens one.
 
 Run with `make test-python`.
 """
 
+import enum
 import errno
 import importlib.util
 import json
@@ -29,8 +30,48 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# What the stubbed get_options() reports as kitty.conf's `env` directives. The
+# watcher reads CATTERY_BIN out of it to find the picker.
+KITTY_ENV: dict[str, str] = {}
+
 # Titles pushed through the stubbed set_os_window_title, as (os_window_id, title).
 TITLE_CALLS: list[tuple[int, str]] = []
+
+# Messages the watcher sent to kitty's log.
+LOG_CALLS: list[str] = []
+
+# The fields kitty's NotificationCommand carries, from
+# `NotificationCommand.__annotations__` in kitty 0.48.1. The double below takes
+# these and nothing else, so a write to a field kitty does not have fails here
+# instead of going out as a notification missing its identifier or its buttons.
+# A kitty upgrade that renames one is a change to this list.
+NOTIFICATION_FIELDS = (
+    "title",
+    "body",
+    "actions",
+    "only_when",
+    "urgency",
+    "icon_data_key",
+    "icon_names",
+    "application_name",
+    "notification_types",
+    "timeout",
+    "buttons",
+    "sound_name",
+    "on_activation",
+    "on_close",
+    "on_update",
+    "identifier",
+    "done",
+    "channel_id",
+    "desktop_notification_id",
+    "close_response_requested",
+    "icon_path",
+    "current_payload_type",
+    "current_payload_buffer",
+    "created_by_desktop",
+    "activation_token",
+)
 
 
 class _FailTitleWrites:
@@ -65,12 +106,23 @@ def _load_watcher():
         TITLE_CALLS.append((os_window_id, title))
 
     fast_mod.set_os_window_title = set_os_window_title
+    fast_mod.get_options = lambda: types.SimpleNamespace(env=KITTY_ENV)
+
+    utils_mod = types.ModuleType("kitty.utils")
+    utils_mod.log_error = LOG_CALLS.append
+
+    notifications_mod = types.ModuleType("kitty.notifications")
+    notifications_mod.OnlyWhen = enum.Enum("OnlyWhen", ["unset", "always", "unfocused", "invisible"])
+    notifications_mod.Urgency = enum.Enum("Urgency", ["Low", "Normal", "Critical"])
+
     sys.modules.update(
         {
             "kitty": kitty,
             "kitty.boss": boss_mod,
             "kitty.window": window_mod,
             "kitty.fast_data_types": fast_mod,
+            "kitty.utils": utils_mod,
+            "kitty.notifications": notifications_mod,
         }
     )
 
@@ -155,28 +207,58 @@ class FakeTabManager:
         self.dirty += 1
 
 
+class FakeNotificationCommand:
+    """What kitty hands out of create_notification_cmd, for filling in.
+
+    __slots__ is the point: the real class has none, so `cmd.identifer = ...`
+    would take the typo, raise nothing, and go out as a notification with no
+    identifier. Here it raises.
+    """
+
+    __slots__ = NOTIFICATION_FIELDS
+
+
+class RecordingNotifications:
+    """Stand-in for boss.notification_manager.
+
+    Setting `error` makes the send raise, which is the shape of kitty's
+    internal API changing under the watcher.
+    """
+
+    def __init__(self):
+        # Every send, as (cmd, channel_id).
+        self.calls = []
+        self.error = None
+
+    def create_notification_cmd(self):
+        return FakeNotificationCommand()
+
+    def notify_with_command(self, cmd, channel_id):
+        if self.error is not None:
+            raise self.error
+        self.calls.append((cmd, channel_id))
+        return 1
+
+
 class FakeBoss:
-    def __init__(self, tab_manager=None, os_window_id=1):
+    def __init__(self, tab_manager=None, os_window_id=1, windows=()):
         self.os_window_map = {os_window_id: tab_manager} if tab_manager else {}
+        self.notification_manager = RecordingNotifications()
+        self.window_id_map = {w.id: w for w in windows}
+        # Every focus, as (window, switch, token), and every launch, as its argv.
+        self.focused = []
+        self.launched = []
+
+    def set_active_window(self, window, switch_os_window_if_needed=False, activation_token=""):
+        self.focused.append((window, switch_os_window_if_needed, activation_token))
+
+    def launch(self, *args):
+        self.launched.append(args)
 
 
 def boss_for(windows, active=None):
     """One OS window (id 1) holding one tab of `windows`."""
-    return FakeBoss(FakeTabManager(windows, active=active))
-
-
-class RecordingPopen:
-    """Stand-in for subprocess.Popen. It records argv, or raises `error`."""
-
-    def __init__(self):
-        self.calls = []
-        self.error = None
-
-    def __call__(self, argv, **kwargs):
-        if self.error is not None:
-            raise self.error
-        self.calls.append(argv)
-        return None
+    return FakeBoss(FakeTabManager(windows, active=active), windows=windows)
 
 
 class RecordingSocket:
@@ -230,10 +312,8 @@ class WatcherTestCase(unittest.TestCase):
 
     def setUp(self):
         TITLE_CALLS.clear()
-        self.popen = RecordingPopen()
-        patcher = mock.patch.object(watcher.subprocess, "Popen", self.popen)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        KITTY_ENV.clear()
+        LOG_CALLS.clear()
 
 
 class DeriveDisplayTest(unittest.TestCase):
@@ -371,7 +451,7 @@ class ApplyTest(WatcherTestCase):
         watcher._apply(boss, window)
 
         self.assertEqual(window.keys_written(), ["AGENT_DISPLAY", "AGENT_SINCE"])
-        self.assertEqual(len(self.popen.calls), 1, "one notification per edge")
+        self.assertEqual(len(boss.notification_manager.calls), 1, "one notification per edge")
 
     def test_a_cleared_state_drops_the_watcher_variables(self):
         window = FakeWindow(1, state="working", kind="claude")
@@ -405,39 +485,140 @@ class ApplyTest(WatcherTestCase):
         ]
         for name, state, prev, focused, want_display, want_notification in cases:
             with self.subTest(name):
-                self.popen.calls.clear()
                 window = FakeWindow(1, display=prev, state=state, kind="claude", focused=focused)
                 boss = boss_for([window])
 
                 watcher._apply(boss, window)
 
                 self.assertEqual(window.user_vars.get("AGENT_DISPLAY"), want_display)
-                self.assertEqual(len(self.popen.calls), 1 if want_notification else 0)
+                self.assertEqual(len(boss.notification_manager.calls), 1 if want_notification else 0)
 
     def test_the_notification_names_the_agent_and_the_window(self):
+        KITTY_ENV["CATTERY_BIN"] = "/opt/homebrew/bin/cattery"
         window = FakeWindow(1, display="working", state="idle", kind="pi", title="~/projects/cattery")
         boss = boss_for([window])
 
         watcher._apply(boss, window)
 
-        argv = self.popen.calls[0]
-        self.assertEqual(argv[0], "terminal-notifier")
-        self.assertIn("Agent finished (pi)", argv)
-        self.assertIn("~/projects/cattery", argv)
-        # One group per window and state, so a repeat replaces instead of
-        # stacking.
-        self.assertIn("kitty-agent-1-done", argv)
+        cmd, channel_id = boss.notification_manager.calls[0]
+        self.assertEqual(cmd.title, "Agent finished (pi)")
+        self.assertEqual(cmd.body, "~/projects/cattery")
+        self.assertEqual(channel_id, window.id)
+        # One identifier per window and state, so a repeat replaces its own
+        # banner instead of stacking, and blocked and done coexist.
+        self.assertEqual(cmd.identifier, "cattery-1-done")
+        self.assertEqual(cmd.sound_name, "silent")
+        self.assertEqual(cmd.buttons, ("Open picker",))
+        # Asking kitty for no action of its own is what keeps a button press
+        # from also focusing the agent window.
+        self.assertEqual(cmd.actions, frozenset())
 
-    def test_a_missing_notifier_still_leaves_the_state_published(self):
-        # Linux has no terminal-notifier, and a sandbox can block it. The tab
-        # marker is the part that has to survive.
-        self.popen.error = FileNotFoundError("terminal-notifier")
+    def test_the_button_is_left_off_when_there_is_nothing_to_launch(self):
+        # An install predating the `env CATTERY_BIN` line in kitty.conf. A
+        # button that silently does nothing is worse than no button.
         window = FakeWindow(1, display="working", state="idle", kind="claude")
         boss = boss_for([window])
 
         watcher._apply(boss, window)
 
-        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "done")
+        cmd, _ = boss.notification_manager.calls[0]
+        self.assertEqual(cmd.buttons, ())
+
+    def test_a_failing_notification_still_leaves_the_state_published(self):
+        # kitty's notification API is internal, and an older kitty has none at
+        # all. The tab marker is the part that has to survive.
+        cases = [
+            # name, break it, whether the failure is logged
+            ("no manager", lambda boss: delattr(boss, "notification_manager"), False),
+            ("send raises", lambda boss: setattr(boss.notification_manager, "error", RuntimeError("gone")), True),
+            # What the guarded import leaves behind on a kitty too old to have
+            # kitty.notifications at all.
+            ("no notification module", lambda boss: setattr(watcher, "OnlyWhen", None), False),
+        ]
+        self.addCleanup(setattr, watcher, "OnlyWhen", watcher.OnlyWhen)
+        for name, break_it, want_log in cases:
+            with self.subTest(name):
+                LOG_CALLS.clear()
+                window = FakeWindow(1, display="working", state="idle", kind="claude")
+                boss = boss_for([window])
+                # Held onto, because a case is free to take it off the boss.
+                manager = boss.notification_manager
+                break_it(boss)
+
+                watcher._apply(boss, window)
+
+                self.assertEqual(window.user_vars["AGENT_DISPLAY"], "done")
+                self.assertEqual(manager.calls, [], "a half-built notification went out")
+                # An API that changed shape leaves a trace in kitty's log.
+                # Having none at all is expected, not a failure to report.
+                self.assertEqual(len(LOG_CALLS), 1 if want_log else 0)
+
+
+class ActivationTest(WatcherTestCase):
+    """What a press on the banner does. Button 0 is the body, 1 the button."""
+
+    def _activation(self, window, boss):
+        watcher._apply(boss, window)
+        cmd, _ = boss.notification_manager.calls[0]
+        return cmd.on_activation
+
+    def _pressed(self, token=""):
+        """The command kitty hands back, carrying whatever token it collected."""
+        cmd = FakeNotificationCommand()
+        cmd.activation_token = token
+        return cmd
+
+    def test_the_body_focuses_the_window_it_came_from(self):
+        window = FakeWindow(1, display="working", state="idle", kind="claude")
+        boss = boss_for([window])
+
+        self._activation(window, boss)(self._pressed(), 0)
+
+        # switch_os_window_if_needed, or an agent in another OS window stays
+        # hidden behind the one in front.
+        self.assertEqual(boss.focused, [(window, True, "")])
+        self.assertEqual(boss.launched, [])
+
+    def test_the_focus_carries_the_activation_token(self):
+        # kitty's own focus path is off, and it is the only other thing that
+        # passes the token on. Without one, a Wayland compositor with
+        # focus-stealing prevention drops the raise and the marker stays.
+        window = FakeWindow(1, display="working", state="idle", kind="claude")
+        boss = boss_for([window])
+
+        self._activation(window, boss)(self._pressed("xdg-token"), 0)
+
+        self.assertEqual(boss.focused, [(window, True, "xdg-token")])
+
+    def test_a_window_that_closed_first_is_ignored(self):
+        window = FakeWindow(1, display="working", state="idle", kind="claude")
+        boss = boss_for([window])
+        activation = self._activation(window, boss)
+        del boss.window_id_map[window.id]
+
+        activation(self._pressed(), 0)
+
+        self.assertEqual(boss.focused, [])
+
+    def test_the_button_opens_the_picker_without_focusing_the_agent(self):
+        KITTY_ENV["CATTERY_BIN"] = "/opt/homebrew/bin/cattery"
+        window = FakeWindow(1, display="working", state="idle", kind="claude")
+        boss = boss_for([window])
+
+        self._activation(window, boss)(self._pressed(), 1)
+
+        self.assertEqual(boss.launched, [("--type=overlay", "--copy-colors", "/opt/homebrew/bin/cattery")])
+        self.assertEqual(boss.focused, [], "the button must not drag the user to the agent")
+
+    def test_an_install_with_no_binary_path_launches_nothing(self):
+        # The banner carries no button in this case, but kitty.conf can also
+        # lose the line between the notification and the press.
+        window = FakeWindow(1, display="working", state="idle", kind="claude")
+        boss = boss_for([window])
+
+        self._activation(window, boss)(self._pressed(), 1)
+
+        self.assertEqual(boss.launched, [])
 
 
 class PublishTest(WatcherTestCase):
@@ -626,7 +807,7 @@ class PublishTest(WatcherTestCase):
 
         self.assertEqual(window.user_vars["AGENT_DISPLAY"], "done")
         self.assertEqual(boss.os_window_map[1].dirty, 1)
-        self.assertEqual(len(self.popen.calls), 1, "the notification still fired")
+        self.assertEqual(len(boss.notification_manager.calls), 1, "the notification still fired")
 
     def test_nobody_registered_means_no_socket_at_all(self):
         window = FakeWindow(1, state="working", kind="claude")

@@ -119,6 +119,7 @@ func TestFreshInstall(t *testing.T) {
 		"tab_bar_style powerline",
 		`tab_title_template "{custom}"`,
 		"map opt+a>opt+a launch --type=overlay --cwd=current --copy-colors " + testBinary,
+		"env CATTERY_BIN=" + testBinary,
 	} {
 		if !strings.Contains(conf, want) {
 			t.Errorf("kitty.conf missing %q, got:\n%s", want, conf)
@@ -414,6 +415,23 @@ func TestKittyConfWithBrokenMarkersIsLeftAlone(t *testing.T) {
 	}
 	if !strings.Contains(out, "kept") || !strings.Contains(out, blockStart) {
 		t.Errorf("report does not explain the problem or print the block, got:\n%s", out)
+	}
+}
+
+// The two lines naming the binary quote it differently, and a path with a space
+// is where that shows. `launch` splits its command shell-style, so the picker
+// binding needs the quotes; kitty's `env` takes the rest of the line as the
+// value, so the same quotes would end up in what the watcher reads.
+func TestRenderBlockQuotesOnlyTheBinding(t *testing.T) {
+	block := renderBlock("/opt/my apps/cattery")
+
+	for _, want := range []string{
+		"--copy-colors '/opt/my apps/cattery'",
+		envBinary + "/opt/my apps/cattery\n",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("block missing %q, got:\n%s", want, block)
+		}
 	}
 }
 
@@ -857,6 +875,41 @@ func TestStale(t *testing.T) {
 				}
 			},
 			want: true,
+		},
+		{
+			// The block carries settings the installed files depend on, so a
+			// release touching only renderBlock has to warn as well.
+			name:    "an edited block is stale",
+			install: true,
+			prepare: func(t *testing.T, h *harness) {
+				t.Helper()
+				conf := h.read(h.kittyPath("kitty.conf"))
+				h.write(h.kittyPath("kitty.conf"), strings.Replace(conf, envBinary+testBinary+"\n", "", 1))
+			},
+			want: true,
+		},
+		{
+			// The install names its own binary. Where that binary is says
+			// nothing about which release wrote the block.
+			name:    "another binary path is not stale",
+			install: true,
+			prepare: func(t *testing.T, h *harness) {
+				t.Helper()
+				conf := h.read(h.kittyPath("kitty.conf"))
+				h.write(h.kittyPath("kitty.conf"), strings.ReplaceAll(conf, testBinary, "/usr/local/bin/cattery"))
+			},
+			want: false,
+		},
+		{
+			// What setup itself leaves behind when it cannot merge. It said so
+			// while it ran, and the picker has nothing to add.
+			name:    "a conf with no block is not stale",
+			install: true,
+			prepare: func(t *testing.T, h *harness) {
+				t.Helper()
+				h.write(h.kittyPath("kitty.conf"), "font_size 13\n")
+			},
+			want: false,
 		},
 		{
 			// Nothing was installed here, so nothing can be behind.

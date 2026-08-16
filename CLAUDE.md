@@ -144,6 +144,38 @@ the picker compares the installed files with the embedded ones and warns.
   pane in copy mode without the program ever seeing it. So `Send` returning nil
   does not mean the agent received anything, and read-write is bound to an agent
   key that every reload rechecks.
+- The watcher runs inside kitty's own Python, so it notifies through
+  `boss.notification_manager` rather than an OSC 99 escape. The escape would
+  need `a=report` for its buttons, and kitty writes that activation response
+  into the channel that sent it, which here is the *agent's* stdin. The manager
+  takes an `on_activation` callback instead, and calls it whatever `actions`
+  holds. `actions = frozenset()` is what stops kitty focusing the agent window
+  itself when the picker button is the thing that was pressed.
+- `_activated` has to pass `cmd.activation_token` to `set_active_window`.
+  kitty's own focus path is the only other thing that passes one, and
+  `actions = frozenset()` turns it off. A Wayland compositor with
+  focus-stealing prevention discards a raise that carries no token, so without
+  it the click neither raises the window nor marks the agent seen. Empty on
+  macOS and X11, which is why it is easy to miss.
+- `cmd.urgency` does nothing on macOS. kitty's `schedule_notification` in
+  `kitty/cocoa_window.m` switches on urgency with no `break` in any case, so
+  every notification arrives at the `Active` level. Setting it is still right
+  for Linux. The fall-through is also what keeps `Urgency.Critical` safe:
+  `UNNotificationInterruptionLevelCritical` needs the Critical Alerts
+  entitlement, which kitty.app does not carry, so a fixed switch could make
+  macOS reject exactly the `blocked` banners.
+- `env CATTERY_BIN` in the managed kitty.conf block is how the installed watcher
+  learns where the binary is. It is a static file with no way to know, and it
+  cannot look the binary up on PATH for the same reason the picker cannot. That
+  line must not be `shellQuote`d: kitty's `env` takes the rest of the line as
+  the value, quotes included, while `launch` on the line above splits
+  shell-style and needs them. It does expand `$VAR` in the value.
+- `setup.Stale` compares the installed kitty files *and* the managed kitty.conf
+  block, because the block carries settings those files depend on. A release
+  that changes only `renderBlock` leaves every file identical, and the watcher
+  would then lose the new line with nothing said. The comparison re-renders the
+  block with the binary path the installed block itself names, since that part
+  belongs to the install rather than to the release.
 - The kitty watcher keeps its seen windows in `boss._agent_seen`, a set inside
   kitty's own process. Nothing outside kitty can reach it, so the picker
   publishes `AGENT_SEEN` and `on_set_user_var` picks it up and clears it. That

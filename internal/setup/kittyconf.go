@@ -14,6 +14,9 @@ const (
 	blockEnd   = "# <<< cattery <<<"
 )
 
+// envBinary starts the line naming the picker binary for the installed watcher.
+const envBinary = "env CATTERY_BIN="
+
 // renderBlock builds the managed kitty.conf block. It launches the picker by
 // absolute path instead of through a shell script, so an install needs nothing
 // outside the binary.
@@ -28,8 +31,71 @@ func renderBlock(binary string) string {
 		"tab_bar_style powerline",
 		`tab_title_template "{custom}"`,
 		"map opt+a>opt+a launch --type=overlay --cwd=current --copy-colors " + shellQuote(binary),
+		// How the installed watcher finds the picker: it is a static file with
+		// no way to know where the binary is. Unquoted, unlike the `map` line
+		// above, because kitty's `env` takes the rest of the line as the value,
+		// quotes included, while `launch` splits shell-style. It does expand
+		// $VAR in that value, so a path holding a literal `$` arrives rewritten.
+		// This also exports CATTERY_BIN into every shell kitty starts.
+		envBinary + binary,
 		blockEnd,
 	}, "\n") + "\n"
+}
+
+// blockStale reports whether the managed block in conf has fallen behind what
+// renderBlock writes now. The installed files are only half the install: a
+// release that changes only renderBlock leaves every one of them identical,
+// while the installed watcher silently loses whatever the new line was meant to
+// give it, which today is the picker's path.
+//
+// The comparison re-renders with the binary the block itself names, because
+// that is the one part of the block that belongs to the install and not to the
+// release. A conf with no managed block is left alone: setup reports that case
+// while it runs, and there is nothing the picker could add.
+func blockStale(conf string) bool {
+	block, ok := extractBlock(conf)
+	if !ok {
+		return false
+	}
+	return block != renderBlock(blockBinary(block))
+}
+
+// extractBlock returns the managed block, exactly as renderBlock would have
+// written it. Markers that do not pair up are the case mergeBlock refuses, so
+// there is no block to compare.
+func extractBlock(conf string) (string, bool) {
+	lines := strings.Split(conf, "\n")
+	start, end := -1, -1
+	for i, line := range lines {
+		switch strings.TrimSpace(line) {
+		case blockStart:
+			if start >= 0 {
+				return "", false
+			}
+			start = i
+		case blockEnd:
+			if end >= 0 {
+				return "", false
+			}
+			end = i
+		}
+	}
+	if start < 0 || end < start {
+		return "", false
+	}
+	return strings.Join(lines[start:end+1], "\n") + "\n", true
+}
+
+// blockBinary is the picker path a managed block names. A block written before
+// the env line has none, and renders as a block for the empty path, which
+// matches nothing and is therefore stale.
+func blockBinary(block string) string {
+	for line := range strings.SplitSeq(block, "\n") {
+		if path, ok := strings.CutPrefix(line, envBinary); ok {
+			return path
+		}
+	}
+	return ""
 }
 
 // mergeBlock puts block into conf. It replaces an existing managed block, or

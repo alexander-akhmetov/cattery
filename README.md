@@ -42,8 +42,22 @@ lists the commands, and `cattery help <command>` says what one of them does.
 
 A `working` or `blocked` tab also shows elapsed minutes. An OS window holding a
 `blocked` or `done` agent gets a `(N need you)` title prefix, which the Dock and
-the ⌘-Tab switcher pick up. A notification fires on entry to `blocked` or
-`done`, unless that window has focus.
+the ⌘-Tab switcher pick up.
+
+A notification fires on entry to `blocked` or `done`, unless that window has
+focus. kitty sends it, so nothing beyond kitty needs installing. Clicking the
+body focuses that exact window, switching OS window if it is in another one,
+which marks the agent seen and drops its marker. The banner also carries an
+**Open picker** button, which opens the overlay and leaves focus where it is. On
+macOS that button is a drop-down menu, which appears when you hover the banner.
+The button needs the binary path `cattery setup` writes into kitty.conf, so an
+install older than this version gets a banner with no button. Each window and
+state gets its own banner, so a repeat replaces itself and a `blocked` does not
+take a `done` away.
+
+Notifications are silent, because macOS cannot pick a sound per state. `blocked`
+asks for a higher urgency instead, which Linux honours. macOS ignores it today,
+so there a `blocked` banner looks the same as a `done` one.
 
 No agent writes `done`. The watcher derives it when the agent goes idle after
 working and you have not focused the window since. Focusing the window marks it
