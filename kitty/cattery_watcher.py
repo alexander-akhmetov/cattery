@@ -1,12 +1,14 @@
 """
 cattery_watcher: kitty global watcher. It turns the per-window AGENT_STATE that
-pi, Claude Code and Codex publish into a display state that also knows whether
-the user has looked at the window.
+pi, Claude Code, Codex and opencode publish into a display state that also knows
+whether the user has looked at the window.
 
 Contract:
-    AGENT_KIND        "pi" | "claude" | "codex"          (set by the agent)
+    AGENT_KIND        "pi" | "claude" | "codex" | "opencode"
+                      (set by the agent)
     AGENT_STATE       "working" | "blocked" | "idle"     (set by the agent)
-    AGENT_TOOL        the tool call running now          (set by the agent, pi only)
+    AGENT_TOOL        the tool call running now          (set by the agent,
+                      pi and opencode only)
     AGENT_TOOL_SINCE  unix seconds when that call started (set by the agent)
     AGENT_DISPLAY     "working" | "stalled" | "blocked" | "done" | "idle"
                       (set here, read by cattery_tab.py and the kittens)
@@ -73,12 +75,12 @@ except ImportError:  # kitty older than the notification manager
 # it, which keeps it from surviving as stale state on the window.
 _SEEN_KEY = "AGENT_SEEN"
 
-# The key naming the tool call in flight, and the only agent kind that writes
-# it. AGENT_TOOL_SINCE is deliberately not an input key: the writer sets it
-# first, so reacting to it would apply the new timestamp against the previous
-# label.
+# The key naming the tool call in flight, and the agent kinds that write it.
+# AGENT_TOOL_SINCE is deliberately not an input key: the writer sets it first, so
+# reacting to it would apply the new timestamp against the previous label.
+# Keep _TOOL_KINDS in step with toolKinds in internal/agent.
 _TOOL_KEY = "AGENT_TOOL"
-_TOOL_KIND = "pi"
+_TOOL_KINDS = ("pi", "opencode")
 
 # The keys the watcher reacts to. AGENT_DISPLAY is its own output, and ignoring
 # it breaks the feedback loop. Other software's user variables stop here too.
@@ -421,13 +423,13 @@ def _redraw(boss: Boss, window: Window) -> None:
 def _tool_since(window: Window) -> float | None:
     """When the tool call this window is running started, or None.
 
-    Only pi publishes the pair, and only pi clears it. A window outlives its
-    agents and `cattery state clear` drops AGENT_STATE, AGENT_KIND and AGENT_MSG
-    and nothing else, so a pi killed mid-call leaves its label standing: without
-    the kind test the Claude started in that window would go stalled, and
-    notify, inside its first second.
+    Only pi and opencode publish the pair, and only they clear it. A window
+    outlives its agents and `cattery state clear` drops AGENT_STATE, AGENT_KIND
+    and AGENT_MSG and nothing else, so a pi killed mid-call leaves its label
+    standing: without the kind test the Claude started in that window would go
+    stalled, and notify, inside its first second.
     """
-    if window.user_vars.get("AGENT_KIND") != _TOOL_KIND:
+    if window.user_vars.get("AGENT_KIND") not in _TOOL_KINDS:
         return None
     if not window.user_vars.get(_TOOL_KEY):
         return None

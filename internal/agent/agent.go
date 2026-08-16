@@ -8,6 +8,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -255,13 +256,20 @@ func UnixSeconds(raw string) time.Time {
 	return time.Unix(secs, 0)
 }
 
-// KindPi is the only agent kind that publishes the running-tool pair.
-const KindPi = "pi"
+// The agent kinds that publish the running-tool pair. Claude and Codex have no
+// per-tool-call hook, so neither reports one and neither can reach "stalled".
+// Keep this in step with _TOOL_KINDS in kitty/cattery_watcher.py.
+const (
+	KindPi       = "pi"
+	KindOpencode = "opencode"
+)
+
+var toolKinds = []string{KindPi, KindOpencode}
 
 // PublishesTool reports whether the tool pair on a window or a pane belongs to
 // the agent reading it now. Two things have to hold.
 //
-// The kind has to be the one that publishes it. A window or a pane outlives its
+// The kind has to be one that publishes it. A window or a pane outlives its
 // agents, and `cattery state clear` drops the state, the kind and the message
 // and nothing else, so a pi killed mid-call leaves its label standing: without
 // the kind test the Claude started in that window reads as stalled from its
@@ -272,7 +280,7 @@ const KindPi = "pi"
 // publishes that one itself, and dropping the label there would take the tool
 // line off the row it exists for.
 func PublishesTool(kind, display string) bool {
-	return kind == KindPi && (display == "working" || display == "stalled")
+	return slices.Contains(toolKinds, kind) && (display == "working" || display == "stalled")
 }
 
 // StallThreshold is how long one tool call has to run before an agent is shown

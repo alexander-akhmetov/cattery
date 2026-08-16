@@ -92,6 +92,128 @@ func TestWriteUpdateOrder(t *testing.T) {
 			},
 		},
 		{
+			// AGENT_TOOL_SINCE before AGENT_TOOL, because AGENT_TOOL is the key
+			// the kitty watcher reacts to: the other order would have it read the
+			// previous call's timestamp against the new label.
+			name:  "an opencode tool pair goes between the prompt and the state",
+			kind:  "opencode",
+			state: "working",
+			stdin: strings.NewReader(
+				`{"session_id":"ses_8a3f","prompt":"fix the picker","tool":"bash: go test ./...","tool_since":1755302096}`),
+			want: []Var{
+				set(varKind, "opencode"),
+				set(varResume, "opencode --session ses_8a3f"),
+				set(varMsg, "fix the picker"),
+				set(varToolSince, "1755302096"),
+				set(varTool, "bash: go test ./..."),
+				set(varState, "working"),
+			},
+		},
+		{
+			// The turn ended. An empty label deletes both, so the picker's tool
+			// line goes with the call rather than outliving it.
+			name:  "an empty opencode tool deletes the pair",
+			kind:  "opencode",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"ses_8a3f","tool":"","tool_since":0}`),
+			want: []Var{
+				set(varKind, "opencode"),
+				set(varResume, "opencode --session ses_8a3f"),
+				del(varToolSince),
+				del(varTool),
+				set(varState, "idle"),
+			},
+		},
+		{
+			// A label with no timestamp beside it shows what is running without
+			// an elapsed time, which beats wearing the previous call's start.
+			name:  "an opencode tool without a timestamp publishes the label alone",
+			kind:  "opencode",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"ses_8a3f","tool":"read: main.go"}`),
+			want: []Var{
+				set(varKind, "opencode"),
+				set(varResume, "opencode --session ses_8a3f"),
+				del(varToolSince),
+				set(varTool, "read: main.go"),
+				set(varState, "working"),
+			},
+		},
+		{
+			// A zero is not a timestamp: time.Unix(0, 0) is not IsZero, so the
+			// picker and the watcher would both read it as 1970 and call the
+			// call stalled inside its first second.
+			name:  "a zero timestamp is no timestamp",
+			kind:  "opencode",
+			state: "working",
+			stdin: strings.NewReader(`{"tool":"read: main.go","tool_since":0}`),
+			want: []Var{
+				set(varKind, "opencode"),
+				del(varToolSince),
+				set(varTool, "read: main.go"),
+				set(varState, "working"),
+			},
+		},
+		{
+			// Every kind goes through this batch, and only opencode sends the
+			// tool fields, so a payload without them publishes no pair.
+			name:  "a claude batch carries no tool pair",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"s1","prompt":"fix the picker"}`),
+			want: []Var{
+				set(varKind, "claude"),
+				set(varResume, "claude --resume s1"),
+				set(varMsg, "fix the picker"),
+				set(varState, "working"),
+			},
+		},
+		{
+			// \x1f separates the fields of a `tmux list-panes` row, so one in a
+			// published value takes the agent out of the picker with nothing
+			// said. unicode.IsSpace is false for it, so the whitespace fold
+			// above does not cover it.
+			name:  "a control character in the prompt becomes a space",
+			state: "working",
+			stdin: strings.NewReader(`{"prompt":"fix\u001fthe picker"}`),
+			want:  []Var{set(varKind, "claude"), set(varMsg, "fix the picker"), set(varState, "working")},
+		},
+		{
+			// Every value goes through the same strip, not the prompt alone: a
+			// session id is agent-supplied too, and AGENT_RESUME travels the
+			// same tmux row. The quoting runs first, on the raw id, so what
+			// reaches the row is one quoted word with a space in it.
+			name:  "a control character in the session id becomes a space",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"s\u001f1"}`),
+			want:  []Var{set(varKind, "claude"), set(varResume, "claude --resume 's 1'"), set(varState, "working")},
+		},
+		{
+			name:  "a control character in the tool label becomes a space too",
+			kind:  "opencode",
+			state: "working",
+			stdin: strings.NewReader(`{"tool":"bash: printf '\u009b2J'","tool_since":1755302096}`),
+			want: []Var{
+				set(varKind, "opencode"),
+				set(varToolSince, "1755302096"),
+				set(varTool, "bash: printf ' 2J'"),
+				set(varState, "working"),
+			},
+		},
+		{
+			// The label shares the picker's second line with the cwd and an
+			// elapsed time, and it is cut there rather than wrapped.
+			name:  "a tool label over the cap is cut",
+			kind:  "opencode",
+			state: "working",
+			stdin: strings.NewReader(`{"tool":"` + strings.Repeat("a", 250) + `","tool_since":1755302096}`),
+			want: []Var{
+				set(varKind, "opencode"),
+				set(varToolSince, "1755302096"),
+				set(varTool, strings.Repeat("a", toolLimit)),
+				set(varState, "working"),
+			},
+		},
+		{
 			// The picker draws AGENT_KIND in the row's chip as it stands, so a
 			// word no kind carries must not reach it.
 			name:  "an unrecognised kind falls back to claude",
@@ -334,6 +456,15 @@ func TestWriteResumeCommand(t *testing.T) {
 			want:  "codex resume 01a007b7-8332-7823-8d0b-8466548d24dc",
 		},
 		{
+			// opencode takes the id after --session, the way pi's own writer
+			// takes a transcript path.
+			name:  "opencode puts the id after --session",
+			kind:  "opencode",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"ses_8a3f"}`),
+			want:  "opencode --session ses_8a3f",
+		},
+		{
 			name:   "a Codex prefix carries the wrapper",
 			kind:   "codex",
 			state:  "working",
@@ -445,6 +576,7 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 		shared       string
 		claude       string
 		codex        string
+		opencode     string
 		want         string
 		wantResumeIn string
 	}{
@@ -492,6 +624,21 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 			want:         "",
 			wantResumeIn: "codex resume abc",
 		},
+		{
+			name:         "the opencode name wins for an opencode writer",
+			kind:         "opencode",
+			shared:       "nono run claude",
+			opencode:     "nono run opencode",
+			want:         "nono run opencode",
+			wantResumeIn: "nono run opencode --session abc",
+		},
+		{
+			name:         "opencode falls back to the shared name",
+			kind:         "opencode",
+			shared:       "nono run",
+			want:         "nono run",
+			wantResumeIn: "nono run --session abc",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -499,6 +646,7 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 			t.Setenv(envResumePrefix, tc.shared)
 			t.Setenv(envResumePrefixClaude, tc.claude)
 			t.Setenv(envResumePrefixCodex, tc.codex)
+			t.Setenv(envResumePrefixOpencode, tc.opencode)
 
 			w := New(tc.kind)
 			if w.ResumePrefix != tc.want {
@@ -533,6 +681,12 @@ func TestParseArgs(t *testing.T) {
 			args:      []string{"working", "--kind=codex"},
 			wantState: "working",
 			wantKind:  "codex",
+		},
+		{
+			name:      "the form the opencode plugin runs",
+			args:      []string{"working", "--kind", "opencode"},
+			wantState: "working",
+			wantKind:  "opencode",
 		},
 		{
 			name:      "the flag in front of the word",

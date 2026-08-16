@@ -73,6 +73,12 @@ func TestPublishesTool(t *testing.T) {
 		{name: "pi done", kind: "pi", display: "done"},
 		{name: "pi blocked", kind: "pi", display: "blocked"},
 		{name: "claude in a window a pi died in", kind: "claude", display: "working"},
+		{name: "opencode working", kind: "opencode", display: "working", want: true},
+		{name: "opencode stalled", kind: "opencode", display: "stalled", want: true},
+		{name: "opencode idle", kind: "opencode", display: "idle"},
+		// `cattery state clear` leaves AGENT_TOOL standing, so the dead agent's
+		// label would sit on the next agent's row and read as stalled at once.
+		{name: "claude in a window an opencode died in", kind: "claude", display: "working"},
 		// Codex has no per-tool-call hook, so no tool column and no stalled.
 		{name: "codex working", kind: "codex", display: "working"},
 		{name: "an untagged agent", display: "working"},

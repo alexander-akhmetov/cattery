@@ -94,6 +94,18 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 				"AGENT_MSG=fix the picker", "AGENT_STATE=working"},
 		},
 		{
+			// What the opencode plugin runs at a tool boundary. The tool pair
+			// travels on stdin beside the prompt, so the argv is the same shape
+			// the other two agents use.
+			name:  "--kind opencode carries the tool pair",
+			argv:  "working --kind opencode",
+			stdin: `{"session_id":"ses_8a3f","prompt":"fix the picker","tool":"bash: go test ./...","tool_since":1755302096}`,
+			want: []string{"@", "set-user-vars", "--match", "id:7",
+				"AGENT_KIND=opencode", "AGENT_RESUME=opencode --session ses_8a3f",
+				"AGENT_MSG=fix the picker", "AGENT_TOOL_SINCE=1755302096",
+				"AGENT_TOOL=bash: go test ./...", "AGENT_STATE=working"},
+		},
+		{
 			name: "a Codex clear deletes the same three",
 			argv: "clear --kind codex",
 			want: []string{"@", "set-user-vars", "--match", "id:7",

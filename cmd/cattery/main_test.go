@@ -574,14 +574,30 @@ func TestPrintAgents(t *testing.T) {
 			ID: 12, Host: agent.HostKitty, Kind: "pi", Display: "idle",
 			Project: "dotfiles", Branch: "main", CWD: "/Users/x/projects/dotfiles",
 		},
+		{
+			ID: 21, Host: agent.HostKitty, Kind: "opencode", Display: "stalled",
+			Project: "cattery", Branch: "main", CWD: "/Users/x/projects/cattery",
+		},
 	}}, &out)
 	if err != nil {
 		t.Fatalf("print: %v", err)
 	}
 
 	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("got %d lines, want 2: %q", len(lines), out.String())
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3: %q", len(lines), out.String())
+	}
+	for _, want := range []string{"opencode", "stalled"} {
+		if !strings.Contains(lines[2], want) {
+			t.Errorf("opencode row %q is missing %q", lines[2], want)
+		}
+	}
+	// "opencode" is the longest kind any agent publishes, and a kind that
+	// overruns its column shifts the rest of that row against every other one.
+	for _, field := range []string{"host=", "id="} {
+		if strings.Index(lines[2], field) != strings.Index(lines[1], field) {
+			t.Errorf("%q starts at a different column in\n %q\nand\n %q", field, lines[1], lines[2])
+		}
 	}
 	for _, want := range []string{"host=tmux", "id=17", "target=dev:3.%17", "myapp", "working"} {
 		if !strings.Contains(lines[0], want) {

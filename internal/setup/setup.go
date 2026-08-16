@@ -1,6 +1,6 @@
 // Package setup installs cattery. It writes the embedded kitty files into the
 // kitty config directory, keeps a marked block in kitty.conf, and offers to
-// wire up Claude Code, Codex and pi. It backs `cattery setup`.
+// wire up Claude Code, Codex, pi and opencode. It backs `cattery setup`.
 //
 // The installed kitty files are copies, so an install does not depend on where
 // the source lives. A copy does not follow a binary upgrade, so the picker
@@ -67,7 +67,7 @@ type Options struct {
 	// no backup, and runs no external command.
 	DryRun bool
 
-	// Yes answers the Claude, Codex and pi questions without asking.
+	// Yes answers the Claude, Codex, pi and opencode questions without asking.
 	Yes bool
 
 	// Binary is the path setup writes into the kitty map and the Claude hooks.
@@ -81,6 +81,10 @@ type Options struct {
 	// CodexDir is where Codex's own hooks.json lives. Empty falls back to
 	// $CODEX_HOME, then ~/.codex. Setup reads that file and never writes it.
 	CodexDir string
+
+	// OpencodeDir is opencode's configuration directory, where the plugin goes.
+	// Empty falls back to $XDG_CONFIG_HOME/opencode, then ~/.config/opencode.
+	OpencodeDir string
 
 	// LegacyPaths are the files the shell installer left behind. Nil uses the
 	// real ones. Setup reports them and never touches them.
@@ -103,9 +107,9 @@ type Options struct {
 // Run installs cattery and reports what it did.
 //
 // It fails only on the kitty side, which is the install itself. The Claude,
-// Codex and pi steps belong to other tools. When one of them cannot be done,
-// setup says so, prints the command to run by hand, and still reports success
-// for its own part.
+// Codex, pi and opencode steps belong to other tools. When one of them cannot
+// be done, setup says so, prints the command to run by hand, and still reports
+// success for its own part.
 func Run(opts Options) error {
 	s, err := newSession(opts)
 	if err != nil {
@@ -117,6 +121,7 @@ func Run(opts Options) error {
 	s.claude()
 	s.codex()
 	s.pi()
+	s.opencode()
 	s.reportLegacy()
 	s.out.line("")
 	s.out.line("Reload kitty to finish.")
@@ -125,16 +130,17 @@ func Run(opts Options) error {
 
 // session is one run's resolved configuration.
 type session struct {
-	opts      Options
-	out       *reporter
-	answers   *bufio.Reader // nil when there is nobody to ask
-	kittyDir  string
-	claudeDir string
-	codexDir  string
-	binary    string
-	legacy    []string
-	lookPath  func(string) (string, error)
-	run       func(string, ...string) error
+	opts        Options
+	out         *reporter
+	answers     *bufio.Reader // nil when there is nobody to ask
+	kittyDir    string
+	claudeDir   string
+	codexDir    string
+	opencodeDir string
+	binary      string
+	legacy      []string
+	lookPath    func(string) (string, error)
+	run         func(string, ...string) error
 }
 
 func newSession(opts Options) (*session, error) {
@@ -162,17 +168,22 @@ func newSession(opts Options) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
+	opencodeDir, err := opencodeDirFor(opts.OpencodeDir)
+	if err != nil {
+		return nil, err
+	}
 
 	s := &session{
-		opts:      opts,
-		out:       &reporter{w: out, dry: opts.DryRun},
-		kittyDir:  kittyDir,
-		claudeDir: claudeDir,
-		codexDir:  codexDir,
-		binary:    binary,
-		legacy:    opts.LegacyPaths,
-		lookPath:  opts.LookPath,
-		run:       opts.RunCommand,
+		opts:        opts,
+		out:         &reporter{w: out, dry: opts.DryRun},
+		kittyDir:    kittyDir,
+		claudeDir:   claudeDir,
+		codexDir:    codexDir,
+		opencodeDir: opencodeDir,
+		binary:      binary,
+		legacy:      opts.LegacyPaths,
+		lookPath:    opts.LookPath,
+		run:         opts.RunCommand,
 	}
 	// One reader for every question. A fresh bufio.Reader per question would
 	// buffer past the first answer and swallow the next.
@@ -216,15 +227,43 @@ func KittyDir() (string, error) {
 	return resolveDir("", "KITTY_CONFIG_DIRECTORY", ".config", "kitty")
 }
 
+// opencodeDirFor picks opencode's configuration directory. It has its own
+// resolver because XDG_CONFIG_HOME names the parent rather than the directory
+// itself, which is not the shape resolveDir reads.
+func opencodeDirFor(explicit string) (string, error) {
+	if explicit != "" {
+		return filepath.Clean(explicit), nil
+	}
+	if config := os.Getenv("XDG_CONFIG_HOME"); config != "" {
+		return filepath.Join(config, "opencode"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot find the home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "opencode"), nil
+}
+
+// opencodePlugin is where the plugin file goes under an opencode config
+// directory.
+func opencodePlugin(dir string) string {
+	return filepath.Join(dir, cattery.OpencodePluginDir, cattery.OpencodeFile)
+}
+
 // Stale reports whether the install in dir has fallen behind this binary: the
-// copies of the kitty files, and the managed kitty.conf block, which carries
-// settings those files depend on. That happens when an upgrade changes one of
-// them and setup has not run since.
+// copies of the kitty files, the managed kitty.conf block, which carries
+// settings those files depend on, and the opencode plugin. That happens when an
+// upgrade changes one of them and setup has not run since.
 //
 // A directory holding none of the files is not stale: cattery may not be
 // installed there at all. A directory holding some of them is stale, which
 // catches an install predating a file the binary now ships. A file that cannot
 // be read counts as missing.
+//
+// The opencode plugin follows the same "absent means not installed" rule on its
+// own: a user without opencode must not be told to run setup again. Its
+// directory is resolved here rather than passed in, because the picker asks
+// about the kitty install and knows nothing about opencode.
 func Stale(dir string) bool {
 	assets := cattery.KittyFiles()
 	installed, missing := 0, 0
@@ -243,6 +282,9 @@ func Stale(dir string) bool {
 			return true
 		}
 	}
+	if opencodeStale() {
+		return true
+	}
 	if installed == 0 {
 		return false
 	}
@@ -254,6 +296,25 @@ func Stale(dir string) bool {
 		return false
 	}
 	return blockStale(string(conf))
+}
+
+// opencodeStale reports whether an installed opencode plugin no longer matches
+// the embedded one. No plugin, and a directory that cannot be resolved, both
+// mean nothing to compare.
+func opencodeStale() bool {
+	dir, err := opencodeDirFor("")
+	if err != nil {
+		return false
+	}
+	want, err := fs.ReadFile(cattery.OpencodeFiles(), cattery.OpencodeFile)
+	if err != nil {
+		return false
+	}
+	got, err := os.ReadFile(opencodePlugin(dir))
+	if err != nil {
+		return false
+	}
+	return string(got) != string(want)
 }
 
 // legacyPaths are what install.sh linked into place.
@@ -557,6 +618,40 @@ func (s *session) pi() {
 	}
 	if err := s.run(path, "install", piPackage); err != nil {
 		s.out.plain("failed", command+": "+err.Error())
+	}
+}
+
+// opencode installs the plugin into opencode's own configuration directory,
+// where it is auto-loaded: opencode scans "{plugin,plugins}/*.{ts,js}" there and
+// needs nothing written into opencode.json.
+//
+// It is the one agent extension that ships inside the binary rather than being
+// fetched from the published repository, which is what lets Stale check it.
+func (s *session) opencode() {
+	s.out.line("")
+	path := opencodePlugin(s.opencodeDir)
+	if _, err := s.lookPath("opencode"); err != nil {
+		s.out.plain("skipped", "opencode is not on PATH")
+		s.out.block("    Once opencode is installed, run cattery setup again to write:\n      " + shorten(path))
+		return
+	}
+	if !s.consent("Install the cattery opencode plugin into " + shorten(path) + "?") {
+		s.out.plain("skipped", shorten(path))
+		return
+	}
+	content, err := fs.ReadFile(cattery.OpencodeFiles(), cattery.OpencodeFile)
+	if err != nil {
+		s.out.plain("failed", shorten(path)+": "+err.Error())
+		return
+	}
+	if !s.opts.DryRun {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			s.out.plain("failed", shorten(path)+": "+err.Error())
+			return
+		}
+	}
+	if err := s.install(path, content); err != nil {
+		s.out.plain("failed", shorten(path)+": "+err.Error())
 	}
 }
 

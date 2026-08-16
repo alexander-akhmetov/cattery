@@ -20,13 +20,14 @@ const testBinary = "/opt/bin/cattery"
 // harness is one setup run against temporary directories, with codex and pi
 // faked so nothing launches.
 type harness struct {
-	t         *testing.T
-	kittyDir  string
-	claudeDir string
-	codexDir  string
-	opts      Options
-	out       strings.Builder
-	runs      [][]string
+	t           *testing.T
+	kittyDir    string
+	claudeDir   string
+	codexDir    string
+	opencodeDir string
+	opts        Options
+	out         strings.Builder
+	runs        [][]string
 
 	// failRun makes chosen commands fail. The harness records every run either
 	// way, so a test can check what came after the failure.
@@ -35,11 +36,24 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, kittyDir: t.TempDir(), claudeDir: t.TempDir(), codexDir: t.TempDir()}
+	// Stale resolves opencode's directory from the environment rather than
+	// taking it as an argument, so the whole suite points XDG_CONFIG_HOME at a
+	// temporary directory. Without that a test would read, and report on, the
+	// plugin installed on the machine running it.
+	config := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", config)
+	h := &harness{
+		t:           t,
+		kittyDir:    t.TempDir(),
+		claudeDir:   t.TempDir(),
+		codexDir:    t.TempDir(),
+		opencodeDir: filepath.Join(config, "opencode"),
+	}
 	h.opts = Options{
 		KittyDir:    h.kittyDir,
 		ClaudeDir:   h.claudeDir,
 		CodexDir:    h.codexDir,
+		OpencodeDir: h.opencodeDir,
 		Binary:      testBinary,
 		Yes:         true,
 		LegacyPaths: []string{},
@@ -79,6 +93,12 @@ func (h *harness) run() string {
 func (h *harness) kittyPath(name string) string  { return filepath.Join(h.kittyDir, name) }
 func (h *harness) claudePath(name string) string { return filepath.Join(h.claudeDir, name) }
 func (h *harness) codexPath(name string) string  { return filepath.Join(h.codexDir, name) }
+
+// opencodePluginPath is where setup writes the plugin: opencode scans
+// "{plugin,plugins}/*.{ts,js}" under its configuration directory.
+func (h *harness) opencodePluginPath() string {
+	return filepath.Join(h.opencodeDir, "plugin", "cattery.ts")
+}
 
 func (h *harness) read(path string) string {
 	h.t.Helper()
@@ -545,13 +565,17 @@ func TestDryRunWritesNothing(t *testing.T) {
 	if _, err := os.Stat(h.claudePath("settings.json.cattery-bak")); !errors.Is(err, os.ErrNotExist) {
 		t.Error("a backup was created")
 	}
+	if _, err := os.Stat(h.opencodePluginPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the opencode plugin was created")
+	}
 	if len(h.runs) != 0 {
 		t.Errorf("a command was launched: %v", h.runs)
 	}
 
-	want := make([]string, 0, 6+len(codexArgs))
+	want := make([]string, 0, 7+len(codexArgs))
 	want = append(want,
 		"would write", "would update", "would run", "kitty.conf", "settings.json", "pi install "+piPackage,
+		shorten(h.opencodePluginPath()),
 	)
 	for _, args := range codexArgs {
 		want = append(want, codexCommand(args))
@@ -828,22 +852,28 @@ func TestClaudeInvalidJSONIsLeftAlone(t *testing.T) {
 // --- consent ----------------------------------------------------------------
 
 func TestConsent(t *testing.T) {
+	// The questions come in one order: Claude, Codex, pi, opencode.
+	type want struct{ claude, codex, pi, opencode bool }
+	every := want{claude: true, codex: true, pi: true, opencode: true}
 	cases := []struct {
-		name       string
-		answers    string // empty with stdin means an empty answer to all three
-		noStdin    bool
-		yes        bool
-		wantClaude bool
-		wantCodex  bool
-		wantPi     bool
+		name    string
+		answers string // empty with stdin means an empty answer to all four
+		noStdin bool
+		yes     bool
+		want    want
 	}{
-		{name: "empty answers accept all three", answers: "\n\n\n", wantClaude: true, wantCodex: true, wantPi: true},
-		{name: "explicit yes", answers: "y\ny\nyes\n", wantClaude: true, wantCodex: true, wantPi: true},
-		{name: "explicit decline", answers: "n\nn\nn\n"},
-		{name: "declines Claude, accepts the rest", answers: "no\n\n\n", wantCodex: true, wantPi: true},
-		{name: "declines Codex only", answers: "\nn\n\n", wantClaude: true, wantPi: true},
-		{name: "--yes skips the questions", noStdin: true, yes: true, wantClaude: true, wantCodex: true, wantPi: true},
-		{name: "no terminal and no --yes skips all three", noStdin: true},
+		{name: "empty answers accept all four", answers: "\n\n\n\n", want: every},
+		{name: "explicit yes", answers: "y\ny\nyes\ny\n", want: every},
+		{name: "explicit decline", answers: "n\nn\nn\nn\n"},
+		{
+			name:    "declines Claude, accepts the rest",
+			answers: "no\n\n\n\n",
+			want:    want{codex: true, pi: true, opencode: true},
+		},
+		{name: "declines Codex only", answers: "\nn\n\n\n", want: want{claude: true, pi: true, opencode: true}},
+		{name: "declines opencode only", answers: "\n\n\nn\n", want: want{claude: true, codex: true, pi: true}},
+		{name: "--yes skips the questions", noStdin: true, yes: true, want: every},
+		{name: "no terminal and no --yes skips all four", noStdin: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -856,17 +886,21 @@ func TestConsent(t *testing.T) {
 			out := h.run()
 
 			_, err := os.Stat(h.claudePath("settings.json"))
-			if merged := err == nil; merged != tc.wantClaude {
-				t.Errorf("settings.json written=%v, want %v; output:\n%s", merged, tc.wantClaude, out)
+			if merged := err == nil; merged != tc.want.claude {
+				t.Errorf("settings.json written=%v, want %v; output:\n%s", merged, tc.want.claude, out)
 			}
-			if ran := len(h.ran("pi")) > 0; ran != tc.wantPi {
-				t.Errorf("pi install ran=%v, want %v; output:\n%s", ran, tc.wantPi, out)
+			if ran := len(h.ran("pi")) > 0; ran != tc.want.pi {
+				t.Errorf("pi install ran=%v, want %v; output:\n%s", ran, tc.want.pi, out)
 			}
-			if ran := len(h.ran("codex")) > 0; ran != tc.wantCodex {
-				t.Errorf("codex plugin install ran=%v, want %v; output:\n%s", ran, tc.wantCodex, out)
+			if ran := len(h.ran("codex")) > 0; ran != tc.want.codex {
+				t.Errorf("codex plugin install ran=%v, want %v; output:\n%s", ran, tc.want.codex, out)
+			}
+			_, err = os.Stat(h.opencodePluginPath())
+			if written := err == nil; written != tc.want.opencode {
+				t.Errorf("opencode plugin written=%v, want %v; output:\n%s", written, tc.want.opencode, out)
 			}
 			// A skipped step says what to run by hand.
-			if !tc.wantClaude {
+			if !tc.want.claude {
 				for _, hook := range claudeHooks {
 					if !strings.Contains(out, hook.Event) || !strings.Contains(out, testBinary+" state "+hook.State) {
 						t.Errorf("report missing the manual %s command, got:\n%s", hook.Event, out)
@@ -878,10 +912,10 @@ func TestConsent(t *testing.T) {
 					}
 				}
 			}
-			if !tc.wantPi && !strings.Contains(out, "pi install "+piPackage) {
+			if !tc.want.pi && !strings.Contains(out, "pi install "+piPackage) {
 				t.Errorf("report missing the manual pi command, got:\n%s", out)
 			}
-			if !tc.wantCodex {
+			if !tc.want.codex {
 				for _, args := range codexArgs {
 					if !strings.Contains(out, codexCommand(args)) {
 						t.Errorf("report missing the manual %q, got:\n%s", codexCommand(args), out)
@@ -927,6 +961,51 @@ func TestPiMissingFromPath(t *testing.T) {
 		t.Fatalf("pi was launched: %v", runs)
 	}
 	if !strings.Contains(out, "pi is not on PATH") || !strings.Contains(out, "pi install "+piPackage) {
+		t.Errorf("report does not explain the skip, got:\n%s", out)
+	}
+}
+
+// --- opencode ---------------------------------------------------------------
+
+// The plugin ships inside the binary, unlike the pi package and the Codex
+// plugin, so setup writes the file itself and opencode auto-loads it.
+func TestOpencodePluginIsWritten(t *testing.T) {
+	h := newHarness(t)
+
+	h.run()
+
+	want, err := fs.ReadFile(cattery.OpencodeFiles(), cattery.OpencodeFile)
+	if err != nil {
+		t.Fatalf("read the embedded plugin: %v", err)
+	}
+	if got := h.read(h.opencodePluginPath()); got != string(want) {
+		t.Errorf("installed plugin does not match the embedded one")
+	}
+	if got := h.perm(h.opencodePluginPath()); got != assetMode {
+		t.Errorf("mode: got %v, want %v", got, assetMode)
+	}
+	if runs := h.ran("opencode"); len(runs) != 0 {
+		t.Fatalf("opencode was launched: %v", runs)
+	}
+}
+
+// A machine without opencode must still get a clean install: this step belongs
+// to another tool.
+func TestOpencodeMissingFromPath(t *testing.T) {
+	h := newHarness(t)
+	h.opts.LookPath = func(file string) (string, error) {
+		if file == "opencode" {
+			return "", exec.ErrNotFound
+		}
+		return "/usr/bin/" + file, nil
+	}
+
+	out := h.run()
+
+	if _, err := os.Stat(h.opencodePluginPath()); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("wrote the plugin for a machine with no opencode: %v", err)
+	}
+	if !strings.Contains(out, "opencode is not on PATH") {
 		t.Errorf("report does not explain the skip, got:\n%s", out)
 	}
 }
@@ -1240,6 +1319,29 @@ func TestStale(t *testing.T) {
 			prepare: func(t *testing.T, h *harness) {
 				t.Helper()
 				h.write(h.kittyPath("kitty.conf"), "font_size 13\n")
+			},
+			want: false,
+		},
+		{
+			// The plugin is the one agent extension the binary carries, so it
+			// is the one an upgrade can leave behind.
+			name:    "an edited opencode plugin is stale",
+			install: true,
+			prepare: func(_ *testing.T, h *harness) {
+				h.write(h.opencodePluginPath(), "// hand-edited\n")
+			},
+			want: true,
+		},
+		{
+			// A user without opencode has no plugin and must not be told to run
+			// setup again.
+			name:    "no opencode plugin at all is not stale",
+			install: true,
+			prepare: func(t *testing.T, h *harness) {
+				t.Helper()
+				if err := os.Remove(h.opencodePluginPath()); err != nil {
+					t.Fatalf("remove: %v", err)
+				}
 			},
 			want: false,
 		},

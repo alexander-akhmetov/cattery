@@ -1,10 +1,11 @@
 // Package state publishes agent state to kitty as AGENT_* user variables. It
-// backs `cattery state <working|blocked|idle|clear> [--kind <claude|codex>]`.
-// Claude Code runs it from five hooks (SessionStart, Notification,
-// UserPromptSubmit, Stop, SessionEnd) and Codex from five of its own
-// (SessionStart, PermissionRequest, UserPromptSubmit, Stop, SessionEnd), and
-// shell wrappers run `clear` after any agent process returns, which catches
-// crashes and force-quits the agent's own cleanup never saw.
+// backs `cattery state <working|blocked|idle|clear> [--kind
+// <claude|codex|opencode>]`. Claude Code runs it from five hooks (SessionStart,
+// Notification, UserPromptSubmit, Stop, SessionEnd) and Codex from five of its
+// own (SessionStart, PermissionRequest, UserPromptSubmit, Stop, SessionEnd),
+// the opencode plugin runs it once per transition, and shell wrappers run
+// `clear` after any agent process returns, which catches crashes and
+// force-quits the agent's own cleanup never saw.
 //
 // Nothing here fails loudly. A hook error would surface in the agent's
 // transcript, so every path returns and the command exits 0.
@@ -28,16 +29,19 @@ import (
 )
 
 // The user-variable contract, shared with the watcher, the tab bar, the picker,
-// and every running pi, Claude and Codex session. Any other program that
-// writes these names works too.
+// and every running pi, Claude, Codex and opencode session. Any other program
+// that writes these names works too.
 const (
-	varKind   = "AGENT_KIND"
-	varState  = "AGENT_STATE"
-	varMsg    = "AGENT_MSG"
-	varResume = "AGENT_RESUME"
+	varKind      = "AGENT_KIND"
+	varState     = "AGENT_STATE"
+	varMsg       = "AGENT_MSG"
+	varResume    = "AGENT_RESUME"
+	varTool      = "AGENT_TOOL"
+	varToolSince = "AGENT_TOOL_SINCE"
 
-	kindClaude = "claude"
-	kindCodex  = "codex"
+	kindClaude   = "claude"
+	kindCodex    = "codex"
+	kindOpencode = "opencode"
 )
 
 // The command AGENT_RESUME starts with. The default, the agent's own name, is
@@ -45,16 +49,17 @@ const (
 // profile that moves CLAUDE_CONFIG_DIR: a session id resolves only under the
 // configuration directory that created it.
 //
-// A per-agent name wins over the shared one, which now has three claimants.
-// The three compose different arguments onto the prefix: Claude takes
-// "--resume <id>", Codex "resume <id>", and pi's writer "--session <file>". So
-// an exported CATTERY_RESUME_PREFIX="nono run claude" would make every pi and
-// Codex session in that shell publish a Claude command aimed at another
-// agent's session.
+// A per-agent name wins over the shared one, which now has four claimants. The
+// four compose different arguments onto the prefix: Claude takes
+// "--resume <id>", Codex "resume <id>", opencode "--session <id>", and pi's
+// writer "--session <file>". So an exported CATTERY_RESUME_PREFIX="nono run
+// claude" would make every pi, Codex and opencode session in that shell publish
+// a Claude command aimed at another agent's session.
 const (
-	envResumePrefix       = "CATTERY_RESUME_PREFIX"
-	envResumePrefixClaude = "CATTERY_RESUME_PREFIX_CLAUDE"
-	envResumePrefixCodex  = "CATTERY_RESUME_PREFIX_CODEX"
+	envResumePrefix         = "CATTERY_RESUME_PREFIX"
+	envResumePrefixClaude   = "CATTERY_RESUME_PREFIX_CLAUDE"
+	envResumePrefixCodex    = "CATTERY_RESUME_PREFIX_CODEX"
+	envResumePrefixOpencode = "CATTERY_RESUME_PREFIX_OPENCODE"
 )
 
 // kind is one agent this writer speaks for. The agents differ in two things:
@@ -64,14 +69,15 @@ type kind struct {
 	name string
 	// resumeArg goes between the prefix and the session id. Codex takes the id
 	// as a positional argument of a "resume" subcommand, Claude after a
-	// "--resume" flag.
+	// "--resume" flag, opencode after "--session".
 	resumeArg string
 	prefixEnv string
 }
 
 var kinds = map[string]kind{
-	kindClaude: {name: kindClaude, resumeArg: "--resume", prefixEnv: envResumePrefixClaude},
-	kindCodex:  {name: kindCodex, resumeArg: "resume", prefixEnv: envResumePrefixCodex},
+	kindClaude:   {name: kindClaude, resumeArg: "--resume", prefixEnv: envResumePrefixClaude},
+	kindCodex:    {name: kindCodex, resumeArg: "resume", prefixEnv: envResumePrefixCodex},
+	kindOpencode: {name: kindOpencode, resumeArg: "--session", prefixEnv: envResumePrefixOpencode},
 }
 
 // resolveKind reads a --kind value, falling back to Claude. An unknown word
@@ -102,7 +108,8 @@ func resolveKind(name string) kind {
 // Claude and a settings.json the user edited.
 //
 // Codex fires the same hook for four sources, startup, resume, clear and
-// compact, and has no fork. So these two lists cover it as they stand.
+// compact, and has no fork. So these two lists cover it as they stand. The
+// opencode plugin sends "startup" once, when it loads.
 var (
 	startSources   = []string{"startup", "resume", "clear"}
 	midTurnSources = []string{"compact", "fork"}
@@ -111,6 +118,13 @@ var (
 // promptLimit caps AGENT_MSG. The picker draws it on one line beside a spinner,
 // and the row already names the cwd, branch, and agent kind.
 const promptLimit = 200
+
+// toolLimit caps AGENT_TOOL, shorter than promptLimit: the label shares the
+// picker's second line with the agent's directory and an elapsed time, and it is
+// cut there rather than wrapped. Keep it in step with MAX_TOOL_LABEL in
+// extensions/cattery.ts and opencode/cattery.ts, which cut at the same width
+// before the label ever reaches a writer.
+const toolLimit = 120
 
 // publishTimeout bounds the remote-control fallback. A hook waits for this
 // command, so a stalled kitty socket must not hold up the agent.
@@ -285,6 +299,7 @@ func (w Writer) Write(state string) {
 			vars = append(vars, Var{Name: varMsg, Value: prompt})
 		}
 	}
+	vars = append(vars, toolVars(payload)...)
 	// A session start drops what the agent before it left in the window or the
 	// pane. A Claude killed without SessionEnd leaves both standing: the prompt
 	// would sit on the new row, and the "has worked" flag turns this opening
@@ -307,7 +322,33 @@ func (w Writer) Write(state string) {
 	// watcher, and anything written after it is missing from the transition the
 	// watcher publishes to its subscribers.
 	vars = append(vars, Var{Name: varState, Value: state})
-	_ = w.Transport.Publish(vars)
+	_ = w.Transport.Publish(clean(vars))
+}
+
+// toolVars renders the running-tool pair, or nothing when the payload carries
+// none. Claude and Codex send neither field, so their batches carry no pair.
+//
+// A nil tool leaves both variables standing, an empty one deletes them, and a
+// label with no usable timestamp beside it publishes the label alone: the row
+// then shows what is running without an elapsed time, which beats a label
+// carrying the previous call's start.
+//
+// AGENT_TOOL_SINCE goes before AGENT_TOOL because AGENT_TOOL is the key the
+// kitty watcher reacts to. The other order would have it read the previous
+// call's timestamp against the new label.
+func toolVars(payload hookPayload) []Var {
+	if payload.Tool == nil {
+		return nil
+	}
+	label := normalizeTool(*payload.Tool)
+	if label == "" {
+		return []Var{{Name: varToolSince, Delete: true}, {Name: varTool, Delete: true}}
+	}
+	since := Var{Name: varToolSince, Delete: true}
+	if payload.ToolSince != nil && *payload.ToolSince > 0 {
+		since = Var{Name: varToolSince, Value: strconv.FormatInt(*payload.ToolSince, 10)}
+	}
+	return []Var{since, {Name: varTool, Value: label}}
 }
 
 // kind is the agent this writer speaks for.
@@ -358,10 +399,15 @@ func readHook(r io.Reader) []byte {
 // hookPayload is the part of an agent hook payload the writer reads. Claude
 // sends session_id on every hook, prompt only on UserPromptSubmit, and source
 // only on SessionStart.
+//
+// The tool pair is opencode's, and is a pointer so that "absent" and "empty"
+// stay apart: absent leaves the variables alone, empty deletes them.
 type hookPayload struct {
-	Prompt    string `json:"prompt"`
-	SessionID string `json:"session_id"`
-	Source    string `json:"source"`
+	Prompt    string  `json:"prompt"`
+	SessionID string  `json:"session_id"`
+	Source    string  `json:"source"`
+	Tool      *string `json:"tool"`
+	ToolSince *int64  `json:"tool_since"`
 }
 
 // parseHook decodes the payload, or returns an empty one. A payload that is not
@@ -375,14 +421,47 @@ func parseHook(data []byte) hookPayload {
 }
 
 // normalizePrompt folds the prompt to one line of at most promptLimit runes.
-// Cutting on runes cannot leave a partial UTF-8 encoding. `kitten @ ls` returns
-// JSON, and invalid bytes there would break the picker's parse.
-func normalizePrompt(raw string) string {
-	prompt := strings.Join(strings.Fields(raw), " ")
-	if utf8.RuneCountInString(prompt) <= promptLimit {
-		return prompt
+func normalizePrompt(raw string) string { return oneLine(raw, promptLimit) }
+
+// normalizeTool folds the tool label to one line of at most toolLimit runes.
+func normalizeTool(raw string) string { return oneLine(raw, toolLimit) }
+
+// oneLine folds a value to one line of at most limit runes. Cutting on runes
+// cannot leave a partial UTF-8 encoding. `kitten @ ls` returns JSON, and invalid
+// bytes there would break the picker's parse.
+func oneLine(raw string, limit int) string {
+	text := strings.Join(strings.Fields(raw), " ")
+	if utf8.RuneCountInString(text) <= limit {
+		return text
 	}
-	return string([]rune(prompt)[:promptLimit])
+	return string([]rune(text)[:limit])
+}
+
+// clean strips the C0 and C1 control characters out of every value in a batch.
+//
+// \x1f separates the fields of a `tmux list-panes` row, and parseAgents drops a
+// row whose field count is wrong, so one of these in any value takes the agent
+// out of the picker with no error anywhere. On kitty the value travels base64
+// and reaches the picker instead, which draws it inside its own frame, where one
+// \x1b moves the cursor rather than a column.
+//
+// The whitespace fold above does not cover this: unicode.IsSpace is false for
+// \x1f, so strings.Fields keeps it. One choke point rather than one call per
+// value, so nothing a prompt, a tool argument or a session id carries can hide
+// the agent.
+func clean(vars []Var) []Var {
+	for i, v := range vars {
+		if v.Delete {
+			continue
+		}
+		vars[i].Value = strings.Map(func(r rune) rune {
+			if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+				return ' '
+			}
+			return r
+		}, v.Value)
+	}
+	return vars
 }
 
 // --- transports -------------------------------------------------------------

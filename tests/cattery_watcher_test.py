@@ -891,11 +891,23 @@ class SweepTest(WatcherTestCase):
         self.assertEqual(window.user_vars["AGENT_SINCE"], "1700000000")
         self.assertEqual(len(boss.notification_manager.calls), 1, "an unfocused stall is worth a notification")
 
-    def test_a_dead_pis_tool_does_not_stall_the_next_agent(self):
+    def test_an_opencode_tool_stalls_too(self):
+        # opencode publishes the same pair pi does, so it reaches the same
+        # display state through the same sweep.
+        window = self.hung(display="working")
+        window.user_vars["AGENT_KIND"] = "opencode"
+        boss = boss_for([window])
+
+        watcher._sweep(boss)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "stalled")
+
+    def test_a_dead_agents_tool_does_not_stall_the_next_one(self):
         # `cattery state clear` drops AGENT_STATE, AGENT_KIND and AGENT_MSG and
-        # nothing else, so a pi killed mid-call leaves its label on the window.
-        # Without the kind test the Claude started there would go stalled, and
-        # notify, inside its first second.
+        # nothing else, so a pi or an opencode killed mid-call leaves its label
+        # on the window. Neither kind survives the clear, so what the next agent
+        # finds is the same either way: without the kind test the Claude started
+        # there would go stalled, and notify, inside its first second.
         window = self.hung(display="working")
         window.user_vars["AGENT_KIND"] = "claude"
         boss = boss_for([window])

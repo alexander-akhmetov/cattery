@@ -33,6 +33,7 @@ var (
 	cPeach      = lipgloss.Color("#fab387")
 	cMauve      = lipgloss.Color("#cba6f7")
 	cSky        = lipgloss.Color("#89dceb")
+	cTeal       = lipgloss.Color("#94e2d5")
 )
 
 // spinnerFrames is the braille spinner shown on a working agent's activity line.
@@ -162,6 +163,8 @@ func modelColor(kind string) lipgloss.Color {
 		return cMauve
 	case "pi":
 		return cSky
+	case "opencode":
+		return cTeal
 	default:
 		return cSubtext
 	}

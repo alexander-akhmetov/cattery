@@ -17,32 +17,37 @@ directory twice, once with `cattery_tab.py` beside it and once without, because
 that is what decides whether the guarded import succeeds.
 
 `make test-ts` and `make lint-ts` install `node_modules` first. Only
-`extensions/cattery.ts` needs that toolchain; no installed file needs node.
+`extensions/cattery.ts` and `opencode/cattery.ts` need that toolchain, and only
+to typecheck: both import their host's types with `import type`, which is
+erased, so no installed file needs node.
 
 ## Layout
 
 `kitty/` holds the five files kitty loads directly. `extensions/cattery.ts` is
 the pi-side state writer. `codex/` and `.agents/plugins/marketplace.json` are
 the Codex plugin. It holds nothing but the five hook entries; the writer they
-run is the binary. `cmd/` and `internal/` build that binary: the picker, `cattery setup`,
-`cattery state <x> [--kind <claude|codex>]` (the writer both Claude and Codex
-run), `cattery save`/`cattery restore` (the tab-tree snapshot), `cattery attach`
-(a read-only view of a tmux agent), and `cattery events` (the transitions the
-watcher pushes, as JSON lines).
+run is the binary. `opencode/cattery.ts` is the opencode plugin, which runs that
+same binary. `cmd/` and `internal/` build it: the picker, `cattery setup`,
+`cattery state <x> [--kind <claude|codex|opencode>]` (the writer Claude, Codex
+and opencode all run), `cattery save`/`cattery restore` (the tab-tree snapshot),
+`cattery attach` (a read-only view of a tmux agent), and `cattery events` (the
+transitions the watcher pushes, as JSON lines).
 
 An agent runs in one of two hosts. `internal/agent` holds what both share: the
 `Agent` struct, its `Key()`, and the git grouping. `internal/kitty` and
 `internal/tmux` each list their own host, `internal/agents` merges them for the
 picker, and `internal/state` picks the transport the state writer publishes on.
 
-`cattery setup` installs copies of the `kitty/` files, so an install does not
-depend on where the source lives. A copy does not follow a binary upgrade, so
-the picker compares the installed files with the embedded ones and warns.
+`cattery setup` installs copies of the `kitty/` files and of
+`opencode/cattery.ts`, so an install does not depend on where the source lives.
+A copy does not follow a binary upgrade, so the picker compares the installed
+files with the embedded ones and warns.
 
 ## Things that bite
 
 - The user variables are named `AGENT_*`. They are a live contract with running
-  pi, Claude and Codex sessions, so renaming them breaks sessions mid-flight.
+  pi, Claude, Codex and opencode sessions, so renaming them breaks sessions
+  mid-flight.
 - kitty loads `tab_bar.py` with `runpy.run_path`, which does not extend
   `sys.path`. `tab_bar.py` must insert its own directory before importing
   `cattery_tab`, and must guard that import.
@@ -177,12 +182,13 @@ the picker compares the installed files with the embedded ones and warns.
   line must not be `shellQuote`d: kitty's `env` takes the rest of the line as
   the value, quotes included, while `launch` on the line above splits
   shell-style and needs them. It does expand `$VAR` in the value.
-- `setup.Stale` compares the installed kitty files *and* the managed kitty.conf
-  block, because the block carries settings those files depend on. A release
-  that changes only `renderBlock` leaves every file identical, and the watcher
-  would then lose the new line with nothing said. The comparison re-renders the
-  block with the binary path the installed block itself names, since that part
-  belongs to the install rather than to the release.
+- `setup.Stale` compares the installed kitty files, the managed kitty.conf
+  block, and the opencode plugin. The block is in there because it carries
+  settings those files depend on: a release that changes only `renderBlock`
+  leaves every file identical, and the watcher would then lose the new line with
+  nothing said. The comparison re-renders the block with the binary path the
+  installed block itself names, since that part belongs to the install rather
+  than to the release.
 - The kitty watcher keeps its seen windows in `boss._agent_seen`, a set inside
   kitty's own process. Nothing outside kitty can reach it, so the picker
   publishes `AGENT_SEEN` and `on_set_user_var` picks it up and clears it. That
@@ -205,12 +211,14 @@ the picker compares the installed files with the embedded ones and warns.
   edges in place of " │ ". That is why `previewWidths`, `previewFits` and the
   91-column threshold did not move when the box arrived. Keep it that way, or
   the drawer shows a different amount of screen in each mode.
-- `AGENT_STATE` is written last in every batch, by both writers. Writing it is
+- `AGENT_STATE` is written last in every batch, by every writer. Writing it is
   what wakes the watcher, so a variable written after it is missing from the
   transition the watcher publishes: with the old order every `working` event
-  carried the previous prompt. The order is asserted in
-  `internal/state/state_test.go`, `internal/state/hook_test.go` and
-  `tests/cattery_extension_test.ts`.
+  carried the previous prompt. `AGENT_TOOL_SINCE` goes before `AGENT_TOOL` for
+  the same reason one level down: `AGENT_TOOL` is the key the watcher reacts to,
+  so the other order would have it read the previous call's timestamp. Both
+  orders are asserted in `internal/state/state_test.go`,
+  `internal/state/hook_test.go` and `tests/cattery_extension_test.ts`.
 - The watcher's `_publish` runs on kitty's own thread, so it may neither raise
   nor block. A blocking send would freeze the terminal, which is why the socket
   is a non-blocking datagram and the whole body sits in a `try`, the way
@@ -254,6 +262,65 @@ the picker compares the installed files with the embedded ones and warns.
   hook without a word, until the user opens `/hooks` in the TUI and trusts each
   entry. Nothing can automate that, so `cattery setup` prints it. A Codex agent
   showing no tab marker at all is untrusted hooks before it is anything else.
+- An opencode server plugin runs in a worker thread of the TUI process, so
+  `process.stdout` there belongs to the TUI and cannot carry the OSC escape a
+  kitty window needs. That is why `opencode/cattery.ts` shells out to
+  `cattery state --kind opencode` instead of writing the contract itself, the
+  way the pi extension does. The Go writer owns the ordering, the tmux `;`
+  escape, the control-character strip and the pane bookkeeping either way.
+- A file plugin whose default export has no `id` fails silently:
+  `resolvePluginId` in opencode's `plugin/shared.ts` throws
+  "Path plugin must export id", and the loader logs the `TypeError` without
+  surfacing it. So `export default { id: "cattery", server }`, and an opencode
+  agent with no tab marker at all is a missing `id` before it is anything else.
+  opencode auto-loads `{plugin,plugins}/*.{ts,js}` from its config directory,
+  which is what setup writes into; nothing goes in `opencode.json`.
+- opencode's shell tool answers to `bash`, not `shell`: its tool id and its
+  permission key both keep that word for compatibility with saved permissions
+  (`tool/shell/id.ts`, "Rename with opencode 2.0"). Its file tools take
+  `filePath`, not the `path` pi's take. `TOOL_ARG` was read out of
+  `packages/opencode/src/tool/`, not guessed from pi's names.
+- opencode's task tool prompts a subagent through the same `SessionPrompt.prompt`
+  entrypoint, so `chat.message`, `session.status` and both tool hooks all fire
+  with the *child's* `sessionID`. A child going idle inside the parent's turn
+  would draw the green `done` marker and fire a "finished" banner over an agent
+  that is still working. The hook inputs carry no `parentID`; only
+  `session.created` and `session.updated` do, which is why the plugin learns
+  every id from those and falls back to `client.session.get` for one it never
+  saw created (the `opencode --session <id>` resume case).
+- Only the v1 permission and question events fire in the session path.
+  `permission.v2.*` and `question.v2.*` exist in the SDK types but are published
+  from `packages/core`, which that path does not use. `asked.id` pairs with
+  `replied.requestID`. And `Permission.reply` publishes an extra
+  `permission.replied` for every request one "always" or one "reject" cascades
+  onto, each with its own id, so the plugin holds a set of outstanding ids: a
+  counter would leave `blocked` on the first cascaded reply.
+- The `permission.ask` hook is declared in opencode's `Hooks` type and never
+  triggered, as of 1.18.18. Watch the `event` hook instead. That hook is
+  filtered to the plugin's own directory, and an event with no `location` is
+  dropped, so nothing from another project reaches it.
+- `tool.execute.before` fires *before* the permission gate: the gate is
+  `ctx.ask()` inside each tool's own `execute`, not a wrapper around it. So a
+  call waiting for the user publishes `AGENT_TOOL` and ages towards the stall
+  threshold, the same way pi's does. It does no harm: `permission.asked` sets
+  `blocked`, and `_derive_display` weighs `AGENT_TOOL_SINCE` only while the
+  state is `working`.
+- opencode's `dispose` hook does not run on SIGINT or SIGTERM in the TUI. The
+  TUI's ctrl-c is a keybind rather than a signal, so a normal quit is covered
+  and an external kill is not. Same hole pi has, and the fish wrapper's
+  `cattery state clear` after the agent process returns is what closes it.
+- One opencode process serving two directories loads the plugin twice, and both
+  copies publish to the same kitty window: last write wins. The `event` hook is
+  directory-filtered so each copy sees only its own events, but nothing tells
+  them apart at the window. A known limitation. Every piece of the plugin's
+  mutable state lives inside `server()` rather than at module scope, so the two
+  copies at least do not corrupt each other's bookkeeping.
+- `XDG_CONFIG_HOME` names the parent of opencode's config directory, not the
+  directory itself, which is not the shape `resolveDir` reads. `opencodeDirFor`
+  is separate for that one reason. `setup.Stale` resolves it from the
+  environment rather than taking it as an argument, so the setup tests point
+  `XDG_CONFIG_HOME` at a temporary directory or they read the machine's own
+  installed plugin.
 - The session-start batch deletes `AGENT_MSG` and `AGENT_WORKED`, which resets
   what a killed agent left on a tmux pane and nothing on a kitty window. The
   "has worked" fact the watcher reads is `AGENT_DISPLAY`, its own output, and no
@@ -272,7 +339,9 @@ the picker compares the installed files with the embedded ones and warns.
   and nothing else, so a pi killed mid-call leaves `AGENT_TOOL` standing, and
   the Claude started in that window would wear the dead pi's command and read as
   stalled inside its first second. The watcher's `_tool_since` makes the same
-  check.
+  check, against `_TOOL_KINDS`. Those two lists are pi and opencode, and a kind
+  added to one has to join the other or the tab bar and the picker disagree
+  about the same window.
 - pi runs sibling tool calls concurrently and holds several open at once, so
   anything counting them needs a map keyed by `toolCallId`. It has to publish
   the earliest-started entry, or a fast `read` restamps the timestamp of a
@@ -312,10 +381,13 @@ the picker compares the installed files with the embedded ones and warns.
 - The pi extension and the Codex plugin are two more rollouts. `cattery setup`
   offers to run `pi install git:github.com/alexander-akhmetov/cattery` and
   `codex plugin add cattery-codex@cattery`, both of which fetch the published
-  copy and not this checkout, and `setup.Stale` covers only the installed
-  `kitty/*.py`, so nothing notices either going out of date. Test a local
-  extension with `pi --no-extensions -e ./extensions/cattery.ts`, and a local
-  plugin with `codex plugin marketplace add .` from the repository root.
+  copy and not this checkout, and `setup.Stale` covers the installed
+  `kitty/*.py` and the opencode plugin, so nothing notices the pi extension or
+  the Codex plugin going out of date. Test a local extension with
+  `pi --no-extensions -e ./extensions/cattery.ts`, a local Codex plugin with
+  `codex plugin marketplace add .` from the repository root, and a local
+  opencode plugin by copying `opencode/cattery.ts` into
+  `~/.config/opencode/plugin/`, which is where setup puts it anyway.
 - `codex plugin marketplace add` on a source already configured exits 0 and
   leaves the snapshot it fetched alone, so a re-run after a release would
   install the old plugin again. `codex plugin marketplace upgrade cattery` is
