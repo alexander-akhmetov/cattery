@@ -5,6 +5,7 @@
 //	                         overlay window
 //	cattery -print           the same inventory without the TUI
 //	cattery -version         print the version and exit
+//	cattery help [command]   the command list, or one command
 //	cattery setup            install the kitty files and the config they need
 //	cattery state <x>        publish this window's agent state
 //	cattery save [path]      snapshot the kitty tab tree
@@ -65,7 +66,114 @@ const (
 	cmdAttach  = "attach"
 	cmdEvents  = "events"
 	cmdVersion = "version"
+	cmdHelp    = "help"
 )
+
+// subcommand is one word the command line accepts. The same entry answers
+// route and the help text, so a command cannot be listed in one and missing
+// from the other.
+type subcommand struct {
+	name string
+	// operands is the rest of the usage line, empty for a command that takes
+	// none. Flags are not in here: they come from commandFlags.
+	operands string
+	// summary is the one line the command list prints. details is the rest,
+	// printed by `cattery help <command>` and wrapped where it is written.
+	summary string
+	details string
+}
+
+// subcommands is the whole command list, in the order the help prints it. A
+// plain literal on purpose: a closure in here that reached back for a flag set
+// would be an initialization cycle.
+var subcommands = []subcommand{
+	{
+		name:    cmdSetup,
+		summary: "install the kitty files and the config they need",
+		details: `Copies the watcher and the kittens into kitty's config directory, keeps its
+own block in kitty.conf, and offers to wire the Claude Code hooks and the pi
+extension. It writes tab_bar.py only when that directory has none, because an
+existing one is yours.
+
+Those are copies, and upgrading the binary does not touch them, so run setup
+again after every upgrade. Reload kitty afterwards.`,
+	},
+	{
+		name:     cmdState,
+		operands: "<working|blocked|idle|clear>",
+		summary:  "publish this window's agent state",
+		details: `Writes the AGENT_* variables that the tab marker and the picker read, on the
+tmux pane when $TMUX and $TMUX_PANE are set and on the kitty window
+otherwise.
+
+Claude Code runs this from four hooks, and the shell wrappers run "clear"
+after the agent exits. It is meant to be called by an agent rather than
+typed, and it exits 0 whatever happens: a failure here would show up in the
+agent's own transcript.`,
+	},
+	{
+		name:     cmdSave,
+		operands: "[path]",
+		summary:  "snapshot the kitty tab tree",
+		details: `Writes every kitty tab, its layout, and each agent's resume command to a
+session file that restore can read back.
+
+With no path the snapshot goes to $CATTERY_SESSION_FILE, else to the default
+under kitty's sessions directory. tmux agents are not recorded: a pane
+belongs to whatever started it.`,
+	},
+	{
+		name:     cmdRestore,
+		operands: "[path]",
+		summary:  "put a snapshot back",
+		details: `Opens the tabs the snapshot recorded and types each agent's resume command at
+its prompt, leaving it there for you to read before it runs.
+
+Reads the same default path as save. It refuses to run twice against one
+snapshot, because kitty would build a second copy of every tab.`,
+	},
+	{
+		name:     cmdAttach,
+		operands: "<session>:<window>.<pane id>",
+		summary:  "watch a tmux agent read-only",
+		details: `Opens a read-only view of one tmux pane, for example
+
+  cattery attach kontora:3.%17
+
+Keys do nothing and your terminal size does not resize the agent's pane.
+"prefix d" detaches. The view is a tmux session of its own, grouped with the
+agent's, so two viewers never fight over which window it shows.
+
+The picker does this for you on Enter, and "cattery -print" prints the target
+of every tmux agent.`,
+	},
+	{
+		name:    cmdEvents,
+		summary: "print agent state transitions as JSON lines",
+		details: `Prints one JSON object per agent state change, until you interrupt it or the
+pipe it writes to closes. Something other than cattery can then react to
+them:
+
+  cattery events | jq -r --unbuffered 'select(.to == "blocked") | .cwd'
+
+The command binds a unix socket and registers it with the running kitty, so
+it needs the kitten that "cattery setup" installs. Nothing is buffered: an
+event that fires while nobody is subscribed is gone, and there is no replay.
+tmux agents emit nothing, because no watcher runs there.
+
+A kitty restart drops the subscription, and the command exits 3 when it
+notices, for a supervisor to start it again.`,
+	},
+}
+
+func lookup(name string) (subcommand, bool) {
+	for _, sc := range subcommands {
+		if sc.name == name {
+			return sc, true
+		}
+	}
+	return subcommand{}, false
+}
 
 // version is the release this binary was built from. `make build` passes the
 // output of `git describe`, goreleaser passes the tag, and the Homebrew formula
@@ -95,12 +203,15 @@ func main() {
 }
 
 func run(args []string) int {
-	cmd, err := route(args, os.Stderr)
+	cmd, err := route(args)
 	if err != nil {
+		// -h reaches this only behind another flag; on its own it is a command.
 		if errors.Is(err, flag.ErrHelp) {
+			usage(os.Stdout)
 			return 0
 		}
 		fmt.Fprintln(os.Stderr, "cattery:", err)
+		fmt.Fprintln(os.Stderr, "run `cattery help` for the command list")
 		return 2
 	}
 
@@ -108,6 +219,9 @@ func run(args []string) int {
 	case cmdVersion:
 		fmt.Println(versionString())
 		return 0
+	case cmdHelp:
+		// Help was asked for, so it is the output, not a diagnostic.
+		return runHelp(os.Stdout, cmd.args)
 	case cmdState:
 		// Never fails: a hook error would surface in the agent's transcript.
 		state.Run(cmd.args)
@@ -143,20 +257,31 @@ func run(args []string) int {
 
 // route reads the argv. A first argument that does not start with "-" names a
 // subcommand; everything else is parsed as flags for the picker.
-func route(args []string, out io.Writer) (command, error) {
+//
+// Every way of asking for help routes to cmdHelp rather than to the flag
+// package's own ErrHelp, so all of it prints to stdout and in one format.
+// route itself prints nothing: a bad command line is an error the caller
+// reports once.
+func route(args []string) (command, error) {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		switch args[0] {
-		case cmdSetup, cmdState, cmdSave, cmdRestore, cmdAttach, cmdEvents:
-			return command{name: args[0], args: args[1:]}, nil
-		default:
-			return command{}, fmt.Errorf("unknown command %q (try setup, state, save, restore, attach, events, or no argument for the picker)", args[0])
+		if args[0] == cmdHelp {
+			return helpCommand(args[1:])
 		}
+		sc, ok := lookup(args[0])
+		if !ok {
+			return command{}, fmt.Errorf("unknown command %q", args[0])
+		}
+		if rest := args[1:]; len(rest) == 1 && isHelpFlag(rest[0]) {
+			return command{name: cmdHelp, args: []string{sc.name}}, nil
+		}
+		return command{name: sc.name, args: args[1:]}, nil
+	}
+	if len(args) > 0 && isHelpFlag(args[0]) {
+		return command{name: cmdHelp}, nil
 	}
 
-	flags := flag.NewFlagSet("cattery", flag.ContinueOnError)
-	flags.SetOutput(out)
-	printOnly := flags.Bool("print", false, "list agent windows and exit (no TUI); useful for debugging")
-	showVersion := flags.Bool("version", false, "print the version and exit")
+	flags, printOnly, showVersion := pickerFlags()
+	flags.SetOutput(io.Discard)
 	if err := flags.Parse(args); err != nil {
 		return command{}, err
 	}
@@ -170,12 +295,185 @@ func route(args []string, out io.Writer) (command, error) {
 	}
 }
 
-func runSetup(args []string) int {
-	flags := flag.NewFlagSet("cattery setup", flag.ContinueOnError)
+// --- help -----------------------------------------------------------------
+
+func isHelpFlag(arg string) bool {
+	return arg == "-h" || arg == "--help" || arg == "-help"
+}
+
+// helpCommand reads what `cattery help` was pointed at.
+func helpCommand(args []string) (command, error) {
+	switch len(args) {
+	case 0:
+		return command{name: cmdHelp}, nil
+	case 1:
+		if _, ok := lookup(args[0]); !ok {
+			return command{}, fmt.Errorf("unknown command %q", args[0])
+		}
+		return command{name: cmdHelp, args: args}, nil
+	default:
+		return command{}, errors.New("help takes one command at most")
+	}
+}
+
+func runHelp(out io.Writer, args []string) int {
+	if len(args) == 0 {
+		usage(out)
+		return 0
+	}
+	// route only passes a name it found, so the lookup cannot fail here.
+	sc, ok := lookup(args[0])
+	if !ok {
+		fmt.Fprintf(os.Stderr, "cattery: unknown command %q\n", args[0])
+		return 2
+	}
+	commandHelp(out, sc)
+	return 0
+}
+
+// usage prints the whole command line: what cattery is, the commands, and the
+// picker's own flags.
+func usage(out io.Writer) {
+	fmt.Fprint(out, `cattery marks each kitty tab with what its agent is doing, and lists every
+agent in a picker.
+
+Usage:
+  cattery [flags]            open the picker
+  cattery <command> [args]
+  cattery help <command>     what one command does
+
+Commands:
+`)
+	rows := make([][2]string, len(subcommands))
+	for i, sc := range subcommands {
+		rows[i] = [2]string{signature(sc), sc.summary}
+	}
+	columns(out, rows)
+
+	flags, _, _ := pickerFlags()
+	fmt.Fprint(out, "\nFlags:\n")
+	columns(out, flagRows(flags))
+}
+
+// commandHelp prints one command's usage line, what it does, and its flags.
+func commandHelp(out io.Writer, sc subcommand) {
+	fmt.Fprintf(out, "Usage: cattery %s\n\n%s\n", signature(sc), sc.summary)
+	if sc.details != "" {
+		fmt.Fprintf(out, "\n%s\n", sc.details)
+	}
+	rows := flagRows(commandFlags(sc.name))
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprint(out, "\nFlags:\n")
+	columns(out, rows)
+}
+
+func signature(sc subcommand) string {
+	if sc.operands == "" {
+		return sc.name
+	}
+	return sc.name + " " + sc.operands
+}
+
+// flagRows describes each flag as a signature and what it does. It replaces
+// flag.PrintDefaults, which breaks the line after any name longer than one
+// character and so cannot line up with the command list.
+func flagRows(flags *flag.FlagSet) [][2]string {
+	var rows [][2]string
+	if flags == nil {
+		return rows
+	}
+	flags.VisitAll(func(f *flag.Flag) {
+		// UnquoteUsage names the value a flag takes, from a backquoted word in
+		// the usage text or from the type. It is empty for a bool.
+		value, help := flag.UnquoteUsage(f)
+		name := "-" + f.Name
+		if value != "" {
+			name += " " + value
+		}
+		if f.DefValue != "" && f.DefValue != "false" {
+			help += " (default " + f.DefValue + ")"
+		}
+		rows = append(rows, [2]string{name, help})
+	})
+	return rows
+}
+
+// columns writes an aligned two-column block.
+func columns(out io.Writer, rows [][2]string) {
+	width := 0
+	for _, row := range rows {
+		width = max(width, len(row[0]))
+	}
+	for _, row := range rows {
+		fmt.Fprintf(out, "  %-*s  %s\n", width, row[0], row[1])
+	}
+}
+
+// --- flag sets --------------------------------------------------------------
+
+// newFlagSet builds a subcommand's flag set. A rejected flag gets the usage
+// line and a pointer, not the whole description: the flag package has already
+// said what it did not understand.
+func newFlagSet(name string) *flag.FlagSet {
+	flags := flag.NewFlagSet("cattery "+name, flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	dryRun := flags.Bool("dry-run", false, "report every action without changing anything")
-	yes := flags.Bool("yes", false, "answer yes to the Claude Code and pi questions")
-	kittyDir := flags.String("kitty-dir", "", "kitty config directory (default $KITTY_CONFIG_DIRECTORY, else ~/.config/kitty)")
+	flags.Usage = func() {
+		sc, ok := lookup(name)
+		if !ok {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Usage: cattery %s\nrun `cattery help %s` for what it does\n", signature(sc), name)
+	}
+	return flags
+}
+
+func pickerFlags() (*flag.FlagSet, *bool, *bool) {
+	flags := flag.NewFlagSet("cattery", flag.ContinueOnError)
+	printOnly := flags.Bool("print", false, "list agent windows and exit (no TUI); useful for debugging")
+	showVersion := flags.Bool("version", false, "print the version and exit")
+	return flags, printOnly, showVersion
+}
+
+// commandFlags returns the flag set of a command that has flags, and nil for
+// one that has none. The help text builds it the same way the command does, so
+// the two cannot describe different flags.
+func commandFlags(name string) *flag.FlagSet {
+	switch name {
+	case cmdSetup:
+		flags, _ := setupFlags()
+		return flags
+	case cmdRestore:
+		flags, _ := restoreFlags()
+		return flags
+	default:
+		return nil
+	}
+}
+
+func setupFlags() (*flag.FlagSet, *setup.Options) {
+	var opts setup.Options
+	flags := newFlagSet(cmdSetup)
+	flags.BoolVar(&opts.DryRun, "dry-run", false, "report every action without changing anything")
+	flags.BoolVar(&opts.Yes, "yes", false, "answer yes to the Claude Code and pi questions")
+	flags.StringVar(&opts.KittyDir, "kitty-dir", "", "kitty config `directory` (default $KITTY_CONFIG_DIRECTORY, else ~/.config/kitty)")
+	return flags, &opts
+}
+
+// restoreFlags carries -run off by default. Resuming every agent starts one
+// process each, and a resume command can point at a session that no longer
+// exists.
+func restoreFlags() (*flag.FlagSet, *bool) {
+	flags := newFlagSet(cmdRestore)
+	run := flags.Bool("run", false, "press return on each resume command instead of leaving it at the prompt")
+	return flags, run
+}
+
+// --- commands ---------------------------------------------------------------
+
+func runSetup(args []string) int {
+	flags, opts := setupFlags()
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -183,13 +481,12 @@ func runSetup(args []string) int {
 		return 2
 	}
 
-	opts := setup.Options{DryRun: *dryRun, Yes: *yes, KittyDir: *kittyDir}
 	// Only a terminal can answer a question. Behind a pipe there is nobody to
 	// ask, so setup skips the agent steps instead of guessing.
 	if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
 		opts.In = os.Stdin
 	}
-	if err := setup.Run(opts); err != nil {
+	if err := setup.Run(*opts); err != nil {
 		fmt.Fprintln(os.Stderr, "cattery:", err)
 		return 1
 	}
@@ -204,9 +501,7 @@ const (
 )
 
 func runSave(client session.Client, out io.Writer, args []string) int {
-	flags := flag.NewFlagSet("cattery save", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	path, err := parseSessionArgs(flags, args)
+	path, err := parseSessionArgs(newFlagSet(cmdSave), args)
 	if err != nil {
 		return flagExit(err)
 	}
@@ -227,11 +522,7 @@ func runSave(client session.Client, out io.Writer, args []string) int {
 }
 
 func runRestore(client session.Client, out io.Writer, args []string) int {
-	flags := flag.NewFlagSet("cattery restore", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	// Off by default. Resuming every agent starts one process each, and a
-	// resume command can point at a session that no longer exists.
-	run := flags.Bool("run", false, "press return on each resume command instead of leaving it at the prompt")
+	flags, run := restoreFlags()
 	path, err := parseSessionArgs(flags, args)
 	if err != nil {
 		return flagExit(err)
@@ -342,8 +633,7 @@ const exitKittyGone = 3
 // the kitten `cattery setup` installed. An install that predates this version
 // has no such file, and kitty refuses the call.
 func runEvents(client events.KittenRunner, out io.Writer, args []string) int {
-	flags := flag.NewFlagSet("cattery events", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
+	flags := newFlagSet(cmdEvents)
 	if err := flags.Parse(args); err != nil {
 		return flagExit(err)
 	}

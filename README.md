@@ -28,7 +28,8 @@ Reload kitty afterwards. Press `opt+a` twice to open the picker.
 `cattery setup` installs copies of the kitty files, and an upgrade of the binary
 does not update those copies. Run it again after every upgrade.
 
-`cattery -version` prints the release the binary was built from.
+`cattery -version` prints the release the binary was built from. `cattery help`
+lists the commands, and `cattery help <command>` says what one of them does.
 
 ## Tab markers
 

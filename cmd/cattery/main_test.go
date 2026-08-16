@@ -61,7 +61,7 @@ func TestRoute(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := route(tc.args, io.Discard)
+			got, err := route(tc.args)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("route(%v): got %+v, want an error", tc.args, got)
@@ -86,14 +86,113 @@ func TestRoute(t *testing.T) {
 	}
 }
 
-// -h is not a routing failure. It asked for the usage text and got it.
+// Asking for help is not a routing failure, and every way of asking reaches the
+// same command, so all of it prints to stdout in one format.
 func TestRouteHelp(t *testing.T) {
-	var out strings.Builder
-	if _, err := route([]string{"-h"}, &out); !errors.Is(err, flag.ErrHelp) {
-		t.Fatalf("route(-h): got %v, want flag.ErrHelp", err)
+	cases := []struct {
+		name     string
+		args     []string
+		wantArgs []string
+		wantErr  bool
+	}{
+		{name: "-h", args: []string{"-h"}},
+		{name: "--help", args: []string{"--help"}},
+		{name: "-help", args: []string{"-help"}},
+		{name: "the help command", args: []string{"help"}},
+		{name: "help for one command", args: []string{"help", "save"}, wantArgs: []string{"save"}},
+		{name: "a command asked for its own help", args: []string{"events", "--help"}, wantArgs: []string{"events"}},
+		{name: "-h after a command", args: []string{"setup", "-h"}, wantArgs: []string{"setup"}},
+		// state and attach parse no flags of their own, so routing is the only
+		// place that can answer them.
+		{name: "-h after state", args: []string{"state", "-h"}, wantArgs: []string{"state"}},
+		{name: "-h after attach", args: []string{"attach", "-h"}, wantArgs: []string{"attach"}},
+
+		{name: "help for an unknown command", args: []string{"help", "install"}, wantErr: true},
+		{name: "help for two commands", args: []string{"help", "save", "restore"}, wantErr: true},
 	}
-	if !strings.Contains(out.String(), "-print") {
-		t.Fatalf("usage does not mention -print:\n%s", out.String())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := route(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("route(%v): got %+v, want an error", tc.args, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("route(%v): %v", tc.args, err)
+			}
+			if got.name != cmdHelp {
+				t.Fatalf("route(%v): got %q, want %q", tc.args, got.name, cmdHelp)
+			}
+			if !slices.Equal(got.args, tc.wantArgs) {
+				t.Fatalf("route(%v) args: got %v, want %v", tc.args, got.args, tc.wantArgs)
+			}
+		})
+	}
+}
+
+// The command list and the picker's flags both come from the code that runs
+// them, so the help cannot describe a command line that does not exist.
+func TestUsageListsEverything(t *testing.T) {
+	var out strings.Builder
+	usage(&out)
+	text := out.String()
+
+	for _, sc := range subcommands {
+		if !strings.Contains(text, sc.name) {
+			t.Errorf("usage does not mention %q:\n%s", sc.name, text)
+		}
+		if !strings.Contains(text, sc.summary) {
+			t.Errorf("usage does not summarise %q:\n%s", sc.name, text)
+		}
+	}
+	for _, flagName := range []string{"-print", "-version"} {
+		if !strings.Contains(text, flagName) {
+			t.Errorf("usage does not mention %q:\n%s", flagName, text)
+		}
+	}
+}
+
+func TestCommandHelp(t *testing.T) {
+	for _, sc := range subcommands {
+		t.Run(sc.name, func(t *testing.T) {
+			if sc.summary == "" || sc.details == "" {
+				t.Fatalf("%q has no description", sc.name)
+			}
+			var out strings.Builder
+			if code := runHelp(&out, []string{sc.name}); code != 0 {
+				t.Fatalf("runHelp(%q): got %d, want 0", sc.name, code)
+			}
+			text := out.String()
+			if want := "Usage: cattery " + signature(sc); !strings.HasPrefix(text, want) {
+				t.Fatalf("help for %q does not start with %q:\n%s", sc.name, want, text)
+			}
+			if !strings.Contains(text, sc.details) {
+				t.Fatalf("help for %q drops its description:\n%s", sc.name, text)
+			}
+			// Every flag the command parses is listed under it. A command with
+			// none has no flag set at all.
+			if flags := commandFlags(sc.name); flags != nil {
+				flags.VisitAll(func(f *flag.Flag) {
+					if !strings.Contains(text, "-"+f.Name) {
+						t.Errorf("help for %q does not mention -%s:\n%s", sc.name, f.Name, text)
+					}
+				})
+			}
+		})
+	}
+}
+
+// The picker has no entry in the command table, so `cattery help picker` is not
+// a command anyone can ask for.
+func TestRunHelpRejectsANonCommand(t *testing.T) {
+	var out strings.Builder
+	if code := runHelp(&out, []string{cmdPicker}); code != 2 {
+		t.Fatalf("runHelp(%q): got %d, want 2", cmdPicker, code)
+	}
+	if out.String() != "" {
+		t.Fatalf("runHelp(%q) wrote to stdout:\n%s", cmdPicker, out.String())
 	}
 }
 
@@ -147,7 +246,7 @@ func TestRouteSessionCommands(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := route(tc.args, io.Discard)
+			got, err := route(tc.args)
 			if err != nil {
 				t.Fatalf("route(%v): %v", tc.args, err)
 			}
@@ -165,7 +264,7 @@ func TestRouteSessionCommands(t *testing.T) {
 // command line still work.
 func TestRouteStillPrefersTheExistingEntryPoints(t *testing.T) {
 	for _, args := range [][]string{nil, {"-print"}} {
-		got, err := route(args, io.Discard)
+		got, err := route(args)
 		if err != nil {
 			t.Fatalf("route(%v): %v", args, err)
 		}
