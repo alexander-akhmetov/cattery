@@ -115,6 +115,17 @@ session file. `R` opens those tabs again and types each resume command at its
 prompt, without pressing return. `cattery save` and `cattery restore` do the
 same from a shell.
 
+The resume command is `claude --resume <id>` or `pi --session <file>`. If you
+start agents through a wrapper, export the command cattery should write instead,
+before the agent starts:
+
+```bash
+export CATTERY_RESUME_PREFIX_CLAUDE="claude --profile personal"
+```
+
+`CATTERY_RESUME_PREFIX_PI` does the same for pi, and `CATTERY_RESUME_PREFIX` for
+both kinds.
+
 tmux agents are not recorded: a pane belongs to whatever started it.
 
 ## Tab markers
