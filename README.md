@@ -51,53 +51,29 @@ lists the commands, and `cattery help <command>` says what one of them does.
 2. Start an agent in a kitty tab. Currently only Claude Code and Pi are supported.
 3. Press `opt+a` (`alt+a`) twice for the overlay in any kitty tab, which lists every running agent.
 
-## Tab markers
+There is nothing to configure per agent or per project. `cattery setup` wires up
+Claude Code, the pi extension covers pi, and from then on every agent you start
+reports itself.
 
-| Display state | Marker | Meaning |
-|---|---:|---|
-| `blocked` | red `◆` | the agent needs input |
-| `stalled` | magenta `◐` | one tool call has run past ten minutes |
-| `done` | green `●` | the agent finished while you were elsewhere |
-| `working` | yellow `●` | the agent is running |
-| `idle` | none | nothing to report |
+## The overlay
 
-A `working`, `blocked` or `stalled` tab also shows elapsed minutes. An OS window
-holding a `blocked`, `stalled` or `done` agent gets a `(N need you)` title
-prefix, which the Dock and the ⌘-Tab switcher pick up.
+`opt+a` `opt+a` opens it from any kitty tab. It lists every running agent,
+grouped by git repository, and Enter takes you to the one under the cursor.
 
-A notification fires on entry to `blocked`, `stalled` or `done`, unless that
-window has focus. kitty sends it, so nothing beyond kitty needs installing.
-Clicking the body focuses that exact window, switching OS window if it is in
-another one, which marks the agent seen and drops its marker. The banner also carries an
-**Open picker** button, which opens the overlay and leaves focus where it is. On
-macOS that button is a drop-down menu, which appears when you hover the banner.
-The button needs the binary path `cattery setup` writes into kitty.conf, so an
-install older than this version gets a banner with no button. Each window and
-state gets its own banner, so a repeat replaces itself and a `blocked` does not
-take a `done` away.
-
-Notifications are silent, because macOS cannot pick a sound per state. `blocked`
-asks for a higher urgency instead, which Linux honours. macOS ignores it today,
-so there a `blocked` banner looks the same as a `done` one.
-
-No agent writes `done`. The watcher derives it when the agent goes idle after
-working and you have not focused the window since. Focusing the window marks it
-seen and drops the marker.
-
-No agent writes `stalled` either, and none can: a hung tool call fires no event
-at all. The watcher sweeps its working windows once a minute and moves one there
-when the tool that window published has been running for more than ten minutes.
-An agent that publishes no tool never reaches the state, which today is every
-Claude agent. The elapsed minutes keep counting across the change, because it is
-still the same turn.
-
-## Overlay
-
-`opt+a` `opt+a` opens the management overlay. It lists all running agents, grouped 
-by git repository.
+| Key | Does |
+|---|---|
+| `j` `k`, `↑` `↓` | move the cursor |
+| `1`-`9` | put the cursor on that row |
+| `g`, `G` | first row, last row |
+| `enter` | go to the agent: focus its kitty tab, or open a viewer for a tmux pane |
+| `v` | open the preview drawer; press again to type at the agent |
+| `/` | search every field on a row: repository, branch, directory, prompt, tool |
+| `f` | cycle the state filter: all, working, stalled, blocked, done, idle |
+| `s`, `R` | save a snapshot of the tab tree, restore one |
+| `q`, `esc` | close |
 
 A row for a pi agent names the tool it is running and how long that one call has
-taken, on the line above the prompt it is working on:
+taken, above the prompt it is working on:
 
 ```
   2 ● working wt/publish-running-tool  pi                       3m 12s
@@ -105,23 +81,20 @@ taken, on the line above the prompt it is working on:
       publish the running tool
 ```
 
-The time appears once the call passes ten seconds. The picker recomputes it once
-a second from the timestamp the agent published, so it keeps rising while the
-agent prints nothing. Only pi publishes this; a Claude agent's row shows its
-prompt as before.
+The time appears after ten seconds. Only pi reports its tool; a Claude row shows
+its prompt.
 
-`v` opens a drawer beside the list, showing the screen of the agent under the
-cursor. It works on a kitty window you are not looking at and on a tmux pane
-nobody is attached to.
+### The preview drawer
 
-The drawer opens **read-only**, framed in grey: the keys still belong to the
-picker, so you can move down the list and watch each agent in turn.
+`v` shows the screen of the agent under the cursor, beside the list. It works on
+a kitty window you are not looking at and on a tmux pane nobody is attached to.
 
-A second `v` switches it to **read-write**, framed in red and marked `R/W` in
-the heading. From then on every key you press goes to the agent instead of to
-the picker, so you can answer a blocked agent without leaving the list. That
-includes `q`, `enter` and `ctrl+c`, which interrupts the agent rather than
-closing the picker. The cursor cannot move while you type.
+The drawer opens read-only, framed in grey. Keys still move the cursor, so you
+can walk down the list and watch each agent in turn.
+
+Press `v` again to type at the agent. The frame turns red, and every key goes to
+the agent: `q`, `enter`, `ctrl+c` to interrupt it. `esc` is the exception, so
+`ctrl+]` sends a literal escape.
 
 `esc` walks back out one step at a time:
 
@@ -131,67 +104,75 @@ closing the picker. The cursor cannot move while you type.
 | read-only (grey frame) | closes the drawer |
 | no drawer | closes the picker |
 
-`q` and `ctrl+c` still close the picker outright from anywhere except
-read-write.
+The drawer needs about 91 columns, and says so instead of opening when the
+terminal is narrower. It shows the left-hand columns of a wider screen, so boxes
+are cut off on the right, and there is no cursor.
 
-`esc` is the way out, so it is the one key the agent cannot be sent, and Claude
-and vim both want it. **`ctrl+]` sends a literal escape** and stays in
-read-write. The drawer's heading says so while you are typing.
+### Snapshots
 
-Read-only changes nothing, and does not mark the agent seen: a `done`
-marker survives being watched. The first key you send does mark it seen, the
-same way jumping to it does, because answering an agent is looking at it.
+`s` writes every kitty tab, its layout, and each agent's resume command to a
+session file. `R` opens those tabs again and types each resume command at its
+prompt, without pressing return. `cattery save` and `cattery restore` do the
+same from a shell.
 
-The drawer refreshes every second in read-only and four times a second in
-read-write, plus once right after each keystroke.
+tmux agents are not recorded: a pane belongs to whatever started it.
 
-The drawer shows the leftmost columns of a screen written for a wider terminal,
-so a boxed frame is cut off on the right, and it draws no cursor: you see that
-the frame changed, not where your text landed. It needs about 91 columns to open
-at all, and says so instead of opening when the terminal is narrower. Neither
-host reports a keystroke that went nowhere, so a window that closes under the
-drawer is noticed by the next reload rather than by the send itself.
+## Tab markers
 
-Marking a kitty agent seen goes through the watcher, so that half only works
-once `cattery setup` has installed this version's copy of it.
+Each agent's tab shows what it is doing, so you can see all of them at once.
+
+| State | Marker | Meaning |
+|---|---:|---|
+| `blocked` | red `◆` | the agent is waiting for your answer |
+| `stalled` | magenta `◐` | one tool call has run past ten minutes |
+| `done` | green `●` | the agent finished while you were looking elsewhere |
+| `working` | yellow `●` | the agent is running |
+| `idle` | none | nothing to report |
+
+A `working`, `blocked` or `stalled` tab also shows how many minutes it has been
+that way. An OS window with a `blocked`, `stalled` or `done` agent in it gets a
+`(N need you)` title prefix, which the Dock and the ⌘-Tab switcher pick up.
+
+Focus a `done` window and the marker goes away. Only pi reports which tool it is
+running, so a Claude agent never reaches `stalled`.
+
+## Notifications
+
+A banner fires when an agent goes `blocked`, `stalled` or `done`, unless you are
+already looking at its window. kitty sends it, so there is nothing else to
+install.
+
+Click it to go to that agent, switching OS window if needed. The
+**Open picker** button opens the overlay instead and leaves your focus alone; on
+macOS it is a drop-down menu you get by hovering the banner.
+
+Banners are silent: macOS cannot pick a sound per state. `blocked` asks for a
+higher urgency, which Linux honours and macOS ignores.
 
 ## tmux agents
 
-An agent in a tmux pane publishes the same states as one in a kitty window, as
-pane options: `@AGENT_STATE`, `@AGENT_KIND`, `@AGENT_MSG`, plus `@AGENT_TOOL`
-and `@AGENT_TOOL_SINCE` from pi. `cattery state` and the pi extension write
-there whenever `$TMUX` and `$TMUX_PANE` are set, which covers a pane nobody is
-attached to. To see what an agent published:
+An agent running in a tmux pane appears in the overlay beside the kitty ones, in
+the same repository groups, marked with a `tmux` chip, whether or not anybody
+is attached to the pane.
+
+Those agents get no tab marker and no notification, because a pane has no kitty
+tab to mark.
+
+Enter opens a kitty tab showing that pane, read-only: keys do nothing, and your
+terminal size does not resize the agent's pane. `prefix d` closes it. A second
+Enter goes back to the tab already showing it. From a shell it is
+`cattery attach dev:3.%17`. Attaching this way clears a `done` row; a plain
+`tmux attach` does not.
+
+The viewer is read-only, the drawer is not. `v` `v` types at a tmux pane the
+same way it types at a kitty window, so you can watch a pane in one tab and
+answer it from the drawer. Needs tmux 3.1 or later.
+
+If an agent does not show up, check what it wrote on its pane:
 
 ```bash
 tmux list-panes -a -F '#{pane_id} #{@AGENT_STATE} #{@AGENT_KIND} #{@AGENT_TOOL}'
 ```
-
-The picker lists those panes beside the kitty agents, in the same repository
-groups, marked with a `tmux` chip. There is no tab marker and no notification
-for them: nothing pushes tmux events, and a pane has no kitty tab to mark.
-
-Enter on a tmux agent opens a kitty tab showing that pane **read-only**: keys do
-nothing, and the viewer's terminal size does not resize the agent's pane.
-`prefix d` detaches and closes the tab. A second Enter on the same agent focuses
-the tab already showing it.
-
-The view is its own tmux session, grouped with the agent's, so two viewers never
-fight over which window the shared session shows. `cattery attach
-<session>:<window>.<pane id>` is the same thing from a shell, for example
-`cattery attach dev:3.%17`.
-
-The viewer tab is read-only, but the picker's drawer in read-write is not: `v`
-`v` types at a tmux pane the same way it types at a kitty window. So you can
-watch a pane in a viewer tab and answer it from the drawer at the same time.
-This needs a tmux with `send-keys -H`, which is tmux 3.1 and later.
-
-Attaching drops the `done` marker, because the attach marks the pane seen. A
-plain `tmux attach` does not, so an agent watched that way keeps its marker
-until it works again.
-
-Snapshots stay kitty-only. `cattery save` records kitty tabs, and a tmux agent
-belongs to whatever started it.
 
 ## Events
 
@@ -210,15 +191,15 @@ Each line is one JSON object:
 |---|---|
 | `ts` | unix seconds |
 | `window` | the kitty window id |
-| `kind` | what the agent calls itself, `pi` or `claude`, and empty on a `cleared` event from Claude, which drops `AGENT_KIND` in the same batch |
-| `from` | the display state before this change, `null` the first time the window is seen |
+| `kind` | what the agent calls itself, `pi` or `claude`, empty on a `cleared` event from Claude |
+| `from` | the state before this change, `null` the first time the window is seen |
 | `to` | `working`, `stalled`, `blocked`, `done`, `idle`, `cleared` when the agent dropped its state, `closed` when the window went away |
 | `title` | the window title, cut to 200 characters |
-| `cwd` | the agent's directory, the one the picker shows |
+| `cwd` | the agent's directory |
 | `msg` | the prompt the agent is on |
 | `focused` | whether you were looking at the window |
 
-One worked subscriber, a desktop notification for every agent that stops for an
+A worked subscriber, one desktop notification for every agent that stops for an
 answer:
 
 ```bash
@@ -226,20 +207,13 @@ cattery events | jq -r --unbuffered 'select(.to == "blocked") | .cwd' |
   while read -r cwd; do terminal-notifier -title "agent blocked" -message "$cwd"; done
 ```
 
-The command binds a unix datagram socket and registers its path with the
-running kitty. The watcher sends one datagram per transition to every
-registered path, and keeps nothing: an event that fires while nobody is
-subscribed is gone, and there is no replay. What ran yesterday is in the
-agents' own session files.
+Nothing is stored. An event that fires while nobody is subscribed is gone, and
+there is no replay.
 
-Three things to know:
+Three more things to know:
 
-* tmux agents emit nothing. No watcher runs there, and the picker derives a
-  tmux agent's `done` when it reads the pane, so a writer-side event would
-  carry a state the picker disagrees with.
-* Registering goes through a kitten `cattery setup` installs, so run setup
-  again after upgrading the binary. Without it kitty has no such kitten and the
-  command says so.
-* The registry lives in the kitty process. A kitty restart drops every
-  subscription, and `cattery events` exits 3 when it notices, for a supervisor
-  to start again.
+* tmux agents emit nothing.
+* Subscribing needs the files `cattery setup` installs, so run setup again after
+  upgrading the binary.
+* A kitty restart drops every subscription. `cattery events` exits 3 when it
+  notices, so a supervisor can start it again.
