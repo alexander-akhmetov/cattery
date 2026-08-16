@@ -9,8 +9,17 @@ import (
 )
 
 // claudeHooks maps each Claude Code hook event to the state cattery publishes
-// from it. Order is the order setup writes and reports them in.
-var claudeHooks = []struct{ Event, State string }{
+// from it. Order is the order setup writes and reports them in, which is the
+// order they fire.
+//
+// SessionStart takes a matcher, because that hook fires for a compaction and a
+// fork as well as for a session opening, and an idle mid-turn would mark a
+// running agent finished. A fork is either one and the payload does not say
+// which, so the matcher drops that word too: see startSources in
+// internal/state. The writer checks the payload's source as well, for a Claude
+// that predates the matcher and for a settings.json the user edited.
+var claudeHooks = []struct{ Event, State, Matcher string }{
+	{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
 	{Event: "Notification", State: "blocked"},
 	{Event: "UserPromptSubmit", State: "working"},
 	{Event: "Stop", State: "idle"},
@@ -114,7 +123,7 @@ func (o object) child(key string) (object, error) {
 	return out, nil
 }
 
-// mergeClaudeHooks adds cattery's four hooks to Claude's settings and returns
+// mergeClaudeHooks adds cattery's five hooks to Claude's settings and returns
 // the whole file. Existing entries stay, because the arrays under hooks.<Event>
 // hold other tools' commands. The merge appends, and it rewrites only the
 // command cattery already owns, so a re-run updates the binary path instead of
@@ -147,9 +156,14 @@ func mergeClaudeHooks(settings []byte, binary string) ([]byte, error) {
 			// A struct, because a map's keys are sorted. That would write
 			// "command" before "type" and read as a different shape from every
 			// hook already in the file.
+			//
+			// The matcher goes only on a group this merge creates. A group the
+			// user has edited belongs to them, and putting a matcher back on one
+			// they stripped would fight them.
 			group, err := encode(struct {
-				Hooks []hookEntry `json:"hooks"`
-			}{Hooks: []hookEntry{{Type: "command", Command: command}}})
+				Matcher string      `json:"matcher,omitempty"`
+				Hooks   []hookEntry `json:"hooks"`
+			}{Matcher: h.Matcher, Hooks: []hookEntry{{Type: "command", Command: command}}})
 			if err != nil {
 				return nil, err
 			}

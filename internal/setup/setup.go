@@ -414,13 +414,19 @@ func (s *session) claude() {
 	}
 }
 
-// claudeInstructions lists the four hooks for a user who declined the merge, or
+// claudeInstructions lists the five hooks for a user who declined the merge, or
 // whose settings.json setup could not read.
 func claudeInstructions(binary string) string {
 	lines := make([]string, 0, len(claudeHooks)+1)
 	lines = append(lines, "    Add these to Claude's settings.json, as hooks.<Event>[].hooks[].command:")
 	for _, h := range claudeHooks {
-		lines = append(lines, fmt.Sprintf("      %-17s %s", h.Event, hookCommand(binary, h.State)))
+		line := fmt.Sprintf("      %-17s %s", h.Event, hookCommand(binary, h.State))
+		if h.Matcher != "" {
+			// Hand-installed without the matcher, SessionStart runs this for a
+			// compaction as well, which marks a running agent finished.
+			line += fmt.Sprintf("   (on a group with \"matcher\": %q)", h.Matcher)
+		}
+		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
 }

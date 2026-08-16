@@ -166,8 +166,13 @@ def _derive_display(
 
     `prev` is the window's current AGENT_DISPLAY. "done" means "finished
     something you have not looked at", so only a state that did work reaches it.
-    Agents announce `idle` when they start, as pi does on session_start, and a
-    session started in an unfocused window must not claim to have finished.
+    Agents announce `idle` when they start, as pi does on session_start and
+    Claude does on SessionStart, and a start after a clean exit reads as idle:
+    the agent's own clear dropped AGENT_STATE, which drops AGENT_DISPLAY with
+    it. A window whose agent was killed keeps AGENT_DISPLAY="working", so the
+    next session's opening idle reads as "done" once while the window is
+    unfocused. Nothing outside can prevent that, because AGENT_DISPLAY is this
+    module's own output.
 
     `tool_since` is when the tool call in flight started, and None when the
     agent publishes none. An agent without one never reads as stalled, which is

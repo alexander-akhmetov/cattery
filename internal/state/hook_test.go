@@ -64,6 +64,21 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 				"AGENT_KIND", "AGENT_MSG", "AGENT_STATE"},
 		},
 		{
+			// The deletes are bare names here too, between the resume command
+			// and the state.
+			name:  "a session start deletes the prompt and the worked flag",
+			state: "idle",
+			stdin: `{"session_id":"s1","source":"startup"}`,
+			want: []string{"@", "set-user-vars", "--match", "id:7",
+				"AGENT_KIND=claude", "AGENT_RESUME=claude --resume s1",
+				"AGENT_MSG", "AGENT_WORKED", "AGENT_STATE=idle"},
+		},
+		{
+			name:  "a compaction publishes nothing",
+			state: "idle",
+			stdin: `{"session_id":"s1","source":"compact"}`,
+		},
+		{
 			name:  "an unknown word publishes nothing",
 			state: "sleeping",
 		},

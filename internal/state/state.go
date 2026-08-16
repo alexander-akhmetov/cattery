@@ -1,8 +1,8 @@
 // Package state publishes agent state to kitty as AGENT_* user variables. It
 // backs `cattery state <working|blocked|idle|clear>`. Claude Code runs it from
-// four hooks (Notification, UserPromptSubmit, Stop, SessionEnd), and shell
-// wrappers run `clear` after any agent process returns, which catches crashes
-// and force-quits the agent's own cleanup never saw.
+// five hooks (SessionStart, Notification, UserPromptSubmit, Stop, SessionEnd),
+// and shell wrappers run `clear` after any agent process returns, which catches
+// crashes and force-quits the agent's own cleanup never saw.
 //
 // Nothing here fails loudly. A hook error would surface in the agent's
 // transcript, so every path returns and the command exits 0.
@@ -15,6 +15,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,25 @@ const (
 const (
 	envResumePrefix       = "CATTERY_RESUME_PREFIX"
 	envResumePrefixClaude = "CATTERY_RESUME_PREFIX_CLAUDE"
+)
+
+// The SessionStart sources cattery reads. Claude fires that hook for five.
+// startup, resume and clear open a session waiting for a prompt. compact fires
+// in the middle of a turn, where an idle would move the tab marker from working
+// to done and fire a "finished" banner over a running agent.
+//
+// fork is both. The /fork background copy runs mid-turn, in the same window,
+// while `--fork-session` and /branch open a session waiting for a prompt. The
+// payload does not say which, so the whole word is excluded: a forked session
+// gets no picker row until its first prompt, which costs less than marking a
+// running agent finished. Claude before 2.1.214 called a fork "resume", so on
+// those versions a /fork copy passes both guards.
+//
+// The settings.json matcher keeps compact and fork away; these cover an older
+// Claude and a settings.json the user edited.
+var (
+	startSources   = []string{"startup", "resume", "clear"}
+	midTurnSources = []string{"compact", "fork"}
 )
 
 // promptLimit caps AGENT_MSG. The picker draws it on one line beside a spinner,
@@ -172,6 +192,20 @@ func (w Writer) Write(state string) {
 	// Each hook invocation is a fresh process and cannot tell a first call from
 	// a later one. The write is one short escape sequence, so resend it always.
 	payload := parseHook(readHook(w.Stdin))
+	// Both SessionStart and Stop run `cattery state idle`, and of the hooks
+	// cattery installs only SessionStart sends a source. An unrecognised source
+	// reads as Stop on purpose: were Claude ever to put one on Stop, taking it
+	// for a session start would drop the done marker with nothing said.
+	sessionStart := false
+	if state == "idle" {
+		switch {
+		case slices.Contains(midTurnSources, payload.Source):
+			return
+		case slices.Contains(startSources, payload.Source):
+			sessionStart = true
+		}
+	}
+
 	vars := []Var{{Name: varKind, Value: kindClaude}}
 	// Every hook payload carries session_id, so all three live states publish
 	// the resume command.
@@ -185,6 +219,24 @@ func (w Writer) Write(state string) {
 		if prompt := normalizePrompt(payload.Prompt); prompt != "" {
 			vars = append(vars, Var{Name: varMsg, Value: prompt})
 		}
+	}
+	// A session start drops what the agent before it left in the window or the
+	// pane. A Claude killed without SessionEnd leaves both standing: the prompt
+	// would sit on the new row, and the "has worked" flag turns this opening
+	// idle into a "done" the moment the picker reads it.
+	//
+	// AGENT_WORKED is a tmux option rather than part of the shared contract. The
+	// delete goes in the batch instead of behind a check for the host because
+	// the kitty watcher never reads that name and kitty drops a variable it
+	// never set. It buys nothing there: what the watcher works from is
+	// AGENT_DISPLAY, which it wrote itself and this batch does not touch, so a
+	// session started in an unfocused window whose last agent was killed still
+	// reads as done once.
+	if sessionStart {
+		vars = append(vars,
+			Var{Name: varMsg, Delete: true},
+			Var{Name: varWorked, Delete: true},
+		)
 	}
 	// AGENT_STATE goes last in the batch. Writing it is what wakes the kitty
 	// watcher, and anything written after it is missing from the transition the
@@ -235,10 +287,12 @@ func readHook(r io.Reader) []byte {
 }
 
 // hookPayload is the part of an agent hook payload the writer reads. Claude
-// sends session_id on every hook and prompt only on UserPromptSubmit.
+// sends session_id on every hook, prompt only on UserPromptSubmit, and source
+// only on SessionStart.
 type hookPayload struct {
 	Prompt    string `json:"prompt"`
 	SessionID string `json:"session_id"`
+	Source    string `json:"source"`
 }
 
 // parseHook decodes the payload, or returns an empty one. A payload that is not

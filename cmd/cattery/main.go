@@ -106,7 +106,7 @@ again after every upgrade. Reload kitty afterwards.`,
 tmux pane when $TMUX and $TMUX_PANE are set and on the kitty window
 otherwise.
 
-Claude Code runs this from four hooks, and the shell wrappers run "clear"
+Claude Code runs this from five hooks, and the shell wrappers run "clear"
 after the agent exits. It is meant to be called by an agent rather than
 typed, and it exits 0 whatever happens: a failure here would show up in the
 agent's own transcript.`,

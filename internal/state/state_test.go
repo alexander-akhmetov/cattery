@@ -114,6 +114,79 @@ func TestWriteUpdateOrder(t *testing.T) {
 			want:  []Var{set(varKind, "claude"), set(varState, "idle")},
 		},
 		{
+			// SessionStart. The two deletes drop what an agent killed without
+			// SessionEnd left behind.
+			name:  "a startup publishes kind, resume, the deletes, then the state",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"startup"}`),
+			want: []Var{
+				set(varKind, "claude"),
+				set(varResume, "claude --resume s1"),
+				del(varMsg),
+				del(varWorked),
+				set(varState, "idle"),
+			},
+		},
+		{
+			name:  "a resume publishes the same batch",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"resume"}`),
+			want: []Var{
+				set(varKind, "claude"),
+				set(varResume, "claude --resume s1"),
+				del(varMsg),
+				del(varWorked),
+				set(varState, "idle"),
+			},
+		},
+		{
+			name:  "a clear source publishes the same batch",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"clear"}`),
+			want: []Var{
+				set(varKind, "claude"),
+				set(varResume, "claude --resume s1"),
+				del(varMsg),
+				del(varWorked),
+				set(varState, "idle"),
+			},
+		},
+		{
+			// SessionStart fires again mid-turn. An idle there would read as
+			// "done" and mark a running agent finished.
+			name:  "a compaction publishes nothing",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"compact"}`),
+		},
+		{
+			name:  "a fork publishes nothing",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"fork"}`),
+		},
+		{
+			// The Stop hook. Its idle keeps AGENT_MSG, which is what a done row
+			// shows.
+			name:  "an idle with no source is the Stop hook",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","stop_hook_active":false}`),
+			want:  []Var{set(varKind, "claude"), set(varResume, "claude --resume s1"), set(varState, "idle")},
+		},
+		{
+			// A source Claude adds later reads as Stop, so the done marker
+			// survives rather than disappearing with nothing said.
+			name:  "an unknown source falls to the Stop path",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"telepathy"}`),
+			want:  []Var{set(varKind, "claude"), set(varResume, "claude --resume s1"), set(varState, "idle")},
+		},
+		{
+			// Only the idle word serves two hooks, so only it reads the source.
+			name:  "a source on another state changes nothing",
+			state: "working",
+			stdin: strings.NewReader(`{"session_id":"s1","source":"compact"}`),
+			want:  []Var{set(varKind, "claude"), set(varResume, "claude --resume s1"), set(varState, "working")},
+		},
+		{
 			name:  "clear deletes kind, message, then state",
 			state: "clear",
 			want:  []Var{del(varKind), del(varMsg), del(varState)},
@@ -207,6 +280,13 @@ func TestWriteResumeCommand(t *testing.T) {
 			name:  "idle publishes it too",
 			state: "idle",
 			stdin: strings.NewReader(`{"session_id":"abc-123"}`),
+			want:  "claude --resume abc-123",
+		},
+		{
+			// A snapshot can reach a session that has answered nothing yet.
+			name:  "a session start publishes it before the first prompt",
+			state: "idle",
+			stdin: strings.NewReader(`{"session_id":"abc-123","source":"startup"}`),
 			want:  "claude --resume abc-123",
 		},
 		{
@@ -719,6 +799,21 @@ func TestTmuxTransportMetadata(t *testing.T) {
 			prev: "working",
 			vars: []Var{set(varState, "idle")},
 			want: []string{"@AGENT_STATE", "@AGENT_SINCE"},
+		},
+		{
+			// The pane the previous agent was killed in still says "working" and
+			// still carries its prompt. The session-start batch takes both away,
+			// so this session's opening idle is not read as "done".
+			name: "a session start forgets the work",
+			prev: "working",
+			vars: []Var{
+				set(varKind, "claude"),
+				set(varResume, "claude --resume s1"),
+				del(varMsg),
+				del(varWorked),
+				set(varState, "idle"),
+			},
+			want: []string{"@AGENT_KIND", "@AGENT_RESUME", "-u @AGENT_MSG", "-u @AGENT_WORKED", "@AGENT_STATE", "@AGENT_SINCE"},
 		},
 		{
 			// A pane outlives its agents, and the next one starts with nothing

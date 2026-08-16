@@ -596,8 +596,11 @@ func TestClaudeMergeKeepsUnrelatedHooksAndKeyOrder(t *testing.T) {
 	if got, want := topLevelKeys(t, merged), []string{"model", "hooks", "env"}; !equal(got, want) {
 		t.Errorf("top-level key order: got %v, want %v", got, want)
 	}
-	if got, want := eventKeys(t, merged), []string{"Notification", "PostToolUse", "UserPromptSubmit", "Stop", "SessionEnd"}; !equal(got, want) {
-		t.Errorf("hook event order: got %v, want %v", got, want)
+	// A file that already has hooks keeps its own order, and the events cattery
+	// adds are appended in the order they fire.
+	wantEvents := []string{"Notification", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
+	if got := eventKeys(t, merged); !equal(got, wantEvents) {
+		t.Errorf("hook event order: got %v, want %v", got, wantEvents)
 	}
 	if backup := h.read(path + ".cattery-bak"); backup != unrelatedSettings {
 		t.Errorf("backup does not hold the original:\n%s", backup)
@@ -606,31 +609,32 @@ func TestClaudeMergeKeepsUnrelatedHooksAndKeyOrder(t *testing.T) {
 
 func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
 	cases := []struct {
-		name       string
-		existing   string
-		gone       string   // a command the merge must rewrite away
-		kept       []string // text the merge must leave exactly as it was
-		wantGroups int      // Stop groups afterwards
+		name         string
+		event        string // the hook event the case is about, "" for Stop
+		existing     string
+		gone         string   // a command the merge must rewrite away
+		kept         []string // text the merge must leave exactly as it was
+		wantMatchers []string // the matcher of each group afterwards, "" for none
 	}{
 		{
-			name:       "the shell installer's command",
-			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery-state idle"}]}]}}`,
-			gone:       "cattery-state idle",
-			wantGroups: 1,
+			name:         "the shell installer's command",
+			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery-state idle"}]}]}}`,
+			gone:         "cattery-state idle",
+			wantMatchers: []string{""},
 		},
 		{
-			name:       "an older binary path",
-			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
-			gone:       "/old/bin/cattery state idle",
-			wantGroups: 1,
+			name:         "an older binary path",
+			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
+			gone:         "/old/bin/cattery state idle",
+			wantMatchers: []string{""},
 		},
 		{
 			// What setup writes when the binary sits in a directory whose name
 			// holds a space.
-			name:       "a quoted binary path",
-			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/opt/my apps/cattery' state idle"}]}]}}`,
-			gone:       "/opt/my apps/cattery",
-			wantGroups: 1,
+			name:         "a quoted binary path",
+			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/opt/my apps/cattery' state idle"}]}]}}`,
+			gone:         "/opt/my apps/cattery",
+			wantMatchers: []string{""},
 		},
 		{
 			// The group belongs to the user. It can carry a matcher and another
@@ -639,17 +643,28 @@ func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
 			existing: `{"hooks":{"Stop":[{"matcher":"*","hooks":[` +
 				`{"type":"command","command":"/old/bin/cattery state idle"},` +
 				`{"type":"command","command":"terminal-notifier -title 'Claude Code'"}]}]}}`,
-			gone:       "/old/bin/cattery state idle",
-			kept:       []string{`"matcher": "*"`, "terminal-notifier -title 'Claude Code'"},
-			wantGroups: 1,
+			gone:         "/old/bin/cattery state idle",
+			kept:         []string{`"matcher": "*"`, "terminal-notifier -title 'Claude Code'"},
+			wantMatchers: []string{"*"},
 		},
 		{
 			// A command that only mentions cattery belongs to somebody else. The
 			// && is here too, because json.MarshalIndent would escape it.
-			name:       "a command that names cattery without running it",
-			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cd ~/projects/cattery && make lint"}]}]}}`,
-			kept:       []string{"cd ~/projects/cattery && make lint"},
-			wantGroups: 2,
+			name:         "a command that names cattery without running it",
+			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cd ~/projects/cattery && make lint"}]}]}}`,
+			kept:         []string{"cd ~/projects/cattery && make lint"},
+			wantMatchers: []string{"", ""},
+		},
+		{
+			// The user took the matcher off cattery's own group. The merge writes
+			// one only on a group it creates, so their edit stands and only the
+			// command is rewritten. The source check in the writer is what keeps
+			// a compaction from publishing idle here.
+			name:         "a SessionStart group the user stripped the matcher from",
+			event:        "SessionStart",
+			existing:     `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
+			gone:         "/old/bin/cattery state idle",
+			wantMatchers: []string{""},
 		},
 	}
 	for _, tc := range cases {
@@ -669,11 +684,27 @@ func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
 					t.Errorf("the merge lost %q:\n%s", want, merged)
 				}
 			}
-			if n := strings.Count(merged, testBinary+" state idle"); n != 1 {
-				t.Errorf("Stop hooks running cattery: got %d, want 1:\n%s", n, merged)
+			// Both idle hooks run the same command, so this counts inside the
+			// event rather than over the whole file.
+			event := tc.event
+			if event == "" {
+				event = "Stop"
 			}
-			if n := len(groupsFor(t, merged, "Stop")); n != tc.wantGroups {
-				t.Errorf("Stop groups: got %d, want %d:\n%s", n, tc.wantGroups, merged)
+			groups := groupsFor(t, merged, event)
+			owns := 0
+			for _, group := range groups {
+				owns += strings.Count(string(group), testBinary+" state idle")
+			}
+			if owns != 1 {
+				t.Errorf("%s hooks running cattery: got %d, want 1:\n%s", event, owns, merged)
+			}
+			if len(groups) != len(tc.wantMatchers) {
+				t.Fatalf("%s groups: got %d, want %d:\n%s", event, len(groups), len(tc.wantMatchers), merged)
+			}
+			for i, want := range tc.wantMatchers {
+				if got := matcherOf(t, groups[i]); got != want {
+					t.Errorf("%s group %d matcher: got %q, want %q:\n%s", event, i, got, want, merged)
+				}
 			}
 		})
 	}
@@ -718,6 +749,29 @@ func TestClaudeSettingsCreatedWhenAbsent(t *testing.T) {
 		if !strings.Contains(merged, testBinary+" state "+hook.State) {
 			t.Errorf("settings.json missing the %s hook:\n%s", hook.Event, merged)
 		}
+		groups := groupsFor(t, merged, hook.Event)
+		if len(groups) != 1 {
+			t.Fatalf("%s groups: got %d, want 1:\n%s", hook.Event, len(groups), merged)
+		}
+		// Claude writes "matcher" before "hooks", and only SessionStart gets one
+		// at all: the other four fire once per turn and need no filtering.
+		want := []string{"hooks"}
+		if hook.Matcher != "" {
+			want = []string{"matcher", "hooks"}
+		}
+		if got := hookGroup(t, groups[0]).keys; !equal(got, want) {
+			t.Errorf("%s group keys: got %v, want %v:\n%s", hook.Event, got, want, merged)
+		}
+	}
+	wantEvents := []string{"SessionStart", "Notification", "UserPromptSubmit", "Stop", "SessionEnd"}
+	if got := eventKeys(t, merged); !equal(got, wantEvents) {
+		t.Errorf("hook event order: got %v, want %v", got, wantEvents)
+	}
+	// The literal, because claudeHooks is what the loop above compares against.
+	// A matcher that missed a source would leave that source with no hook, and
+	// one that named compact would mark a running agent finished.
+	if !strings.Contains(merged, `"matcher": "startup|resume|clear"`) {
+		t.Errorf("SessionStart carries no matcher:\n%s", merged)
 	}
 	if _, err := os.Stat(h.claudePath("settings.json.cattery-bak")); !errors.Is(err, os.ErrNotExist) {
 		t.Error("a backup was written for a file that did not exist")
@@ -780,6 +834,11 @@ func TestConsent(t *testing.T) {
 				for _, hook := range claudeHooks {
 					if !strings.Contains(out, hook.Event) || !strings.Contains(out, testBinary+" state "+hook.State) {
 						t.Errorf("report missing the manual %s command, got:\n%s", hook.Event, out)
+					}
+					// A hand-installed SessionStart without its matcher fires
+					// on a compaction, so the instructions have to name it.
+					if hook.Matcher != "" && !strings.Contains(out, `"matcher": "`+hook.Matcher+`"`) {
+						t.Errorf("report missing the %s matcher, got:\n%s", hook.Event, out)
 					}
 				}
 			}
@@ -985,6 +1044,30 @@ func groupsFor(t *testing.T, data, event string) []json.RawMessage {
 		}
 	}
 	return groups
+}
+
+// hookGroup parses one hook group, which remembers its key order.
+func hookGroup(t *testing.T, group json.RawMessage) object {
+	t.Helper()
+	var out object
+	if err := json.Unmarshal(group, &out); err != nil {
+		t.Fatalf("parse a hook group: %v", err)
+	}
+	return out
+}
+
+// matcherOf is the matcher one hook group carries, or "" when it has none.
+func matcherOf(t *testing.T, group json.RawMessage) string {
+	t.Helper()
+	raw, ok := hookGroup(t, group).values["matcher"]
+	if !ok {
+		return ""
+	}
+	var matcher string
+	if err := json.Unmarshal(raw, &matcher); err != nil {
+		t.Fatalf("parse the matcher: %v", err)
+	}
+	return matcher
 }
 
 func equal(a, b []string) bool {

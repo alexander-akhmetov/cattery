@@ -222,6 +222,31 @@ the picker compares the installed files with the embedded ones and warns.
   `_WORKED`. Any new state a working agent can pass through has to join that
   tuple, or the agent goes idle with no marker and no notification. The failure
   is silent: no alert, no error.
+- Claude's `SessionStart` hook fires for five sources. `startup`, `resume` and
+  `clear` open a session waiting for a prompt; `compact` fires in the middle of
+  a turn, and an `idle` published there reads as `done` through `_WORKED` above:
+  a green tab marker and a "finished" banner over an agent that is still
+  working. Two guards, because either alone leaves a hole: the
+  `"matcher": "startup|resume|clear"` `cattery setup` writes on the group, and
+  the `source` check in `internal/state`. That `source` is also what tells a
+  `SessionStart` idle from a `Stop` idle, since both hooks run
+  `cattery state idle`, and of the five hooks cattery installs only
+  `SessionStart` sends one. An unrecognised value reads as `Stop`, so a source
+  Claude adds later cannot silently drop the `done` marker.
+- `fork` is the fifth source and covers two different things: the `/fork`
+  background copy, which runs mid-turn in the same window, and
+  `--fork-session` or `/branch`, which open a session waiting for a prompt. The
+  payload does not separate them, so both guards drop the whole word, and a
+  forked session gets no picker row until its first prompt. Claude before
+  2.1.214 reported a fork as `resume`, which passes both guards.
+- The session-start batch deletes `AGENT_MSG` and `AGENT_WORKED`, which resets
+  what a killed agent left on a tmux pane and nothing on a kitty window. The
+  "has worked" fact the watcher reads is `AGENT_DISPLAY`, its own output, and no
+  writer sets that. So a Claude killed without `SessionEnd` leaves
+  `AGENT_DISPLAY=working` behind, and the next session started in that window
+  reads as `done` once while the window is unfocused. `cattery state clear`,
+  which the fish wrappers run after any agent process returns, is what normally
+  prevents it.
 - `time.Time{}` is older than every threshold, so a "has this run too long" rule
   needs `!IsZero()` as well as the comparison, and every unix-seconds variable
   needs a `secs > 0` guard: `"0"` parses, and `time.Unix(0, 0)` is not
