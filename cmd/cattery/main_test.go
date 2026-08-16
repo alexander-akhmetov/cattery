@@ -50,7 +50,7 @@ func TestRoute(t *testing.T) {
 			wantArgs: []string{"--dry-run", "--kitty-dir", "/tmp/k"},
 		},
 
-		{name: "attach", args: []string{"attach", "kontora:3.%17"}, want: cmdAttach, wantArgs: []string{"kontora:3.%17"}},
+		{name: "attach", args: []string{"attach", "dev:3.%17"}, want: cmdAttach, wantArgs: []string{"dev:3.%17"}},
 		// The target is checked where the attach runs, not here.
 		{name: "attach with no target", args: []string{"attach"}, want: cmdAttach},
 
@@ -566,9 +566,9 @@ func TestPrintAgents(t *testing.T) {
 	err := printAgents(printLister{agents: []agent.Agent{
 		{
 			ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
-			Project: "astra-l", Branch: "kontora/al-67je",
-			CWD:    "/Users/x/.kontora/worktrees/astra-l/al-67je",
-			Target: "kontora:3.%17",
+			Project: "myapp", Branch: "wt/feat-42",
+			CWD:    "/Users/x/.worktrees/myapp/feat-42",
+			Target: "dev:3.%17",
 		},
 		{
 			ID: 12, Host: agent.HostKitty, Kind: "pi", Display: "idle",
@@ -583,7 +583,7 @@ func TestPrintAgents(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("got %d lines, want 2: %q", len(lines), out.String())
 	}
-	for _, want := range []string{"host=tmux", "id=17", "target=kontora:3.%17", "astra-l", "working"} {
+	for _, want := range []string{"host=tmux", "id=17", "target=dev:3.%17", "myapp", "working"} {
 		if !strings.Contains(lines[0], want) {
 			t.Errorf("tmux row %q is missing %q", lines[0], want)
 		}
@@ -599,7 +599,7 @@ func TestPrintAgents(t *testing.T) {
 func TestPrintAgentsPartialFailure(t *testing.T) {
 	var out strings.Builder
 	err := printAgents(printLister{
-		agents: []agent.Agent{{ID: 17, Host: agent.HostTmux, Display: "working", Target: "kontora:3.%17"}},
+		agents: []agent.Agent{{ID: 17, Host: agent.HostTmux, Display: "working", Target: "dev:3.%17"}},
 		err:    errors.New("kitty: no listening socket"),
 	}, &out)
 
@@ -657,9 +657,9 @@ func TestRunAttachArguments(t *testing.T) {
 	}{
 		{name: "no target", args: nil, want: 2},
 		{name: "an empty target", args: []string{""}, want: 2},
-		{name: "two targets", args: []string{"kontora:3.%17", "kontora:4.%18"}, want: 2},
-		{name: "a target with no window index", args: []string{"kontora"}, want: 1},
-		{name: "a target with no pane id", args: []string{"kontora:3"}, want: 1},
+		{name: "two targets", args: []string{"dev:3.%17", "dev:4.%18"}, want: 2},
+		{name: "a target with no window index", args: []string{"dev"}, want: 1},
+		{name: "a target with no pane id", args: []string{"dev:3"}, want: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

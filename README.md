@@ -32,10 +32,10 @@ go install github.com/alexander-akhmetov/cattery/cmd/cattery@latest
 cattery setup
 ```
 
-Reload kitty afterwards. Press `opt+a` twice to open the picker.
+Reload kitty afterwards.
 
 `cattery setup` installs copies of the kitty files, and an upgrade of the binary
-does not update those copies. Run it again after every upgrade.
+does not update those copies. Run it again after every upgrade. Restart kitty after.
 
 `cattery setup` also offers to run
 `pi install git:github.com/alexander-akhmetov/cattery`. Say yes after every
@@ -44,6 +44,12 @@ pi extension.
 
 `cattery -version` prints the release the binary was built from. `cattery help`
 lists the commands, and `cattery help <command>` says what one of them does.
+
+## Quick start
+
+1. Run `cattery setup` and restart kitty.
+2. Start an agent in a kitty tab. Currently only Claude Code and Pi are supported.
+3. Press `opt+a` (`alt+a`) twice for the overlay in any kitty tab, which lists every running agent.
 
 ## Tab markers
 
@@ -94,9 +100,9 @@ A row for a pi agent names the tool it is running and how long that one call has
 taken, on the line above the prompt it is working on:
 
 ```
-  2 ● working  cat-muv9  pi   kontora/publish-running-tool          3m 12s
-    ~/…/cat-muv9 · ⠹ bash: go test -race ./... 1m 04s
-                     publish the running tool
+  2 ● working wt/publish-running-tool  pi                       3m 12s
+    ~/…/myapp · ⠹ bash: go test -race ./... 1m 04s
+      publish the running tool
 ```
 
 The time appears once the call passes ten seconds. The picker recomputes it once
@@ -173,7 +179,7 @@ the tab already showing it.
 The view is its own tmux session, grouped with the agent's, so two viewers never
 fight over which window the shared session shows. `cattery attach
 <session>:<window>.<pane id>` is the same thing from a shell, for example
-`cattery attach kontora:3.%17`.
+`cattery attach dev:3.%17`.
 
 The viewer tab is read-only, but the picker's drawer in read-write is not: `v`
 `v` types at a tmux pane the same way it types at a kitty window. So you can
@@ -194,8 +200,8 @@ than cattery can react to them:
 
 ```console
 $ cattery events
-{"ts":1755302096,"window":363,"kind":"pi","from":"idle","to":"working","title":"~/projects/sigil","cwd":"/Users/alexander/projects/sigil","msg":"fix the picker","focused":false}
-{"ts":1755302241,"window":363,"kind":"pi","from":"working","to":"blocked","title":"~/projects/sigil","cwd":"/Users/alexander/projects/sigil","msg":"fix the picker","focused":false}
+{"ts":1755302096,"window":363,"kind":"pi","from":"idle","to":"working","title":"~/projects/myapp","cwd":"/Users/you/projects/myapp","msg":"fix the picker","focused":false}
+{"ts":1755302241,"window":363,"kind":"pi","from":"working","to":"blocked","title":"~/projects/myapp","cwd":"/Users/you/projects/myapp","msg":"fix the picker","focused":false}
 ```
 
 Each line is one JSON object:

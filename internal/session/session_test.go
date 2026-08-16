@@ -51,7 +51,7 @@ func TestRewriteFixture(t *testing.T) {
 	t.Run("resume commands survive", func(t *testing.T) {
 		want := []string{
 			`'--var=AGENT_RESUME=claude --resume abc-123'`,
-			`'--var=AGENT_RESUME=pi --session /Users/alexander/.pi/agent/sessions/x/2026-08-04.jsonl'`,
+			`'--var=AGENT_RESUME=pi --session /Users/x/.pi/agent/sessions/x/2026-08-04.jsonl'`,
 		}
 		for _, w := range want {
 			if !strings.Contains(out, w) {
@@ -82,8 +82,8 @@ func TestRewriteFixture(t *testing.T) {
 	t.Run("everything that is not a launch line is untouched", func(t *testing.T) {
 		for _, want := range []string{
 			// An unquoted path with spaces, which the tokenizer must not touch.
-			"cd /Users/alexander/Library/Mobile Documents/iCloud~md~obsidian/Documents/org/grafana/sigil/otel",
-			"cd /Users/alexander/projects/astra-l",
+			"cd /Users/x/Documents/My Notes/otel",
+			"cd /Users/x/projects/myapp",
 			"new_tab pi fork",
 			"layout fat",
 			"layout tall",

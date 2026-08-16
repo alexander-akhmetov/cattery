@@ -53,14 +53,14 @@ func pane(id, session, index, name, path, title, kind, state, msg, since, worked
 	return strings.Join(fields, fieldSep)
 }
 
-// A kontora agent: one detached window per ticket, named after the ticket, with
+// A dev agent: one detached window per ticket, named after the ticket, with
 // the worktree as its directory.
-var kontoraPane = pane("%17", "kontora", "3", "al-67je", "/Users/x/.kontora/worktrees/astra-l/al-67je",
+var devPane = pane("%17", "dev", "3", "feat-42", "/Users/x/.worktrees/myapp/feat-42",
 	"◐ Run /code-review", "claude", "working", "run the review", "1700000000", "1", "")
 
 func TestListAgents(t *testing.T) {
-	t.Run("a kontora agent", func(t *testing.T) {
-		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+kontoraPane+"\nEOF")}
+	t.Run("a dev agent", func(t *testing.T) {
+		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+devPane+"\nEOF")}
 
 		agents, err := client.ListAgents(context.Background())
 		if err != nil {
@@ -72,10 +72,10 @@ func TestListAgents(t *testing.T) {
 		want := agent.Agent{
 			ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
 			Title:  "◐ Run /code-review",
-			CWD:    "/Users/x/.kontora/worktrees/astra-l/al-67je",
+			CWD:    "/Users/x/.worktrees/myapp/feat-42",
 			Msg:    "run the review",
 			Since:  time.Unix(1700000000, 0),
-			Target: "kontora:3.%17",
+			Target: "dev:3.%17",
 		}
 		if agents[0] != want {
 			t.Fatalf("agent:\n got %+v\nwant %+v", agents[0], want)
@@ -87,7 +87,7 @@ func TestListAgents(t *testing.T) {
 
 	t.Run("only panes publishing a state", func(t *testing.T) {
 		rows := strings.Join([]string{
-			kontoraPane,
+			devPane,
 			// A plain shell: every agent option empty.
 			pane("%2", "work", "0", "zsh", "/Users/x", "zsh", "", "", "", "", "", ""),
 			// A kind with no state is not an agent either: the writer clears the
@@ -157,15 +157,15 @@ func TestListAgents(t *testing.T) {
 	// A grouped session mirrors the windows of the session it was made from, so
 	// list-panes reports one pane once per session.
 	t.Run("a pane seen through a viewer is listed once", func(t *testing.T) {
-		viewer := pane("%17", viewPrefix+"kontora-991", "3", "al-67je",
-			"/Users/x/.kontora/worktrees/astra-l/al-67je", "◐ Run /code-review",
+		viewer := pane("%17", viewPrefix+"dev-991", "3", "feat-42",
+			"/Users/x/.worktrees/myapp/feat-42", "◐ Run /code-review",
 			"claude", "working", "run the review", "1700000000", "1", "")
 		for _, order := range []struct {
 			name string
 			rows []string
 		}{
-			{name: "owner first", rows: []string{kontoraPane, viewer}},
-			{name: "viewer first", rows: []string{viewer, kontoraPane}},
+			{name: "owner first", rows: []string{devPane, viewer}},
+			{name: "viewer first", rows: []string{viewer, devPane}},
 		} {
 			t.Run(order.name, func(t *testing.T) {
 				client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+strings.Join(order.rows, "\n")+"\nEOF")}
@@ -177,8 +177,8 @@ func TestListAgents(t *testing.T) {
 				if len(agents) != 1 {
 					t.Fatalf("got %d agents, want 1: %+v", len(agents), agents)
 				}
-				if agents[0].Target != "kontora:3.%17" {
-					t.Errorf("target: got %q, want kontora:3.%%17", agents[0].Target)
+				if agents[0].Target != "dev:3.%17" {
+					t.Errorf("target: got %q, want dev:3.%%17", agents[0].Target)
 				}
 			})
 		}
@@ -187,7 +187,7 @@ func TestListAgents(t *testing.T) {
 	// The owning session is gone, so nothing names this pane in a way that
 	// outlives the viewer.
 	t.Run("a pane only a viewer can see is dropped", func(t *testing.T) {
-		row := pane("%17", viewPrefix+"kontora-991", "3", "al-67je", "/p", "t", "claude", "working", "", "", "1", "")
+		row := pane("%17", viewPrefix+"dev-991", "3", "feat-42", "/p", "t", "claude", "working", "", "", "1", "")
 		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+row+"\nEOF")}
 
 		agents, err := client.ListAgents(context.Background())
@@ -330,18 +330,18 @@ func TestSplitTarget(t *testing.T) {
 		pane    string
 		wantErr bool
 	}{
-		{name: "session, window index, pane", target: "kontora:3.%17", session: "kontora", index: "3", pane: "%17"},
-		{name: "index zero", target: "kontora:0.%1", session: "kontora", index: "0", pane: "%1"},
+		{name: "session, window index, pane", target: "dev:3.%17", session: "dev", index: "3", pane: "%17"},
+		{name: "index zero", target: "dev:0.%1", session: "dev", index: "0", pane: "%1"},
 		// tmux allows both in a session name and reads its own targets from the
 		// end, so this one has to as well.
 		{name: "a session name holding a dot and a colon", target: "a.b:c:3.%17", session: "a.b:c", index: "3", pane: "%17"},
-		{name: "no pane", target: "kontora:3", wantErr: true},
-		{name: "a pane index is not a pane id", target: "kontora:3.1", wantErr: true},
-		{name: "empty pane", target: "kontora:3.", wantErr: true},
-		{name: "no window", target: "kontora.%17", wantErr: true},
-		{name: "empty window", target: "kontora:.%17", wantErr: true},
+		{name: "no pane", target: "dev:3", wantErr: true},
+		{name: "a pane index is not a pane id", target: "dev:3.1", wantErr: true},
+		{name: "empty pane", target: "dev:3.", wantErr: true},
+		{name: "no window", target: "dev.%17", wantErr: true},
+		{name: "empty window", target: "dev:.%17", wantErr: true},
 		{name: "no session", target: ":3.%17", wantErr: true},
-		{name: "a window name is not an identity", target: "kontora:al-67je.%17", wantErr: true},
+		{name: "a window name is not an identity", target: "dev:feat-42.%17", wantErr: true},
 		{name: "empty", target: "", wantErr: true},
 	}
 	for _, tc := range cases {
@@ -377,7 +377,7 @@ func TestAlive(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			alive, err := (&Client{tmux: tc.tmux}).Alive(context.Background(), "kontora:3.%17")
+			alive, err := (&Client{tmux: tc.tmux}).Alive(context.Background(), "dev:3.%17")
 			if err != nil {
 				t.Fatalf("alive: %v", err)
 			}
@@ -391,7 +391,7 @@ func TestAlive(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if _, err := client.Alive(context.Background(), "kontora:3.%17"); err != nil {
+		if _, err := client.Alive(context.Background(), "dev:3.%17"); err != nil {
 			t.Fatalf("alive: %v", err)
 		}
 		if got, want := readLines(t, log), []string{"list-panes -t %17 -F #{pane_id}"}; !slices.Equal(got, want) {
@@ -400,7 +400,7 @@ func TestAlive(t *testing.T) {
 	})
 
 	t.Run("a malformed target is a failure, not an answer", func(t *testing.T) {
-		if _, err := (&Client{tmux: "tmux"}).Alive(context.Background(), "kontora"); err == nil {
+		if _, err := (&Client{tmux: "tmux"}).Alive(context.Background(), "dev"); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
@@ -414,7 +414,7 @@ func TestCapture(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if _, err := client.Capture(context.Background(), "kontora:3.%17"); err != nil {
+		if _, err := client.Capture(context.Background(), "dev:3.%17"); err != nil {
 			t.Fatalf("capture: %v", err)
 		}
 		if got, want := readLines(t, log), []string{"capture-pane -e -p -t %17"}; !slices.Equal(got, want) {
@@ -426,7 +426,7 @@ func TestCapture(t *testing.T) {
 		const screen = "\x1b[38;2;108;112;134m~/p/cattery\x1b[39m\nnono sandbox\n"
 		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+screen+"EOF")}
 
-		got, err := client.Capture(context.Background(), "kontora:3.%17")
+		got, err := client.Capture(context.Background(), "dev:3.%17")
 		if err != nil {
 			t.Fatalf("capture: %v", err)
 		}
@@ -440,7 +440,7 @@ func TestCapture(t *testing.T) {
 	t.Run("no server is an empty screen", func(t *testing.T) {
 		client := &Client{tmux: fakeTmux(t, "printf 'no server running on /tmp/x\\n' >&2; exit 1")}
 
-		got, err := client.Capture(context.Background(), "kontora:3.%17")
+		got, err := client.Capture(context.Background(), "dev:3.%17")
 		if err != nil {
 			t.Fatalf("capture: %v", err)
 		}
@@ -452,7 +452,7 @@ func TestCapture(t *testing.T) {
 	t.Run("another failure keeps tmux's reason on one line", func(t *testing.T) {
 		client := &Client{tmux: fakeTmux(t, "printf \"can't find pane: %%17\\nand more\\n\" >&2; exit 1")}
 
-		if _, err := client.Capture(context.Background(), "kontora:3.%17"); err == nil {
+		if _, err := client.Capture(context.Background(), "dev:3.%17"); err == nil {
 			t.Fatal("expected an error")
 		} else if !strings.Contains(err.Error(), "find pane") || strings.Contains(err.Error(), "\n") {
 			t.Fatalf("error: %q", err)
@@ -460,7 +460,7 @@ func TestCapture(t *testing.T) {
 	})
 
 	t.Run("a malformed target is a failure, not an empty screen", func(t *testing.T) {
-		if _, err := (&Client{tmux: "tmux"}).Capture(context.Background(), "kontora"); err == nil {
+		if _, err := (&Client{tmux: "tmux"}).Capture(context.Background(), "dev"); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
@@ -468,7 +468,7 @@ func TestCapture(t *testing.T) {
 
 func TestViewName(t *testing.T) {
 	pid := strconv.Itoa(os.Getpid())
-	if got, want := viewName("kontora"), viewPrefix+"kontora-"+pid; got != want {
+	if got, want := viewName("dev"), viewPrefix+"dev-"+pid; got != want {
 		t.Fatalf("view name: got %q, want %q", got, want)
 	}
 	// Both characters separate the parts of a target, and an agent session can
@@ -521,7 +521,7 @@ func TestSendKeys(t *testing.T) {
 			log := filepath.Join(t.TempDir(), "argv")
 			client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-			if err := client.SendKeys(context.Background(), "kontora:3.%17", tc.data); err != nil {
+			if err := client.SendKeys(context.Background(), "dev:3.%17", tc.data); err != nil {
 				t.Fatalf("send: %v", err)
 			}
 			if got := readLines(t, log); !slices.Equal(got, tc.want) {
@@ -536,7 +536,7 @@ func TestSendKeys(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if err := client.SendKeys(context.Background(), "kontora:3.%17", strings.Repeat("x", sendChunk+1)); err != nil {
+		if err := client.SendKeys(context.Background(), "dev:3.%17", strings.Repeat("x", sendChunk+1)); err != nil {
 			t.Fatalf("send: %v", err)
 		}
 		got := readLines(t, log)
@@ -555,7 +555,7 @@ func TestSendKeys(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if err := client.SendKeys(context.Background(), "kontora:3.%17", ""); err != nil {
+		if err := client.SendKeys(context.Background(), "dev:3.%17", ""); err != nil {
 			t.Fatalf("send: %v", err)
 		}
 		if _, err := os.Stat(log); err == nil {
@@ -566,7 +566,7 @@ func TestSendKeys(t *testing.T) {
 	t.Run("a failure keeps tmux's reason on one line", func(t *testing.T) {
 		client := &Client{tmux: fakeTmux(t, "printf \"can't find pane: %%17\\nand more\\n\" >&2; exit 1")}
 
-		err := client.SendKeys(context.Background(), "kontora:3.%17", "hi")
+		err := client.SendKeys(context.Background(), "dev:3.%17", "hi")
 		if err == nil {
 			t.Fatal("expected an error")
 		}
@@ -576,7 +576,7 @@ func TestSendKeys(t *testing.T) {
 	})
 
 	t.Run("a malformed target is a failure", func(t *testing.T) {
-		if err := (&Client{tmux: "tmux"}).SendKeys(context.Background(), "kontora", "hi"); err == nil {
+		if err := (&Client{tmux: "tmux"}).SendKeys(context.Background(), "dev", "hi"); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
@@ -602,7 +602,7 @@ exit 1
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, strings.ReplaceAll(refuseWithoutC, "LOG", log))}
 
-		if err := client.SendKeys(context.Background(), "kontora:3.%17", "h"); err != nil {
+		if err := client.SendKeys(context.Background(), "dev:3.%17", "h"); err != nil {
 			t.Fatalf("send: %v", err)
 		}
 		want := []string{
@@ -621,7 +621,7 @@ exit 1
 		client := &Client{tmux: fakeTmux(t, strings.ReplaceAll(refuseWithoutC, "LOG", log))}
 
 		for range 2 {
-			if err := client.SendKeys(context.Background(), "kontora:3.%17", "h"); err != nil {
+			if err := client.SendKeys(context.Background(), "dev:3.%17", "h"); err != nil {
 				t.Fatalf("send: %v", err)
 			}
 		}
@@ -641,7 +641,7 @@ exit 1
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log+`; printf "can't find pane: %%17\n" >&2; exit 1`)}
 
-		if err := client.SendKeys(context.Background(), "kontora:3.%17", "h"); err == nil {
+		if err := client.SendKeys(context.Background(), "dev:3.%17", "h"); err == nil {
 			t.Fatal("expected an error")
 		}
 		if got := readLines(t, log); len(got) != 1 {
@@ -654,7 +654,7 @@ exit 1
 	t.Run("a failed retry keeps the original reason", func(t *testing.T) {
 		client := &Client{tmux: fakeTmux(t, `printf 'client is read-only\n' >&2; exit 1`)}
 
-		err := client.SendKeys(context.Background(), "kontora:3.%17", "h")
+		err := client.SendKeys(context.Background(), "dev:3.%17", "h")
 		if err == nil {
 			t.Fatal("expected an error")
 		}
@@ -671,7 +671,7 @@ func TestMarkSeen(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if err := client.MarkSeen(context.Background(), "kontora:3.%17"); err != nil {
+		if err := client.MarkSeen(context.Background(), "dev:3.%17"); err != nil {
 			t.Fatalf("mark seen: %v", err)
 		}
 		if got, want := readLines(t, log), []string{"set -p -t %17 @AGENT_SEEN 1"}; !slices.Equal(got, want) {
@@ -680,20 +680,20 @@ func TestMarkSeen(t *testing.T) {
 	})
 
 	t.Run("a malformed target is a failure", func(t *testing.T) {
-		if err := (&Client{tmux: "tmux"}).MarkSeen(context.Background(), "kontora"); err == nil {
+		if err := (&Client{tmux: "tmux"}).MarkSeen(context.Background(), "dev"); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
 }
 
 func TestAttach(t *testing.T) {
-	view := viewName("kontora")
+	view := viewName("dev")
 
 	t.Run("the commands one attachment runs", func(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if err := client.Attach(context.Background(), "kontora:3.%17"); err != nil {
+		if err := client.Attach(context.Background(), "dev:3.%17"); err != nil {
 			t.Fatalf("attach: %v", err)
 		}
 
@@ -702,7 +702,7 @@ func TestAttach(t *testing.T) {
 			// name would collide.
 			"kill-session -t =" + view,
 			// Grouped, so the viewer has its own current window.
-			"new-session -d -t =kontora -s " + view,
+			"new-session -d -t =dev -s " + view,
 			"select-window -t " + view + ":3",
 			// The agent is no longer "done": someone has looked at it. On the
 			// pane, because a window target means whichever pane is active.
@@ -728,7 +728,7 @@ func TestAttach(t *testing.T) {
 			t.Fatal(err)
 		}
 		os.Stdout = file
-		err = client.Attach(context.Background(), "kontora:3.%17")
+		err = client.Attach(context.Background(), "dev:3.%17")
 		os.Stdout = stdout
 		file.Close()
 		if err != nil {
@@ -751,12 +751,12 @@ func TestAttach(t *testing.T) {
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log+`
 case "$1" in attach-session) exit 1 ;; esac`)}
 
-		err := client.Attach(context.Background(), "kontora:3.%17")
+		err := client.Attach(context.Background(), "dev:3.%17")
 
 		if err == nil {
 			t.Fatal("expected the attach failure to surface")
 		}
-		if !strings.Contains(err.Error(), "kontora:3.%17") {
+		if !strings.Contains(err.Error(), "dev:3.%17") {
 			t.Errorf("error does not name the target: %v", err)
 		}
 		if got := readLines(t, log); !slices.Contains(got, "kill-session -t ="+view) {
@@ -765,9 +765,9 @@ case "$1" in attach-session) exit 1 ;; esac`)}
 	})
 
 	t.Run("a session that cannot be grouped is reported", func(t *testing.T) {
-		client := &Client{tmux: fakeTmux(t, `printf "can't find session: kontora\n" >&2; exit 1`)}
+		client := &Client{tmux: fakeTmux(t, `printf "can't find session: dev\n" >&2; exit 1`)}
 
-		err := client.Attach(context.Background(), "kontora:3.%17")
+		err := client.Attach(context.Background(), "dev:3.%17")
 
 		if err == nil {
 			t.Fatal("expected an error")
@@ -781,7 +781,7 @@ case "$1" in attach-session) exit 1 ;; esac`)}
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$*" >> `+log)}
 
-		if err := client.Attach(context.Background(), "kontora"); err == nil {
+		if err := client.Attach(context.Background(), "dev"); err == nil {
 			t.Fatal("expected an error")
 		}
 		if _, err := os.Stat(log); err == nil {
@@ -802,7 +802,7 @@ case "$1" in attach-session) exit 1 ;; esac`)}
 case "$1" in attach-session) : > `+attached+`; while :; do sleep 0.1; done ;; esac`)}
 
 		done := make(chan error, 1)
-		go func() { done <- client.Attach(context.Background(), "kontora:3.%17") }()
+		go func() { done <- client.Attach(context.Background(), "dev:3.%17") }()
 
 		waitForFile(t, attached)
 		if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {

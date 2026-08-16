@@ -3,35 +3,35 @@ new_tab
 layout fat
 enabled_layouts fat,grid,horizontal,splits,stack,tall,vertical
 set_layout_state {"main_bias": [0.5, 0.5], "biased_map": {}, "opts": {"full_size": 1, "bias": 50, "mirrored": "n"}, "class": "Fat", "all_windows": {"active_group_idx": 0, "active_group_history": [618], "window_groups": [{"id": 618, "window_ids": [649]}]}}
-cd /Users/alexander/projects/astra-l
+cd /Users/x/projects/myapp
 
-launch 'kitty-unserialize-data={"id": 649}' '--var=AGENT_MSG=analyze ~/projects/other/mnemosyne. Compare to our memory system.' --var=AGENT_KIND=claude --var=AGENT_STATE=blocked --var=AGENT_DISPLAY=blocked --var=AGENT_SINCE=1785937158 '--var=AGENT_RESUME=claude --resume abc-123'
+launch 'kitty-unserialize-data={"id": 649}' '--var=AGENT_MSG=analyze ~/projects/other/queue. Compare it to ours.' --var=AGENT_KIND=claude --var=AGENT_STATE=blocked --var=AGENT_DISPLAY=blocked --var=AGENT_SINCE=1785937158 '--var=AGENT_RESUME=claude --resume abc-123'
 focus
 
 new_tab pi fork
 layout fat
 enabled_layouts fat,grid,horizontal,splits,stack,tall,vertical
 set_layout_state {"main_bias": [0.5, 0.5], "biased_map": {}, "opts": {"full_size": 1, "bias": 50, "mirrored": "n"}, "class": "Fat", "all_windows": {"active_group_idx": 0, "active_group_history": [468], "window_groups": [{"id": 468, "window_ids": [494]}]}}
-cd /Users/alexander/.local/share/wt/worktrees/sigil-alexander-akhmetov-generate-tokens
+cd /Users/x/.local/share/wt/worktrees/myapp-generate-tokens
 
-launch 'kitty-unserialize-data={"id": 494}' --var=AGENT_KIND=pi '--var=AGENT_MSG=give me one liner' --var=AGENT_STATE=idle --var=AGENT_DISPLAY=idle --var=AGENT_SINCE=1785881911 '--var=AGENT_RESUME=pi --session /Users/alexander/.pi/agent/sessions/x/2026-08-04.jsonl' /Users/alexander/.local/share/mise/installs/node/24.18.1/bin/node /opt/homebrew/bin/pi --fork /Users/alexander/.pi/agent/sessions/x/2026-08-04.jsonl
+launch 'kitty-unserialize-data={"id": 494}' --var=AGENT_KIND=pi '--var=AGENT_MSG=give me one liner' --var=AGENT_STATE=idle --var=AGENT_DISPLAY=idle --var=AGENT_SINCE=1785881911 '--var=AGENT_RESUME=pi --session /Users/x/.pi/agent/sessions/x/2026-08-04.jsonl' /Users/x/.local/share/mise/installs/node/24.18.1/bin/node /opt/homebrew/bin/pi --fork /Users/x/.pi/agent/sessions/x/2026-08-04.jsonl
 focus
 
 new_tab
 layout fat
 set_layout_state {"main_bias": [0.5, 0.5], "biased_map": {}, "opts": {"full_size": 1, "bias": 50, "mirrored": "n"}, "class": "Fat", "all_windows": {"active_group_idx": 0, "active_group_history": [622], "window_groups": [{"id": 622, "window_ids": [653]}]}}
-cd /Users/alexander/Library/Mobile Documents/iCloud~md~obsidian/Documents/org/grafana/sigil/otel
+cd /Users/x/Documents/My Notes/otel
 
-launch 'kitty-unserialize-data={"id": 653}' --var=AGENT_KIND=pi '--var=AGENT_MSG=our network policy - it'"'"'s correct, right? sampler, etc' --var=AGENT_STATE=idle --var=AGENT_DISPLAY=idle --var=AGENT_SINCE=1785938522 /opt/homebrew/bin/pi --fork /Users/alexander/.pi/agent/sessions/y/stale.jsonl
+launch 'kitty-unserialize-data={"id": 653}' --var=AGENT_KIND=pi '--var=AGENT_MSG=the sampler config - it'"'"'s correct, right?' --var=AGENT_STATE=idle --var=AGENT_DISPLAY=idle --var=AGENT_SINCE=1785938522 /opt/homebrew/bin/pi --fork /Users/x/.pi/agent/sessions/y/stale.jsonl
 focus
 
 new_tab
 layout tall
 enabled_layouts fat,grid,horizontal,splits,stack,tall,vertical
-cd /Users/alexander/projects/deployment_tools
+cd /Users/x/projects/infra
 
 launch 'kitty-unserialize-data={"id": 693}'
-launch 'kitty-unserialize-data={"id": 702}' --cwd=/Users/alexander --type=overlay sh -c 'sleep 25'
+launch 'kitty-unserialize-data={"id": 702}' --cwd=/Users/x --type=overlay sh -c 'sleep 25'
 launch --title=logs tail -f /var/log/system.log
 focus
 

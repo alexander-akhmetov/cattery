@@ -112,7 +112,7 @@ func New() Writer {
 	}
 	// tmux first, and the kitty window id is not even consulted. A tmux server
 	// inherits the environment of whatever started it, so every pane under a
-	// server that kontora launched from kitty carries that window's
+	// server that dev launched from kitty carries that window's
 	// KITTY_WINDOW_ID. Publishing there would move an unrelated window's tab
 	// marker, and the pane the agent runs in would stay blank.
 	if os.Getenv("TMUX") != "" {

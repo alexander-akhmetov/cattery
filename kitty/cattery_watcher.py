@@ -279,7 +279,7 @@ def _publish(boss: Boss, window: Window, frm: str | None, to: str) -> None:
     The event is one JSON object per datagram, with no framing:
 
         {"ts":1755302096,"window":363,"kind":"pi","from":"working",
-         "to":"blocked","title":"~/projects/sigil","cwd":"/Users/x/sigil",
+         "to":"blocked","title":"~/projects/notes","cwd":"/Users/x/notes",
          "msg":"fix the picker","focused":false}
 
     `to` is a display state, or "cleared" when the agent dropped its state and

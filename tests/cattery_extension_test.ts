@@ -548,7 +548,7 @@ type TmuxRun = string[];
 function inPane(): { pi: FakePi; runs: TmuxRun[] } {
   process.env.TMUX = "/private/tmp/tmux-501/default,69427,0";
   process.env.TMUX_PANE = "%17";
-  // A kontora agent inherits this from the tmux server, which inherited it from
+  // A dev agent inherits this from the tmux server, which inherited it from
   // whatever kitty window started the daemon. It names an unrelated window.
   process.env.KITTY_WINDOW_ID = "7";
   const runs: TmuxRun[] = [];

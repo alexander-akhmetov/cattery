@@ -419,12 +419,12 @@ class UpdateOsTitleTest(unittest.TestCase):
 
         watcher._update_os_title(boss, 1)
         watcher._update_os_title(boss, 1)  # unchanged: no repeat write
-        active.title = "~/projects/sigil"
+        active.title = "~/projects/notes"
         watcher._update_os_title(boss, 1)
 
         self.assertEqual(
             TITLE_CALLS,
-            [(1, "(1 need you) ~/projects/dotfiles"), (1, "(1 need you) ~/projects/sigil")],
+            [(1, "(1 need you) ~/projects/dotfiles"), (1, "(1 need you) ~/projects/notes")],
         )
 
     def test_ignores_the_window_being_closed(self):
@@ -680,8 +680,8 @@ class PublishTest(WatcherTestCase):
             display="working",
             state="blocked",
             kind="pi",
-            title="~/projects/sigil",
-            cwd="/Users/x/projects/sigil",
+            title="~/projects/notes",
+            cwd="/Users/x/projects/notes",
             msg="fix the picker",
         )
         boss = boss_for([window])
@@ -695,8 +695,8 @@ class PublishTest(WatcherTestCase):
         self.assertEqual(event["to"], "blocked")
         self.assertEqual(event["window"], 363)
         self.assertEqual(event["kind"], "pi")
-        self.assertEqual(event["title"], "~/projects/sigil")
-        self.assertEqual(event["cwd"], "/Users/x/projects/sigil")
+        self.assertEqual(event["title"], "~/projects/notes")
+        self.assertEqual(event["cwd"], "/Users/x/projects/notes")
         self.assertEqual(event["msg"], "fix the picker")
         self.assertIs(event["focused"], False)
         self.assertAlmostEqual(event["ts"], int(time.time()), delta=5)
@@ -724,7 +724,7 @@ class PublishTest(WatcherTestCase):
             state="blocked",
             kind="pi",
             title="ф" * 900,
-            cwd="/Users/x/projects/sigil",
+            cwd="/Users/x/projects/notes",
             msg="п" * 900,
         )
         boss = boss_for([window])

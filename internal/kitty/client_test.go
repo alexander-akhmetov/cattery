@@ -40,7 +40,7 @@ const sampleLs = `[
           {
             "id": 114,
             "title": "Check bot",
-            "cwd": "/Users/x/projects/astra-l",
+            "cwd": "/Users/x/projects/myapp",
             "user_vars": {"AGENT_DISPLAY": "blocked", "AGENT_KIND": "claude"}
           }
         ]
@@ -573,8 +573,8 @@ func TestActionCommand(t *testing.T) {
 // reaches kitty unsplit, which is what keeps a target with a space in it whole.
 func TestLaunchCommand(t *testing.T) {
 	args := []string{
-		"--type=tab", "--title", "ro kontora:3.%17", "--var", "AGENT_VIEW=kontora:3.%17",
-		"--", "/usr/local/bin/cattery", "attach", "kontora:3.%17",
+		"--type=tab", "--title", "ro dev:3.%17", "--var", "AGENT_VIEW=dev:3.%17",
+		"--", "/usr/local/bin/cattery", "attach", "dev:3.%17",
 	}
 	cmd := launchCommand(context.Background(), "kitten", args)
 	want := append([]string{"kitten", "@", "launch"}, args...)

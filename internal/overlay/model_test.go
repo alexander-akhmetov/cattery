@@ -121,7 +121,7 @@ func sampleModel() Model {
 	m.loading = false
 	// Project order, the way ListAgents delivers them.
 	m.agents = []agent.Agent{
-		checkout(3, "pi", "working", "astra-l", "feat/oauth"),
+		checkout(3, "pi", "working", "myapp", "feat/oauth"),
 		checkout(2, "pi", "working", "dotfiles", "main"),
 		checkout(1, "claude", "blocked", "llm-proxy", "master"),
 		checkout(4, "codex", "done", "qmp-relay", "qmp"),
@@ -247,7 +247,7 @@ func TestFocusCmdCallsClient(t *testing.T) {
 		{name: "a kitty window", in: agent.Agent{ID: 3, Host: agent.HostKitty}, want: "kitty:3"},
 		// The whole agent goes to the client, because reaching a tmux agent
 		// means attaching to its pane rather than focusing a window id.
-		{name: "a tmux pane", in: agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"}, want: "tmux:%17"},
+		{name: "a tmux pane", in: agent.Agent{ID: 17, Host: agent.HostTmux, Target: "dev:3.%17"}, want: "tmux:%17"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -576,8 +576,8 @@ func TestRowLabel(t *testing.T) {
 		},
 		{
 			name:  "detached HEAD falls back to the worktree",
-			agent: agent.Agent{CWD: "/tmp/sig-review/sub", Root: "/tmp/sig-review"},
-			want:  "sig-review",
+			agent: agent.Agent{CWD: "/tmp/notes-review/sub", Root: "/tmp/notes-review"},
+			want:  "notes-review",
 		},
 		{
 			name:  "outside git falls back to the folder",
@@ -635,8 +635,8 @@ func TestViewGroupsWorktreesUnderOneHeading(t *testing.T) {
 			ProjectKey: "/p/dotfiles/.git", Root: "/wt/dotfiles/feat-oauth", Branch: "feat/oauth"},
 		{ID: 3, Kind: "pi", Display: "idle", CWD: "/tmp/dotfiles-review", Project: "dotfiles",
 			ProjectKey: "/p/dotfiles/.git", Root: "/tmp/dotfiles-review"},
-		{ID: 4, Kind: "pi", Display: "working", CWD: "/p/sigil", Project: "sigil",
-			ProjectKey: "/p/sigil/.git", Root: "/p/sigil", Branch: "main"},
+		{ID: 4, Kind: "pi", Display: "working", CWD: "/p/notes", Project: "notes",
+			ProjectKey: "/p/notes/.git", Root: "/p/notes", Branch: "main"},
 	}
 
 	out := ansi.Strip(m.View())
@@ -645,8 +645,8 @@ func TestViewGroupsWorktreesUnderOneHeading(t *testing.T) {
 	if !strings.Contains(out, "dotfiles 3") {
 		t.Errorf("missing dotfiles heading with 3 agents, got:\n%s", out)
 	}
-	if !strings.Contains(out, "sigil 1") {
-		t.Errorf("missing sigil heading with 1 agent, got:\n%s", out)
+	if !strings.Contains(out, "notes 1") {
+		t.Errorf("missing notes heading with 1 agent, got:\n%s", out)
 	}
 	if got := strings.Count(out, "dotfiles 3"); got != 1 {
 		t.Errorf("dotfiles should head exactly one group, headed %d:\n%s", got, out)
@@ -1037,7 +1037,7 @@ func TestAgentsMsgPreservesSelectedID(t *testing.T) {
 			{ID: 4, Display: "done", CWD: "/p/qmp-relay"},
 			{ID: 9, Display: "done", CWD: "/p/new"},
 			{ID: 2, Display: "working", CWD: "/p/dotfiles"},
-			{ID: 3, Display: "working", CWD: "/p/astra-l"},
+			{ID: 3, Display: "working", CWD: "/p/myapp"},
 		},
 	})
 	got := updated.(Model)
@@ -1256,7 +1256,7 @@ func TestReplaceAgentsSelectionFallback(t *testing.T) {
 			agents: []agent.Agent{
 				{ID: 9, Display: "working", CWD: "/p/new"},
 				{ID: 2, Display: "working", CWD: "/p/dotfiles"},
-				{ID: 3, Display: "working", CWD: "/p/astra-l"},
+				{ID: 3, Display: "working", CWD: "/p/myapp"},
 			},
 			wantKey: "kitty:2",
 		},
@@ -1265,7 +1265,7 @@ func TestReplaceAgentsSelectionFallback(t *testing.T) {
 			query:    "working",
 			selected: 1, // id 2
 			agents: []agent.Agent{
-				{ID: 3, Display: "working", CWD: "/p/astra-l"},
+				{ID: 3, Display: "working", CWD: "/p/myapp"},
 				{ID: 1, Display: "blocked", CWD: "/p/llm-proxy"},
 				{ID: 2, Display: "working", CWD: "/p/dotfiles"},
 			},
@@ -1277,7 +1277,7 @@ func TestReplaceAgentsSelectionFallback(t *testing.T) {
 			name:     "a pane id equal to a window id does not steal the cursor",
 			selected: 1, // id 2
 			agents: []agent.Agent{
-				{ID: 2, Host: agent.HostTmux, Display: "working", CWD: "/p/dotfiles", Target: "kontora:1.%2"},
+				{ID: 2, Host: agent.HostTmux, Display: "working", CWD: "/p/dotfiles", Target: "dev:1.%2"},
 				{ID: 2, Display: "working", CWD: "/p/dotfiles"},
 			},
 			wantKey: "kitty:2",
@@ -1433,7 +1433,7 @@ func TestViewLoadStates(t *testing.T) {
 			name:   "fresh kitty files say nothing",
 			set:    func(m *Model) { m.staleAssets = false },
 			absent: []string{"out of date"},
-			want:   "astra-l", // a normal list, with no warning row
+			want:   "myapp", // a normal list, with no warning row
 		},
 		{
 			// One warning row, and the failed refresh owns it. It explains the
@@ -1770,7 +1770,7 @@ func TestViewKeepsEssentialsWhenCompact(t *testing.T) {
 			for _, want := range []string{
 				"working",   // active filter stays visible
 				"▌",         // the selected row is marked
-				"ast",       // and is identifiable, even truncated
+				"mya",       // and is identifiable, even truncated
 				"esc close", // close guidance survives whole
 				"1/2",       // selected/visible position
 			} {
@@ -2154,13 +2154,13 @@ func TestSessionHintNamesTheOperation(t *testing.T) {
 
 // --- tmux rows ---------------------------------------------------------------
 
-// tmuxAgent is a kontora agent: a detached pane in a ticket worktree.
+// tmuxAgent is a dev agent: a detached pane in a ticket worktree.
 func tmuxAgent() agent.Agent {
 	return agent.Agent{
 		ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
-		CWD: "/p/astra-l/al-67je", Project: "astra-l", ProjectKey: "/p/astra-l/.git",
-		Root: "/p/astra-l/al-67je", Branch: "kontora/al-67je",
-		Target: "kontora:3.%17", Msg: "run the review",
+		CWD: "/p/myapp/feat-42", Project: "myapp", ProjectKey: "/p/myapp/.git",
+		Root: "/p/myapp/feat-42", Branch: "wt/feat-42",
+		Target: "dev:3.%17", Msg: "run the review",
 	}
 }
 
@@ -2209,7 +2209,7 @@ func TestTmuxRowSaysItAttaches(t *testing.T) {
 		t.Errorf("footer %q does not offer %q", got, attachHint)
 	}
 	// The summary names the target, which is what `cattery attach` takes.
-	if got := ansi.Strip(m.renderSummary(120)); !strings.Contains(got, "kontora:3.%17") {
+	if got := ansi.Strip(m.renderSummary(120)); !strings.Contains(got, "dev:3.%17") {
 		t.Errorf("summary %q does not name the target", got)
 	}
 
@@ -2305,7 +2305,7 @@ func previewModel(client *fakeClient) Model {
 	m.loaded = true
 	m.loading = false
 	m.agents = []agent.Agent{
-		checkout(3, "pi", "working", "astra-l", "feat/oauth"),
+		checkout(3, "pi", "working", "myapp", "feat/oauth"),
 		checkout(2, "pi", "working", "dotfiles", "main"),
 	}
 	m.width, m.height = 140, 40

@@ -163,9 +163,9 @@ func TestSort(t *testing.T) {
 		{
 			name: "same label from different repos does not merge",
 			input: []Agent{
-				{ID: 1, Project: "grafana", ProjectKey: "/work/grafana/.git"},
-				{ID: 2, Project: "grafana", ProjectKey: "/oss/grafana/.git"},
-				{ID: 3, Project: "grafana", ProjectKey: "/work/grafana/.git"},
+				{ID: 1, Project: "myapp", ProjectKey: "/work/myapp/.git"},
+				{ID: 2, Project: "myapp", ProjectKey: "/oss/myapp/.git"},
+				{ID: 3, Project: "myapp", ProjectKey: "/work/myapp/.git"},
 			},
 			want: []string{"kitty:2", "kitty:1", "kitty:3"},
 		},
@@ -240,16 +240,16 @@ func TestParseRepo(t *testing.T) {
 			want: repo{project: "dotfiles", projectKey: "/p/dotfiles/.git", root: "/wt/dotfiles/feat-oauth", branch: "feat/oauth"},
 		},
 		{
-			// The kontora worktree a tmux agent runs in. It groups with the
+			// The dev worktree a tmux agent runs in. It groups with the
 			// repository's other agents and keeps the ticket branch.
-			name: "a kontora worktree groups with its main repo",
-			cwd:  "/Users/x/.kontora/worktrees/astra-l/al-67je",
-			out:  "/Users/x/projects/astra-l/.git\n/Users/x/.kontora/worktrees/astra-l/al-67je\nkontora/al-67je\n",
+			name: "a dev worktree groups with its main repo",
+			cwd:  "/Users/x/.worktrees/myapp/feat-42",
+			out:  "/Users/x/projects/myapp/.git\n/Users/x/.worktrees/myapp/feat-42\nwt/feat-42\n",
 			want: repo{
-				project:    "astra-l",
-				projectKey: "/Users/x/projects/astra-l/.git",
-				root:       "/Users/x/.kontora/worktrees/astra-l/al-67je",
-				branch:     "kontora/al-67je",
+				project:    "myapp",
+				projectKey: "/Users/x/projects/myapp/.git",
+				root:       "/Users/x/.worktrees/myapp/feat-42",
+				branch:     "wt/feat-42",
 			},
 		},
 		{
@@ -260,9 +260,9 @@ func TestParseRepo(t *testing.T) {
 		},
 		{
 			name: "detached HEAD keeps the project but has no branch",
-			cwd:  "/tmp/sig-review",
-			out:  "/p/sigil/.git\n/tmp/sig-review\nHEAD\n",
-			want: repo{project: "sigil", projectKey: "/p/sigil/.git", root: "/tmp/sig-review"},
+			cwd:  "/tmp/notes-review",
+			out:  "/p/notes/.git\n/tmp/notes-review\nHEAD\n",
+			want: repo{project: "notes", projectKey: "/p/notes/.git", root: "/tmp/notes-review"},
 		},
 		{
 			name: "bare repo drops the .git suffix from its label",

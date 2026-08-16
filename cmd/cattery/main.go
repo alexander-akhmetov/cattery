@@ -138,7 +138,7 @@ snapshot, because kitty would build a second copy of every tab.`,
 		summary:  "watch a tmux agent read-only",
 		details: `Opens a read-only view of one tmux pane, for example
 
-  cattery attach kontora:3.%17
+  cattery attach dev:3.%17
 
 Keys do nothing and your terminal size does not resize the agent's pane.
 "prefix d" detaches. The view is a tmux session of its own, grouped with the

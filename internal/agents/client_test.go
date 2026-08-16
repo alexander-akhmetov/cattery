@@ -154,7 +154,7 @@ func TestListAgents(t *testing.T) {
 				{ID: 2, Host: agent.HostKitty, Display: "working", CWD: repo},
 			}},
 			&fakeTmux{agents: []agent.Agent{
-				{ID: 17, Host: agent.HostTmux, Display: "working", CWD: repo, Target: "kontora:3.%17"},
+				{ID: 17, Host: agent.HostTmux, Display: "working", CWD: repo, Target: "dev:3.%17"},
 			}},
 		)
 
@@ -259,7 +259,7 @@ func TestListAgents(t *testing.T) {
 			}
 			tm := &fakeTmux{err: tc.tmuxErr}
 			if tc.tmuxErr == nil {
-				tm.agents = []agent.Agent{{ID: 17, Host: agent.HostTmux, Display: "working", Target: "kontora:3.%17"}}
+				tm.agents = []agent.Agent{{ID: 17, Host: agent.HostTmux, Display: "working", Target: "dev:3.%17"}}
 			}
 
 			got, err := newTestClient(k, tm).ListAgents(context.Background())
@@ -279,7 +279,7 @@ func TestListAgents(t *testing.T) {
 }
 
 func TestFocus(t *testing.T) {
-	tmuxAgent := agent.Agent{ID: 17, Host: agent.HostTmux, Display: "working", Target: "kontora:3.%17"}
+	tmuxAgent := agent.Agent{ID: 17, Host: agent.HostTmux, Display: "working", Target: "dev:3.%17"}
 
 	t.Run("a kitty agent is focused by window id", func(t *testing.T) {
 		k := &fakeKitty{}
@@ -305,9 +305,9 @@ func TestFocus(t *testing.T) {
 		}
 		want := []string{
 			"--type=tab",
-			"--title", "ro kontora:3.%17",
-			"--var", "AGENT_VIEW=kontora:3.%17",
-			"--", "/usr/local/bin/cattery", "attach", "kontora:3.%17",
+			"--title", "ro dev:3.%17",
+			"--var", "AGENT_VIEW=dev:3.%17",
+			"--", "/usr/local/bin/cattery", "attach", "dev:3.%17",
 		}
 		if len(k.launched) != 1 || !slices.Equal(k.launched[0], want) {
 			t.Fatalf("launched:\n got %v\nwant %v", k.launched, want)
@@ -323,8 +323,8 @@ func TestFocus(t *testing.T) {
 		k := &fakeKitty{windows: []kitty.Window{
 			// The second agent of a split window: same window, another pane, and
 			// its own viewer tab.
-			{ID: 5, UserVars: map[string]string{"AGENT_VIEW": "kontora:3.%18"}},
-			{ID: 6, UserVars: map[string]string{"AGENT_VIEW": "kontora:3.%17"}},
+			{ID: 5, UserVars: map[string]string{"AGENT_VIEW": "dev:3.%18"}},
+			{ID: 6, UserVars: map[string]string{"AGENT_VIEW": "dev:3.%17"}},
 			{ID: 7},
 		}}
 		client := newTestClient(k, &fakeTmux{})
@@ -426,8 +426,8 @@ func TestPreview(t *testing.T) {
 		},
 		{
 			name:        "a tmux agent is read by target",
-			a:           agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"},
-			wantCapture: []string{"kontora:3.%17"},
+			a:           agent.Agent{ID: 17, Host: agent.HostTmux, Target: "dev:3.%17"},
+			wantCapture: []string{"dev:3.%17"},
 		},
 		{
 			name:    "a tmux agent with no target reaches neither host",
@@ -485,8 +485,8 @@ func TestSend(t *testing.T) {
 		},
 		{
 			name:     "a tmux agent is typed at by target",
-			a:        agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"},
-			wantTmux: []string{`kontora:3.%17:"\x1b[A"`},
+			a:        agent.Agent{ID: 17, Host: agent.HostTmux, Target: "dev:3.%17"},
+			wantTmux: []string{`dev:3.%17:"\x1b[A"`},
 		},
 		{
 			name:    "a tmux agent with no target reaches neither host",
@@ -536,12 +536,12 @@ func TestMarkSeen(t *testing.T) {
 
 	t.Run("a tmux agent is marked on its pane", func(t *testing.T) {
 		k, tm := &fakeKitty{}, &fakeTmux{}
-		a := agent.Agent{ID: 17, Host: agent.HostTmux, Target: "kontora:3.%17"}
+		a := agent.Agent{ID: 17, Host: agent.HostTmux, Target: "dev:3.%17"}
 
 		if err := newTestClient(k, tm).MarkSeen(context.Background(), a); err != nil {
 			t.Fatalf("mark seen: %v", err)
 		}
-		if want := []string{"kontora:3.%17"}; !slices.Equal(tm.marked, want) {
+		if want := []string{"dev:3.%17"}; !slices.Equal(tm.marked, want) {
 			t.Fatalf("marked: got %v, want %v", tm.marked, want)
 		}
 		if len(k.vars) != 0 {
