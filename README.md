@@ -6,6 +6,15 @@ Coding agents run for minutes in windows you are not watching. Cattery marks
 each tab with what its agent is doing, notifies you when one needs an answer,
 and lists them all in a picker.
 
+![The overlay, listing six agents grouped by repository](docs/overlay.png)
+
+<details>
+<summary>Press <code>v</code> for the screen of the agent under the cursor</summary>
+
+![The preview drawer beside the list, showing an agent's screen](docs/preview.png)
+
+</details>
+
 ## Install
 
 With Homebrew:
