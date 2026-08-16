@@ -145,9 +145,11 @@ func appendBlock(conf, block string) string {
 	return strings.TrimRight(conf, "\n") + "\n\n" + block
 }
 
-// shellQuote makes a path safe to embed in a command line. kitty's `launch` and
-// Claude's hook command both split their string shell-style, so a path with a
-// space or a quote needs quoting.
+// shellQuote makes a path safe to embed in a command line. kitty's `launch`
+// splits its command shell-style, so a path with a space or a quote needs
+// quoting. Nothing else setup writes does: `env` on the line below takes the
+// rest of the line as the value, and the hook manifests name the binary by its
+// bare name.
 func shellQuote(s string) string {
 	const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:@+,="
 	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !strings.ContainsRune(safe, r) }) < 0 {

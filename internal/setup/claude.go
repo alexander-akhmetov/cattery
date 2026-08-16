@@ -5,19 +5,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
 // claudeHooks maps each Claude Code hook event to the state cattery publishes
-// from it. Order is the order setup writes and reports them in, which is the
-// order they fire.
+// from it. Order is the order the hooks fire, and the order claude/hooks/hooks.json
+// lists them in.
 //
 // SessionStart takes a matcher, because that hook fires for a compaction and a
 // fork as well as for a session opening, and an idle mid-turn would mark a
 // running agent finished. A fork is either one and the payload does not say
 // which, so the matcher drops that word too: see startSources in
 // internal/state. The writer checks the payload's source as well, for a Claude
-// that predates the matcher and for a settings.json the user edited.
+// that predates the matcher.
+//
+// The plugin manifest is what Claude reads. This list is what the tests hold it
+// to, and what the removal below looks for in a settings.json an older release
+// merged its hooks into.
 var claudeHooks = []struct{ Event, State, Matcher string }{
 	{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
 	{Event: "Notification", State: "blocked"},
@@ -26,20 +31,9 @@ var claudeHooks = []struct{ Event, State, Matcher string }{
 	{Event: "SessionEnd", State: "clear"},
 }
 
-// hookCommand is what one Claude hook runs.
-func hookCommand(binary, state string) string {
-	return shellQuote(binary) + " state " + state
-}
-
-// hookEntry is one command inside a hook group.
-type hookEntry struct {
-	Type    string `json:"type"`
-	Command string `json:"command"`
-}
-
 // object is a JSON object that remembers the order its keys arrived in, and
 // keeps every value it does not need as raw bytes. Claude's settings.json
-// belongs to the user. A merge that reshuffled its keys, or rewrote a command
+// belongs to the user. An edit that reshuffled its keys, or rewrote a command
 // it never touched, would make the diff unreadable.
 type object struct {
 	keys   []string
@@ -95,6 +89,15 @@ func (o object) MarshalJSON() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+// remove drops a key, leaving the order of the rest alone.
+func (o *object) remove(key string) {
+	if _, ok := o.values[key]; !ok {
+		return
+	}
+	delete(o.values, key)
+	o.keys = slices.DeleteFunc(o.keys, func(k string) bool { return k == key })
+}
+
 func (o *object) set(key string, value json.RawMessage) {
 	if o.values == nil {
 		o.values = map[string]json.RawMessage{}
@@ -123,73 +126,144 @@ func (o object) child(key string) (object, error) {
 	return out, nil
 }
 
-// mergeClaudeHooks adds cattery's five hooks to Claude's settings and returns
-// the whole file. Existing entries stay, because the arrays under hooks.<Event>
-// hold other tools' commands. The merge appends, and it rewrites only the
-// command cattery already owns, so a re-run updates the binary path instead of
-// adding a second copy.
-func mergeClaudeHooks(settings []byte, binary string) ([]byte, error) {
-	root := object{}
-	if len(bytes.TrimSpace(settings)) > 0 {
-		if err := json.Unmarshal(settings, &root); err != nil {
-			return nil, err
-		}
+// removeCatteryHooks takes cattery's own hooks back out of Claude's settings and
+// returns the whole file with the number of entries it dropped. Releases before
+// the plugin merged them in there; the plugin runs them now, and an entry left
+// behind publishes every state a second time.
+//
+// Only the commands catteryCommand recognises go. A group left with no commands
+// goes with them, then an event left with no groups, then "hooks" itself. Every
+// other key keeps its place and its bytes, so a diff of the file shows the five
+// entries leaving and nothing else.
+//
+// A file holding nothing of cattery's comes back as it arrived, byte for byte.
+// Re-encoding reindents the whole file, which is not a change to make on a file
+// that needed no edit.
+func removeCatteryHooks(settings []byte) ([]byte, int, error) {
+	if len(bytes.TrimSpace(settings)) == 0 {
+		return settings, 0, nil
 	}
-
+	root := object{}
+	if err := json.Unmarshal(settings, &root); err != nil {
+		return nil, 0, err
+	}
+	if _, ok := root.values["hooks"]; !ok {
+		return settings, 0, nil
+	}
 	hooks, err := root.child("hooks")
 	if err != nil {
-		return nil, err
-	}
-	for _, h := range claudeHooks {
-		var groups []json.RawMessage
-		if raw, ok := hooks.values[h.Event]; ok {
-			if err := json.Unmarshal(raw, &groups); err != nil {
-				return nil, fmt.Errorf("hooks.%s: %w", h.Event, err)
-			}
-		}
-		command := hookCommand(binary, h.State)
-		updated, err := updateCatteryHook(groups, h.State, command)
-		if err != nil {
-			return nil, fmt.Errorf("hooks.%s: %w", h.Event, err)
-		}
-		if !updated {
-			// A struct, because a map's keys are sorted. That would write
-			// "command" before "type" and read as a different shape from every
-			// hook already in the file.
-			//
-			// The matcher goes only on a group this merge creates. A group the
-			// user has edited belongs to them, and putting a matcher back on one
-			// they stripped would fight them.
-			group, err := encode(struct {
-				Matcher string      `json:"matcher,omitempty"`
-				Hooks   []hookEntry `json:"hooks"`
-			}{Matcher: h.Matcher, Hooks: []hookEntry{{Type: "command", Command: command}}})
-			if err != nil {
-				return nil, err
-			}
-			groups = append(groups, group)
-		}
-		raw, err := encode(groups)
-		if err != nil {
-			return nil, err
-		}
-		hooks.set(h.Event, raw)
+		return nil, 0, err
 	}
 
-	raw, err := encode(hooks)
-	if err != nil {
-		return nil, err
+	removed := 0
+	for _, h := range claudeHooks {
+		raw, ok := hooks.values[h.Event]
+		if !ok {
+			continue
+		}
+		var groups []json.RawMessage
+		if err := json.Unmarshal(raw, &groups); err != nil {
+			return nil, 0, fmt.Errorf("hooks.%s: %w", h.Event, err)
+		}
+		kept, dropped, err := dropCatteryEntries(groups, h.State)
+		if err != nil {
+			return nil, 0, fmt.Errorf("hooks.%s: %w", h.Event, err)
+		}
+		if dropped == 0 {
+			continue
+		}
+		removed += dropped
+		if len(kept) == 0 {
+			hooks.remove(h.Event)
+			continue
+		}
+		encoded, err := encode(kept)
+		if err != nil {
+			return nil, 0, err
+		}
+		hooks.set(h.Event, encoded)
 	}
-	root.set("hooks", raw)
+	if removed == 0 {
+		return settings, 0, nil
+	}
+
+	if len(hooks.keys) == 0 {
+		root.remove("hooks")
+	} else {
+		encoded, err := encode(hooks)
+		if err != nil {
+			return nil, 0, err
+		}
+		root.set("hooks", encoded)
+	}
 
 	var out bytes.Buffer
 	enc := json.NewEncoder(&out)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(root); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return out.Bytes(), nil
+	return out.Bytes(), removed, nil
+}
+
+// dropCatteryEntries takes cattery's commands out of one event's groups and
+// reports how many it took. A group holding another tool's command keeps that
+// command, its matcher and the raw bytes of both; a group holding nothing else
+// goes. A group in a shape this cannot read is somebody else's and stays whole.
+func dropCatteryEntries(groups []json.RawMessage, state string) ([]json.RawMessage, int, error) {
+	kept := make([]json.RawMessage, 0, len(groups))
+	removed := 0
+	for _, rawGroup := range groups {
+		var group object
+		if err := json.Unmarshal(rawGroup, &group); err != nil {
+			kept = append(kept, rawGroup)
+			continue
+		}
+		var entries []json.RawMessage
+		if err := json.Unmarshal(group.values["hooks"], &entries); err != nil {
+			kept = append(kept, rawGroup)
+			continue
+		}
+		keptEntries := make([]json.RawMessage, 0, len(entries))
+		for _, rawEntry := range entries {
+			if catteryEntry(rawEntry, state) {
+				removed++
+				continue
+			}
+			keptEntries = append(keptEntries, rawEntry)
+		}
+		switch {
+		case len(keptEntries) == len(entries):
+			kept = append(kept, rawGroup)
+		case len(keptEntries) == 0:
+		default:
+			encoded, err := encode(keptEntries)
+			if err != nil {
+				return nil, 0, err
+			}
+			group.set("hooks", encoded)
+			regrouped, err := encode(group)
+			if err != nil {
+				return nil, 0, err
+			}
+			kept = append(kept, regrouped)
+		}
+	}
+	return kept, removed, nil
+}
+
+// catteryEntry reports whether one hook entry runs a cattery command for state.
+func catteryEntry(raw json.RawMessage, state string) bool {
+	var entry object
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return false
+	}
+	var command string
+	if err := json.Unmarshal(entry.values["command"], &command); err != nil {
+		return false
+	}
+	return catteryCommand(command, state)
 }
 
 // encode is json.Marshal with HTML escaping off. Marshal rewrites <, > and & as
@@ -207,59 +281,11 @@ func encode(v any) (json.RawMessage, error) {
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }
 
-// updateCatteryHook points the hook cattery already owns at the current binary,
-// and reports whether it found one. Only that command string changes. The group
-// around it belongs to the user and holds a matcher and other tools' commands,
-// which replacing the group would delete.
-func updateCatteryHook(groups []json.RawMessage, state, command string) (bool, error) {
-	encoded, err := encode(command)
-	if err != nil {
-		return false, err
-	}
-	for gi, rawGroup := range groups {
-		var group object
-		if err := json.Unmarshal(rawGroup, &group); err != nil {
-			continue // not a shape we understand, so not ours to edit
-		}
-		var entries []json.RawMessage
-		if err := json.Unmarshal(group.values["hooks"], &entries); err != nil {
-			continue
-		}
-		for ei, rawEntry := range entries {
-			var entry object
-			if err := json.Unmarshal(rawEntry, &entry); err != nil {
-				continue
-			}
-			var current string
-			if err := json.Unmarshal(entry.values["command"], &current); err != nil {
-				continue
-			}
-			if !catteryCommand(current, state) {
-				continue
-			}
-			entry.set("command", encoded)
-			if entries[ei], err = encode(entry); err != nil {
-				return false, err
-			}
-			rawEntries, err := encode(entries)
-			if err != nil {
-				return false, err
-			}
-			group.set("hooks", rawEntries)
-			if groups[gi], err = encode(group); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // catteryCommand reports whether a hook command is one cattery wrote for the
-// given state: the current `<binary> state <x>` form, or the `cattery-state <x>`
-// of an older install. It reads the end of the command instead of searching for
-// "cattery" anywhere in it, or it would rewrite a hook like
-// `cd ~/projects/cattery && make lint`.
+// given state: the `<binary> state <x>` form releases before the plugin merged
+// in, or the `cattery-state <x>` of an older install still. It reads the end of
+// the command instead of searching for "cattery" anywhere in it, or it would
+// delete a hook like `cd ~/projects/cattery && make lint`.
 func catteryCommand(command, state string) bool {
 	fields := strings.Fields(command)
 	if len(fields) < 2 || fields[len(fields)-1] != state {
@@ -272,7 +298,7 @@ func catteryCommand(command, state string) bool {
 }
 
 // binaryName is the command a hook field names, without its directory and
-// without the quotes shellQuote puts around a path holding a space.
+// without the quotes an older release put around a path holding a space.
 func binaryName(field string) string {
 	return filepath.Base(strings.Trim(field, `'"`))
 }

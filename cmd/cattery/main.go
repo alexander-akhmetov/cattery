@@ -91,7 +91,7 @@ var subcommands = []subcommand{
 		name:    cmdSetup,
 		summary: "install the kitty files and the config they need",
 		details: `Copies the watcher and the kittens into kitty's config directory, keeps its
-own block in kitty.conf, and offers to wire the Claude Code hooks, the Codex
+own block in kitty.conf, and offers to wire the Claude Code plugin, the Codex
 plugin, the pi extension and the opencode plugin. It writes tab_bar.py only
 when that directory has none, because an existing one is yours.
 

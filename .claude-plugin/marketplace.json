@@ -1,0 +1,15 @@
+{
+  "name": "cattery",
+  "description": "Agent state in the kitty tab bar, plus a picker for jumping between agents",
+  "owner": {
+    "name": "Alexander Akhmetov",
+    "url": "https://github.com/alexander-akhmetov"
+  },
+  "plugins": [
+    {
+      "name": "cattery-claude",
+      "source": "./claude",
+      "category": "productivity"
+    }
+  ]
+}

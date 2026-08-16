@@ -24,9 +24,10 @@ erased, so no installed file needs node.
 ## Layout
 
 `kitty/` holds the five files kitty loads directly. `extensions/cattery.ts` is
-the pi-side state writer. `codex/` and `.agents/plugins/marketplace.json` are
-the Codex plugin. It holds nothing but the five hook entries; the writer they
-run is the binary. `opencode/cattery.ts` is the opencode plugin, which runs that
+the pi-side state writer. `claude/` and `.claude-plugin/marketplace.json` are
+the Claude Code plugin, `codex/` and `.agents/plugins/marketplace.json` the
+Codex one. Each holds nothing but its five hook entries; the writer they run is
+the binary. `opencode/cattery.ts` is the opencode plugin, which runs that
 same binary. `cmd/` and `internal/` build it: the picker, `cattery setup`,
 `cattery state <x> [--kind <claude|codex|opencode>]` (the writer Claude, Codex
 and opencode all run), `cattery save`/`cattery restore` (the tab-tree snapshot),
@@ -114,11 +115,12 @@ files with the embedded ones and warns.
   `internal/kitty` and `internal/tmux` both fall back to known install prefixes
   when the lookup fails. Without that, `noServer` reads the missing binary as
   "no tmux on this machine" and every tmux agent leaves the picker silently.
-- The Codex hooks are the one exception to that rule: they run the bare name
-  `cattery` off PATH. `codex/hooks/hooks.json` is a static file with no way to
-  learn the install path, the way `env CATTERY_BIN` teaches the watcher, and a
-  Codex hook is a child of the Codex process, which a shell started. So it gets
-  that shell's PATH and not launchd's.
+- The Claude and Codex hooks are the one exception to that rule: they run the
+  bare name `cattery` off PATH. `claude/hooks/hooks.json` and
+  `codex/hooks/hooks.json` are static files with no way to learn the install
+  path, the way `env CATTERY_BIN` teaches the watcher, and either host's hook is
+  a child of that host's process, which a shell started. So it gets that shell's
+  PATH and not launchd's.
 - The preview sidebar draws text the picker did not write, inside its own
   frame. `internal/overlay/preview.go` passes SGR through and drops every other
   escape and control byte. One cursor movement or one OSC would corrupt the
@@ -242,7 +244,7 @@ files with the embedded ones and warns.
   a turn, and an `idle` published there reads as `done` through `_WORKED` above:
   a green tab marker and a "finished" banner over an agent that is still
   working. Two guards, because either alone leaves a hole: the
-  `"matcher": "startup|resume|clear"` `cattery setup` writes on the group, and
+  `"matcher": "startup|resume|clear"` in `claude/hooks/hooks.json`, and
   the `source` check in `internal/state`. That `source` is also what tells a
   `SessionStart` idle from a `Stop` idle, since both hooks run
   `cattery state idle`, and of the five hooks cattery installs only
@@ -256,8 +258,22 @@ files with the embedded ones and warns.
   2.1.214 reported a fork as `resume`, which passes both guards.
 - Codex fires `SessionStart` for four sources, Claude's five without `fork`, so
   `startSources` and `midTurnSources` cover it as they stand. Its own guard is
-  the `"matcher": "startup|resume|clear"` in `codex/hooks/hooks.json`, not the
-  one `cattery setup` writes: setup never edits Codex's `hooks.json`.
+  the `"matcher": "startup|resume|clear"` in `codex/hooks/hooks.json`, the same
+  shape Claude's plugin uses.
+- Claude Code loads a plugin's `hooks/hooks.json` by itself. A `plugin.json`
+  that also names it in its `hooks` field fails the whole plugin with "Duplicate
+  hooks file detected", so `claude/.claude-plugin/plugin.json` carries no `hooks`
+  key, where Codex's needs one. `claude plugin list` is where that error shows
+  up; nothing says it at install time.
+- The Claude plugin and the hooks an older release merged into
+  `~/.claude/settings.json` both fire, and every state is published twice.
+  Nothing shows it: `_apply`'s `changed = display != prev`
+  (`kitty/cattery_watcher.py:464`) swallows the repeat, so no second banner and
+  no second event. `s.claudeSettings` takes the old entries out, and only after
+  the install commands ran, so a user who declines keeps the only thing
+  publishing their state.
+- `claude plugin marketplace add` refuses a bare `.` and wants `./`, unlike
+  Codex's.
 - Codex trust-gates a plugin's hooks. It records a hash and skips an untrusted
   hook without a word, until the user opens `/hooks` in the TUI and trusts each
   entry. Nothing can automate that, so `cattery setup` prints it. A Codex agent
@@ -378,16 +394,21 @@ files with the embedded ones and warns.
 - A colour name `fmt.fg` does not carry raises inside `agent_prefix`, whose
   `except Exception` returns `""`, so a typo in `_AGENT_STATE_STYLE` costs the
   tab marker with nothing said. `magenta` is in kitty 0.48.1's table.
-- The pi extension and the Codex plugin are two more rollouts. `cattery setup`
-  offers to run `pi install git:github.com/alexander-akhmetov/cattery` and
-  `codex plugin add cattery-codex@cattery`, both of which fetch the published
+- The pi extension, the Claude plugin and the Codex plugin are three more
+  rollouts. `cattery setup` offers to run
+  `pi install git:github.com/alexander-akhmetov/cattery`,
+  `claude plugin install cattery-claude@cattery --scope user` and
+  `codex plugin add cattery-codex@cattery`, all of which fetch the published
   copy and not this checkout, and `setup.Stale` covers the installed
-  `kitty/*.py` and the opencode plugin, so nothing notices the pi extension or
-  the Codex plugin going out of date. Test a local extension with
-  `pi --no-extensions -e ./extensions/cattery.ts`, a local Codex plugin with
-  `codex plugin marketplace add .` from the repository root, and a local
+  `kitty/*.py` and the opencode plugin, so nothing notices any of the three
+  going out of date. Test a local extension with
+  `pi --no-extensions -e ./extensions/cattery.ts`, a local Claude plugin with
+  `claude plugin marketplace add ./` from the repository root, a local Codex
+  plugin with `codex plugin marketplace add .` from the same place, and a local
   opencode plugin by copying `opencode/cattery.ts` into
-  `~/.config/opencode/plugin/`, which is where setup puts it anyway.
+  `~/.config/opencode/plugin/`, which is where setup puts it anyway. Point
+  `CLAUDE_CONFIG_DIR` at a scratch directory first, or the test installs into
+  the running session's own configuration.
 - `codex plugin marketplace add` on a source already configured exits 0 and
   leaves the snapshot it fetched alone, so a re-run after a release would
   install the old plugin again. `codex plugin marketplace upgrade cattery` is

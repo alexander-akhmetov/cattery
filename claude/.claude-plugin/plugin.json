@@ -1,0 +1,11 @@
+{
+  "name": "cattery-claude",
+  "description": "Report Claude Code session state to cattery, for the kitty tab marker and the agent picker",
+  "author": {
+    "name": "Alexander Akhmetov"
+  },
+  "repository": "https://github.com/alexander-akhmetov/cattery",
+  "homepage": "https://github.com/alexander-akhmetov/cattery/tree/main/claude",
+  "license": "MIT",
+  "keywords": ["kitty", "tmux", "claude", "status"]
+}

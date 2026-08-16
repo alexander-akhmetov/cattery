@@ -26,6 +26,38 @@ import (
 // parses pi's settings file.
 const piPackage = "git:github.com/alexander-akhmetov/cattery"
 
+// The Claude Code plugin, as its CLI names it. claudeSource is the repository
+// the marketplace comes from, claudeMarketplace the name the manifest gives it,
+// and claudePlugin the selector `claude plugin install` takes.
+//
+// The https URL rather than the `alexander-akhmetov/cattery` shorthand Codex
+// takes: Claude clones that shorthand over SSH, and a user following the README
+// has no reason to have a key loaded.
+const (
+	claudeSource      = "https://github.com/alexander-akhmetov/cattery.git"
+	claudeMarketplace = "cattery"
+	claudePlugin      = "cattery-claude@" + claudeMarketplace
+)
+
+// claudeArgs are what setup runs, in order, checked against claude 2.1.233.
+//
+// `marketplace add` on a source already configured exits 0 and says so, but it
+// leaves the clone it fetched alone, and `plugin install` on an installed
+// plugin exits 0 without refetching. So `marketplace update` between them is
+// the only thing that carries a release to a machine that already has the
+// plugin, and it is second because it fails on a marketplace nothing has added
+// yet.
+//
+// `--scope user` because s.run gives the child no stdin, so the scope the
+// interactive install would ask for has to be on the command line. No `--yes`:
+// that flag is for a plugin installed by running a marketplace-declared
+// command, which this one is not.
+var claudeArgs = [][]string{
+	{"plugin", "marketplace", "add", claudeSource},
+	{"plugin", "marketplace", "update", claudeMarketplace},
+	{"plugin", "install", claudePlugin, "--scope", "user"},
+}
+
 // The Codex plugin, as its CLI names it. codexSource is the repository the
 // marketplace comes from, codexMarketplace the name the manifest gives it, and
 // codexPlugin the selector `codex plugin add` takes.
@@ -53,8 +85,8 @@ var codexArgs = [][]string{
 const assetMode fs.FileMode = 0o644
 
 // preserveMode tells writeFile to keep the mode a file already has. kitty.conf
-// and Claude's settings.json belong to the user, and setup edits only part of
-// them.
+// and Claude's settings.json belong to the user, and setup edits only its own
+// part of them.
 const preserveMode fs.FileMode = 0
 
 // Options configures one `cattery setup` run.
@@ -70,12 +102,13 @@ type Options struct {
 	// Yes answers the Claude, Codex, pi and opencode questions without asking.
 	Yes bool
 
-	// Binary is the path setup writes into the kitty map and the Claude hooks.
-	// Empty asks the running process where it lives.
+	// Binary is the path setup writes into the kitty map. Empty asks the
+	// running process where it lives.
 	Binary string
 
 	// ClaudeDir is where settings.json lives. Empty falls back to
-	// $CLAUDE_CONFIG_DIR, then ~/.claude.
+	// $CLAUDE_CONFIG_DIR, then ~/.claude. Setup reads that file only to take
+	// out the hooks an older release merged into it.
 	ClaudeDir string
 
 	// CodexDir is where Codex's own hooks.json lives. Empty falls back to
@@ -98,8 +131,8 @@ type Options struct {
 	// Out receives the report. Nil means os.Stdout.
 	Out io.Writer
 
-	// LookPath and RunCommand find and run codex and pi. A test replaces them
-	// to record the install commands without launching anything.
+	// LookPath and RunCommand find and run claude, codex and pi. A test
+	// replaces them to record the install commands without launching anything.
 	LookPath   func(file string) (string, error)
 	RunCommand func(name string, args ...string) error
 }
@@ -447,30 +480,82 @@ func (s *session) kittyConf() error {
 
 // --- agents -----------------------------------------------------------------
 
+// claude installs the Claude Code plugin through Claude's own CLI, then takes
+// the hooks an older release merged into settings.json back out. The plugin
+// comes from the published repository rather than from this checkout, so a run
+// here fetches whatever that repository holds now.
+//
+// Nothing notices that plugin going stale: Stale compares the installed kitty
+// files and the opencode plugin, neither of which this step touches. Claude
+// trusts a user-scope plugin's hooks on install, so there is no gate to explain
+// the way Codex needs one.
 func (s *session) claude() {
 	s.out.line("")
-	path := filepath.Join(s.claudeDir, "settings.json")
-	skip := func(reason string) {
-		s.out.plain("skipped", strings.TrimSuffix(shorten(path)+": "+reason, ": "))
-		s.out.block(claudeInstructions(s.binary))
-	}
-
-	if !s.consent("Add cattery hooks to " + shorten(path) + "?") {
-		skip("")
-		return
-	}
-	current, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		skip(err.Error())
-		return
-	}
-	merged, err := mergeClaudeHooks(current, s.binary)
+	path, err := s.lookPath("claude")
 	if err != nil {
-		skip(err.Error())
+		s.out.plain("skipped", "claude is not on PATH")
+		s.out.block(claudeInstructions())
 		return
 	}
-	if string(merged) == string(current) {
-		s.out.plain("ok", fmt.Sprintf("%s (%d hooks)", shorten(path), len(claudeHooks)))
+	if !s.consent("Install the cattery Claude Code plugin?") {
+		// One line per command, so a decline still leaves the three to run by
+		// hand. settings.json is left alone on this path: hooks an older release
+		// merged in there are the only thing publishing the state, and taking
+		// them out without the plugin to replace them would leave the user with
+		// neither.
+		for _, args := range claudeArgs {
+			s.out.plain("skipped", claudeCommand(args))
+		}
+		s.out.block(claudeStaleInstructions)
+		return
+	}
+	// The install is the last step, and the only one whose success says the
+	// plugin is in place: either marketplace step can fail on a machine that
+	// already has it. A dry run runs nothing and still reports the removal.
+	installed := s.opts.DryRun
+	for i, args := range claudeArgs {
+		command := claudeCommand(args)
+		s.out.act("ran", "would run", command)
+		if s.opts.DryRun {
+			continue
+		}
+		err := s.run(path, args...)
+		if err != nil {
+			s.out.plain("failed", command+": "+err.Error())
+		}
+		if i == len(claudeArgs)-1 {
+			installed = err == nil
+		}
+	}
+	s.out.block(claudeStaleInstructions)
+	if installed {
+		s.claudeSettings()
+	}
+}
+
+// claudeSettings takes cattery's own hooks out of settings.json, which is where
+// releases before the plugin put them. Both sets fire otherwise, and every state
+// is published twice.
+//
+// It runs only behind an install that worked. A user who declined, who has no
+// claude on PATH, or whose install failed keeps the hooks, because those are
+// then still the only thing publishing their state. Silent when the file holds
+// nothing of cattery's.
+func (s *session) claudeSettings() {
+	path := filepath.Join(s.claudeDir, "settings.json")
+	current, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.out.plain("kept", shorten(path)+": "+err.Error())
+		}
+		return
+	}
+	cleaned, removed, err := removeCatteryHooks(current)
+	if err != nil {
+		s.out.plain("kept", shorten(path)+": "+err.Error())
+		return
+	}
+	if removed == 0 {
 		return
 	}
 
@@ -478,19 +563,15 @@ func (s *session) claude() {
 	// copy of the settings from before cattery.
 	backup := path + ".cattery-bak"
 	target := resolveLink(path)
-	detail := fmt.Sprintf("%s (%d hooks)", label(path, target), len(claudeHooks))
+	detail := fmt.Sprintf("%s (%d hooks; the plugin runs them now)", label(path, target), removed)
 	_, backupErr := os.Stat(backup)
-	writeBackup := len(current) > 0 && errors.Is(backupErr, os.ErrNotExist)
+	writeBackup := errors.Is(backupErr, os.ErrNotExist)
 	if writeBackup {
 		detail += ", backup at " + filepath.Base(backup)
 	}
 
-	s.out.act("updated", "would update", detail)
+	s.out.act("removed", "would remove", detail)
 	if s.opts.DryRun {
-		return
-	}
-	if err := os.MkdirAll(s.claudeDir, 0o755); err != nil {
-		s.out.plain("failed", shorten(path)+": "+err.Error())
 		return
 	}
 	if writeBackup {
@@ -504,27 +585,27 @@ func (s *session) claude() {
 			return
 		}
 	}
-	if err := writeFile(target, merged, preserveMode); err != nil {
+	if err := writeFile(target, cleaned, preserveMode); err != nil {
 		s.out.plain("failed", shorten(target)+": "+err.Error())
 	}
 }
 
-// claudeInstructions lists the five hooks for a user who declined the merge, or
-// whose settings.json setup could not read.
-func claudeInstructions(binary string) string {
-	lines := make([]string, 0, len(claudeHooks)+1)
-	lines = append(lines, "    Add these to Claude's settings.json, as hooks.<Event>[].hooks[].command:")
-	for _, h := range claudeHooks {
-		line := fmt.Sprintf("      %-17s %s", h.Event, hookCommand(binary, h.State))
-		if h.Matcher != "" {
-			// Hand-installed without the matcher, SessionStart runs this for a
-			// compaction as well, which marks a running agent finished.
-			line += fmt.Sprintf("   (on a group with \"matcher\": %q)", h.Matcher)
-		}
-		lines = append(lines, line)
+// claudeCommand renders one step as the line a user would type.
+func claudeCommand(args []string) string { return "claude " + strings.Join(args, " ") }
+
+// claudeInstructions lists the steps for a user without claude on PATH.
+func claudeInstructions() string {
+	lines := make([]string, 0, 1+len(claudeArgs))
+	lines = append(lines, "    Once claude is installed, run:")
+	for _, args := range claudeArgs {
+		lines = append(lines, "      "+claudeCommand(args))
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n") + "\n\n" + claudeStaleInstructions
 }
+
+// claudeStaleInstructions is what setup cannot do for the user.
+const claudeStaleInstructions = `    The plugin is fetched from the published repository, so nothing notices it
+    going stale. Run these again after every cattery upgrade.`
 
 // codex installs the Codex plugin through Codex's own CLI. The plugin comes
 // from the published repository rather than from this checkout, so a run here

@@ -38,10 +38,14 @@ Reload kitty afterwards.
 and an upgrade of the binary does not update those copies. Run it again after
 every upgrade. Restart kitty after.
 
-`cattery setup` also offers to install the pi extension and the Codex plugin:
+`cattery setup` also offers to install the pi extension, the Claude Code plugin
+and the Codex plugin:
 
 ```bash
 pi install git:github.com/alexander-akhmetov/cattery
+claude plugin marketplace add https://github.com/alexander-akhmetov/cattery.git
+claude plugin marketplace update cattery
+claude plugin install cattery-claude@cattery --scope user
 codex plugin marketplace add alexander-akhmetov/cattery
 codex plugin marketplace upgrade cattery
 codex plugin add cattery-codex@cattery
@@ -49,11 +53,17 @@ codex plugin add cattery-codex@cattery
 
 Say yes after every upgrade. The picker warns about stale kitty files and a
 stale opencode plugin, because the binary carries both. Nothing notices a stale
-pi extension or a stale Codex plugin: those two are fetched from the published
-repository rather than from the binary.
+pi extension, Claude plugin or Codex plugin: those three are fetched from the
+published repository rather than from the binary.
+
+Earlier releases put the Claude hooks in `~/.claude/settings.json`. One
+`cattery setup` run after this upgrade takes them back out, and keeps a copy of
+the file as `settings.json.cattery-bak`. Without that the plugin and the hooks
+both fire and every state is published twice.
 
 Codex hooks are trust-gated. Open `/hooks` in Codex and trust each
 `cattery-codex@cattery` entry. Until you do, Codex skips them without a word.
+Claude needs no such step.
 
 `cattery -version` prints the release the binary was built from. `cattery help`
 lists the commands, and `cattery help <command>` says what one of them does.

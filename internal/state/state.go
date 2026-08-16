@@ -104,8 +104,8 @@ func resolveKind(name string) kind {
 // running agent finished. Claude before 2.1.214 called a fork "resume", so on
 // those versions a /fork copy passes both guards.
 //
-// The settings.json matcher keeps compact and fork away; these cover an older
-// Claude and a settings.json the user edited.
+// The matcher in claude/hooks/hooks.json keeps compact and fork away; these
+// cover an older Claude and a hook the user wrote by hand.
 //
 // Codex fires the same hook for four sources, startup, resume, clear and
 // compact, and has no fork. So these two lists cover it as they stand. The
@@ -183,8 +183,8 @@ func Run(args []string) {
 // parseArgs reads the state word and the --kind value out of the argv. Written
 // out rather than handed to the flag package, which stops at the first
 // operand: the state word stands in front of the flag, so flag.Parse would see
-// no flags at all. This argv is written by `cattery setup` and by the Codex
-// plugin manifest, never typed.
+// no flags at all. This argv is written by the Claude and Codex plugin
+// manifests, by the opencode plugin and by the shell wrappers, never typed.
 func parseArgs(args []string) (state, kindName string) {
 	for i := 0; i < len(args); i++ {
 		switch arg := args[i]; {

@@ -1,8 +1,10 @@
 package setup
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -178,6 +180,9 @@ func TestFreshInstall(t *testing.T) {
 // second time.
 func TestRerunIsIdempotent(t *testing.T) {
 	h := newHarness(t)
+	// The first run takes the old hooks out. The second has nothing left to do
+	// with the file, which is the case that must not rewrite it again.
+	h.write(h.claudePath("settings.json"), oldHookSettings)
 	h.run()
 
 	before := map[string]string{}
@@ -204,6 +209,9 @@ func TestRerunIsIdempotent(t *testing.T) {
 	}
 	if n := len(h.ran("codex")); n != 2*len(codexArgs) {
 		t.Errorf("codex runs: got %d, want %d per setup run", n, len(codexArgs))
+	}
+	if n := len(h.ran("claude")); n != 2*len(claudeArgs) {
+		t.Errorf("claude runs: got %d, want %d per setup run", n, len(claudeArgs))
 	}
 }
 
@@ -249,7 +257,7 @@ func TestSymlinkedUserFilesAreEditedThroughTheLink(t *testing.T) {
 	conf := filepath.Join(dotfiles, "kitty.conf")
 	h.write(conf, "font_size 13\n")
 	settings := filepath.Join(dotfiles, "settings.json")
-	h.write(settings, unrelatedSettings)
+	h.write(settings, oldHookSettings)
 	if err := os.Chmod(settings, 0o600); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
@@ -280,8 +288,8 @@ func TestSymlinkedUserFilesAreEditedThroughTheLink(t *testing.T) {
 	if got := h.read(conf); !strings.Contains(got, blockStart) {
 		t.Errorf("the checkout's kitty.conf did not get the block:\n%s", got)
 	}
-	if got := h.read(settings); !strings.Contains(got, testBinary+" state idle") {
-		t.Errorf("the checkout's settings.json did not get the hooks:\n%s", got)
+	if got := h.read(settings); strings.Contains(got, testBinary+" state idle") {
+		t.Errorf("the checkout's settings.json kept the hooks:\n%s", got)
 	}
 	if got := h.perm(settings); got != 0o600 {
 		t.Errorf("settings.json mode: got %o, want %o", got, 0o600)
@@ -291,7 +299,7 @@ func TestSymlinkedUserFilesAreEditedThroughTheLink(t *testing.T) {
 	if _, err := os.Stat(settings + ".cattery-bak"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a backup was written into the checkout: %v", err)
 	}
-	if got := h.read(h.claudePath("settings.json.cattery-bak")); got != unrelatedSettings {
+	if got := h.read(h.claudePath("settings.json.cattery-bak")); got != oldHookSettings {
 		t.Errorf("backup does not hold the original:\n%s", got)
 	}
 }
@@ -547,14 +555,14 @@ func TestDryRunWritesNothing(t *testing.T) {
 	h.opts.DryRun = true
 	existing := "font_size 13\n"
 	h.write(h.kittyPath("kitty.conf"), existing)
-	h.write(h.claudePath("settings.json"), `{"model":"opus"}`)
+	h.write(h.claudePath("settings.json"), oldHookSettings)
 
 	out := h.run()
 
 	if got := h.read(h.kittyPath("kitty.conf")); got != existing {
 		t.Errorf("kitty.conf changed:\n%s", got)
 	}
-	if got := h.read(h.claudePath("settings.json")); got != `{"model":"opus"}` {
+	if got := h.read(h.claudePath("settings.json")); got != oldHookSettings {
 		t.Errorf("settings.json changed:\n%s", got)
 	}
 	for _, name := range cattery.ManagedFiles {
@@ -572,13 +580,16 @@ func TestDryRunWritesNothing(t *testing.T) {
 		t.Errorf("a command was launched: %v", h.runs)
 	}
 
-	want := make([]string, 0, 7+len(codexArgs))
+	want := make([]string, 0, 8+len(codexArgs)+len(claudeArgs))
 	want = append(want,
-		"would write", "would update", "would run", "kitty.conf", "settings.json", "pi install "+piPackage,
-		shorten(h.opencodePluginPath()),
+		"would write", "would update", "would run", "would remove", "kitty.conf", "settings.json",
+		"pi install "+piPackage, shorten(h.opencodePluginPath()),
 	)
 	for _, args := range codexArgs {
 		want = append(want, codexCommand(args))
+	}
+	for _, args := range claudeArgs {
+		want = append(want, claudeCommand(args))
 	}
 	for _, phrase := range want {
 		if !strings.Contains(out, phrase) {
@@ -614,112 +625,252 @@ func TestLegacyLeftoversAreReportedNotDeleted(t *testing.T) {
 
 // --- Claude -----------------------------------------------------------------
 
-// unrelatedSettings mirrors a real file. Other tools' hooks sit in the same
-// arrays cattery writes into, and the keys around them must not move.
-const unrelatedSettings = `{
+// The marketplace has to be added before the plugin can be installed from it,
+// and updated in between, because `marketplace add` on a source already
+// configured leaves its snapshot alone.
+func TestClaudePluginCommand(t *testing.T) {
+	h := newHarness(t)
+	out := h.run()
+
+	runs := h.ran("claude")
+	want := [][]string{
+		{"/usr/bin/claude", "plugin", "marketplace", "add", claudeSource},
+		{"/usr/bin/claude", "plugin", "marketplace", "update", claudeMarketplace},
+		{"/usr/bin/claude", "plugin", "install", claudePlugin, "--scope", "user"},
+	}
+	if len(runs) != len(want) {
+		t.Fatalf("claude runs: got %v, want %v", runs, want)
+	}
+	for i := range want {
+		if !equal(runs[i], want[i]) {
+			t.Errorf("claude run %d: got %v, want %v", i, runs[i], want[i])
+		}
+	}
+	// The plugin comes from the published repository, so nothing here notices it
+	// going stale. That has to be said.
+	if !strings.Contains(out, "stale") {
+		t.Errorf("report missing the stale note, got:\n%s", out)
+	}
+}
+
+func TestClaudeMissingFromPath(t *testing.T) {
+	h := newHarness(t)
+	h.opts.LookPath = func(file string) (string, error) {
+		if file == "claude" {
+			return "", exec.ErrNotFound
+		}
+		return "/usr/bin/" + file, nil
+	}
+	// The hooks an older release merged in are the only thing publishing state
+	// for a user who cannot install the plugin.
+	path := h.claudePath("settings.json")
+	h.write(path, oldHookSettings)
+
+	out := h.run()
+
+	if runs := h.ran("claude"); len(runs) != 0 {
+		t.Fatalf("claude was launched: %v", runs)
+	}
+	if !strings.Contains(out, "claude is not on PATH") {
+		t.Errorf("report does not name the skip, got:\n%s", out)
+	}
+	for _, args := range claudeArgs {
+		if !strings.Contains(out, claudeCommand(args)) {
+			t.Errorf("report missing %q, got:\n%s", claudeCommand(args), out)
+		}
+	}
+	if got := h.read(path); got != oldHookSettings {
+		t.Errorf("settings.json was changed:\n%s", got)
+	}
+}
+
+// A failing step is reported and the ones behind it still run. `plugin install`
+// works off the clone an earlier run left, so a marketplace fetch that fails
+// offline does not have to take the install with it. A failing install does
+// take the removal with it: without a plugin, the old hooks are all the user
+// has.
+func TestClaudeFailureIsReported(t *testing.T) {
+	cases := []struct {
+		name        string
+		fails       []string // the claudeArgs entry that fails
+		wantRemoval bool
+	}{
+		{name: "the marketplace fetch", fails: claudeArgs[0], wantRemoval: true},
+		{name: "the install itself", fails: claudeArgs[len(claudeArgs)-1]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.failRun = func(name string, args []string) error {
+				if filepath.Base(name) == "claude" && slices.Equal(args, tc.fails) {
+					return errors.New("network unreachable")
+				}
+				return nil
+			}
+			path := h.claudePath("settings.json")
+			h.write(path, oldHookSettings)
+
+			out := h.run()
+
+			if runs := h.ran("claude"); len(runs) != len(claudeArgs) {
+				t.Fatalf("claude runs: got %v, want %d", runs, len(claudeArgs))
+			}
+			if !strings.Contains(out, "failed") || !strings.Contains(out, "network unreachable") {
+				t.Errorf("report does not name the failure, got:\n%s", out)
+			}
+			if removed := h.read(path) != oldHookSettings; removed != tc.wantRemoval {
+				t.Errorf("hooks removed=%v, want %v; output:\n%s", removed, tc.wantRemoval, out)
+			}
+		})
+	}
+}
+
+// --- the hooks an older release merged into settings.json --------------------
+
+// oldHookSettings is what a machine installed before the plugin holds: cattery's
+// five hooks beside another tool's, and keys around them that must not move.
+const oldHookSettings = `{
   "model": "opus",
   "hooks": {
     "Notification": [
-      {"hooks": [{"type": "command", "command": "nono notify"}]}
+      {"hooks": [{"type": "command", "command": "nono notify"}]},
+      {"hooks": [{"type": "command", "command": "/opt/bin/cattery state blocked"}]}
     ],
     "PostToolUse": [
-      {"matcher": "Edit", "hooks": [{"type": "command", "command": "agterm format"}]}
+      {"matcher": "Edit", "hooks": [{"type": "command", "command": "agterm format 2>/dev/null && echo ok"}]}
+    ],
+    "SessionStart": [
+      {"matcher": "startup|resume|clear", "hooks": [{"type": "command", "command": "/opt/bin/cattery state idle"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "/opt/bin/cattery state working"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/opt/bin/cattery state idle"}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "/opt/bin/cattery state clear"}]}
     ]
   },
   "env": {"FOO": "bar"}
 }`
 
-func TestClaudeMergeKeepsUnrelatedHooksAndKeyOrder(t *testing.T) {
+func TestClaudeOldHooksAreRemoved(t *testing.T) {
 	h := newHarness(t)
 	path := h.claudePath("settings.json")
-	h.write(path, unrelatedSettings)
+	h.write(path, oldHookSettings)
 
-	h.run()
+	out := h.run()
 
-	merged := h.read(path)
-	for _, want := range []string{"nono notify", "agterm format", `"matcher": "Edit"`, `"FOO": "bar"`, `"model": "opus"`} {
-		if !strings.Contains(merged, want) {
-			t.Errorf("merged settings lost %q:\n%s", want, merged)
+	cleaned := h.read(path)
+	if strings.Contains(cleaned, "cattery state") {
+		t.Errorf("a cattery hook survived:\n%s", cleaned)
+	}
+	// The other tool's hooks, and the keys around them, belong to the user. The
+	// && and the 2>/dev/null are here because json.Marshal escapes both unless
+	// every step goes through encode.
+	for _, want := range []string{
+		"nono notify", "agterm format 2>/dev/null && echo ok", `"matcher": "Edit"`,
+		`"FOO": "bar"`, `"model": "opus"`,
+	} {
+		if !strings.Contains(cleaned, want) {
+			t.Errorf("the removal lost %q:\n%s", want, cleaned)
 		}
 	}
-	for _, h := range claudeHooks {
-		want := testBinary + " state " + h.State
-		if !strings.Contains(merged, want) {
-			t.Errorf("merged settings missing %q:\n%s", want, merged)
-		}
-	}
-	if got, want := topLevelKeys(t, merged), []string{"model", "hooks", "env"}; !equal(got, want) {
+	if got, want := topLevelKeys(t, cleaned), []string{"model", "hooks", "env"}; !equal(got, want) {
 		t.Errorf("top-level key order: got %v, want %v", got, want)
 	}
-	// A file that already has hooks keeps its own order, and the events cattery
-	// adds are appended in the order they fire.
-	wantEvents := []string{"Notification", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
-	if got := eventKeys(t, merged); !equal(got, wantEvents) {
+	// Notification keeps its first group, because the other tool's command is in
+	// it. The four events cattery had to itself go entirely.
+	wantEvents := []string{"Notification", "PostToolUse"}
+	if got := eventKeys(t, cleaned); !equal(got, wantEvents) {
 		t.Errorf("hook event order: got %v, want %v", got, wantEvents)
 	}
-	if backup := h.read(path + ".cattery-bak"); backup != unrelatedSettings {
+	if groups := groupsFor(t, cleaned, "Notification"); len(groups) != 1 {
+		t.Errorf("Notification groups: got %d, want 1:\n%s", len(groups), cleaned)
+	}
+	if backup := h.read(path + ".cattery-bak"); backup != oldHookSettings {
 		t.Errorf("backup does not hold the original:\n%s", backup)
+	}
+	if !strings.Contains(out, "removed") || !strings.Contains(out, "5 hooks") {
+		t.Errorf("report does not name the removal, got:\n%s", out)
 	}
 }
 
-func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
+func TestClaudeHookRemovalCases(t *testing.T) {
 	cases := []struct {
-		name         string
-		event        string // the hook event the case is about, "" for Stop
-		existing     string
-		gone         string   // a command the merge must rewrite away
-		kept         []string // text the merge must leave exactly as it was
-		wantMatchers []string // the matcher of each group afterwards, "" for none
+		name     string
+		event    string // the hook event the case is about, "" for Stop
+		existing string
+		kept     []string // text the removal must leave exactly as it was
+		// wantGroups is how many groups the event holds afterwards, and
+		// wantEvents which events survive at all. A nil wantEvents means no
+		// "hooks" key is left.
+		wantGroups int
+		wantEvents []string
+		wantCount  int
+		// wantGroupKeys is the first surviving group's keys, in order. A group
+		// this rewrites goes back through object, which is what keeps the
+		// matcher where the user put it.
+		wantGroupKeys []string
+		wantMatcher   string
 	}{
 		{
-			name:         "the shell installer's command",
-			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery-state idle"}]}]}}`,
-			gone:         "cattery-state idle",
-			wantMatchers: []string{""},
+			name:     "the shell installer's command",
+			existing: `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery-state idle"}]}]}}`,
+			// The last event empties, so "hooks" goes with it.
+			wantCount: 1,
 		},
 		{
-			name:         "an older binary path",
-			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
-			gone:         "/old/bin/cattery state idle",
-			wantMatchers: []string{""},
+			name:      "an older binary path",
+			existing:  `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
+			wantCount: 1,
 		},
 		{
-			// What setup writes when the binary sits in a directory whose name
-			// holds a space.
-			name:         "a quoted binary path",
-			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/opt/my apps/cattery' state idle"}]}]}}`,
-			gone:         "/opt/my apps/cattery",
-			wantMatchers: []string{""},
+			// What an older setup wrote when the binary sat in a directory whose
+			// name holds a space.
+			name:      "a quoted binary path",
+			existing:  `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/opt/my apps/cattery' state idle"}]}]}}`,
+			wantCount: 1,
 		},
 		{
-			// The group belongs to the user. It can carry a matcher and another
-			// tool's command, and only cattery's own entry may change.
+			// The group belongs to the user. Only cattery's own entry goes, and
+			// the matcher and the other command around it stay.
 			name: "a group cattery shares with another tool",
 			existing: `{"hooks":{"Stop":[{"matcher":"*","hooks":[` +
 				`{"type":"command","command":"/old/bin/cattery state idle"},` +
 				`{"type":"command","command":"terminal-notifier -title 'Claude Code'"}]}]}}`,
-			gone:         "/old/bin/cattery state idle",
-			kept:         []string{`"matcher": "*"`, "terminal-notifier -title 'Claude Code'"},
-			wantMatchers: []string{"*"},
+			kept:          []string{"terminal-notifier -title 'Claude Code'"},
+			wantGroups:    1,
+			wantEvents:    []string{"Stop"},
+			wantCount:     1,
+			wantGroupKeys: []string{"matcher", "hooks"},
+			wantMatcher:   "*",
 		},
 		{
-			// A command that only mentions cattery belongs to somebody else. The
-			// && is here too, because json.MarshalIndent would escape it.
-			name:         "a command that names cattery without running it",
-			existing:     `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cd ~/projects/cattery && make lint"}]}]}}`,
-			kept:         []string{"cd ~/projects/cattery && make lint"},
-			wantMatchers: []string{"", ""},
+			// A command that only mentions cattery belongs to somebody else, so
+			// the whole file comes back untouched.
+			name:       "a command that names cattery without running it",
+			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cd ~/projects/cattery && make lint"}]}]}}`,
+			kept:       []string{"cd ~/projects/cattery && make lint"},
+			wantGroups: 1,
+			wantEvents: []string{"Stop"},
 		},
 		{
-			// The user took the matcher off cattery's own group. The merge writes
-			// one only on a group it creates, so their edit stands and only the
-			// command is rewritten. The source check in the writer is what keeps
-			// a compaction from publishing idle here.
-			name:         "a SessionStart group the user stripped the matcher from",
-			event:        "SessionStart",
-			existing:     `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
-			gone:         "/old/bin/cattery state idle",
-			wantMatchers: []string{""},
+			// The plugin's own command carries --kind, so the state is not the
+			// last word and catteryCommand does not claim it. A user who copied
+			// it into settings.json by hand keeps it.
+			name:       "the plugin's command copied in by hand",
+			existing:   `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery state idle --kind claude"}]}]}}`,
+			kept:       []string{"cattery state idle --kind claude"},
+			wantGroups: 1,
+			wantEvents: []string{"Stop"},
+		},
+		{
+			name:      "a SessionStart group the user stripped the matcher from",
+			event:     "SessionStart",
+			existing:  `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/old/bin/cattery state idle"}]}]}}`,
+			wantCount: 1,
 		},
 	}
 	for _, tc := range cases {
@@ -728,40 +879,81 @@ func TestClaudeMergeReplacesTheCatteryHook(t *testing.T) {
 			path := h.claudePath("settings.json")
 			h.write(path, tc.existing)
 
-			h.run()
+			out := h.run()
 
-			merged := h.read(path)
-			if tc.gone != "" && strings.Contains(merged, tc.gone) {
-				t.Errorf("the old command survived:\n%s", merged)
-			}
+			cleaned := h.read(path)
 			for _, want := range tc.kept {
-				if !strings.Contains(merged, want) {
-					t.Errorf("the merge lost %q:\n%s", want, merged)
+				if !strings.Contains(cleaned, want) {
+					t.Errorf("the removal lost %q:\n%s", want, cleaned)
 				}
 			}
-			// Both idle hooks run the same command, so this counts inside the
-			// event rather than over the whole file.
+			// A file with nothing of cattery's in it is not rewritten at all, so
+			// it comes back byte for byte and gets no backup.
+			if tc.wantCount == 0 {
+				if cleaned != tc.existing {
+					t.Errorf("settings.json was rewritten:\n%s", cleaned)
+				}
+				if _, err := os.Stat(path + ".cattery-bak"); !errors.Is(err, os.ErrNotExist) {
+					t.Error("a backup was written for a file that needed no edit")
+				}
+				return
+			}
+			if want := fmt.Sprintf("%d hooks", tc.wantCount); !strings.Contains(out, want) {
+				t.Errorf("report does not say %q, got:\n%s", want, out)
+			}
+			if strings.Contains(cleaned, "cattery state") || strings.Contains(cleaned, "cattery-state") {
+				t.Errorf("a cattery hook survived:\n%s", cleaned)
+			}
+			if got := eventKeys(t, cleaned); !equal(got, tc.wantEvents) {
+				t.Errorf("hook events: got %v, want %v:\n%s", got, tc.wantEvents, cleaned)
+			}
+			if tc.wantEvents == nil {
+				if got := topLevelKeys(t, cleaned); slices.Contains(got, "hooks") {
+					t.Errorf("an empty hooks key was left behind: %v\n%s", got, cleaned)
+				}
+				return
+			}
 			event := tc.event
 			if event == "" {
 				event = "Stop"
 			}
-			groups := groupsFor(t, merged, event)
-			owns := 0
-			for _, group := range groups {
-				owns += strings.Count(string(group), testBinary+" state idle")
+			groups := groupsFor(t, cleaned, event)
+			if len(groups) != tc.wantGroups {
+				t.Fatalf("%s groups: got %d, want %d:\n%s", event, len(groups), tc.wantGroups, cleaned)
 			}
-			if owns != 1 {
-				t.Errorf("%s hooks running cattery: got %d, want 1:\n%s", event, owns, merged)
-			}
-			if len(groups) != len(tc.wantMatchers) {
-				t.Fatalf("%s groups: got %d, want %d:\n%s", event, len(groups), len(tc.wantMatchers), merged)
-			}
-			for i, want := range tc.wantMatchers {
-				if got := matcherOf(t, groups[i]); got != want {
-					t.Errorf("%s group %d matcher: got %q, want %q:\n%s", event, i, got, want, merged)
+			if tc.wantGroupKeys != nil {
+				if got := hookGroup(t, groups[0]).keys; !equal(got, tc.wantGroupKeys) {
+					t.Errorf("%s group keys: got %v, want %v:\n%s", event, got, tc.wantGroupKeys, cleaned)
+				}
+				if got := matcherOf(t, groups[0]); got != tc.wantMatcher {
+					t.Errorf("%s matcher: got %q, want %q:\n%s", event, got, tc.wantMatcher, cleaned)
 				}
 			}
 		})
+	}
+}
+
+// The hooks stay when there is no plugin to replace them: a user who declines
+// keeps the only thing publishing their state.
+func TestClaudeDeclinedInstallKeepsTheHooks(t *testing.T) {
+	h := newHarness(t)
+	h.opts.Yes = false
+	h.opts.In = strings.NewReader("n\n\n\n\n")
+	path := h.claudePath("settings.json")
+	h.write(path, oldHookSettings)
+
+	out := h.run()
+
+	if got := h.read(path); got != oldHookSettings {
+		t.Errorf("settings.json was changed:\n%s", got)
+	}
+	if _, err := os.Stat(path + ".cattery-bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a backup was written on a declined install")
+	}
+	for _, args := range claudeArgs {
+		if !strings.Contains(out, claudeCommand(args)) {
+			t.Errorf("report missing the manual %q, got:\n%s", claudeCommand(args), out)
+		}
 	}
 }
 
@@ -769,14 +961,14 @@ func TestClaudeBackupIsWrittenOnce(t *testing.T) {
 	h := newHarness(t)
 	path := h.claudePath("settings.json")
 	backup := path + ".cattery-bak"
-	h.write(path, unrelatedSettings)
+	h.write(path, oldHookSettings)
 	// settings.json can hold an API key, so the copy must not widen its mode.
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 
 	h.run()
-	if got := h.read(backup); got != unrelatedSettings {
+	if got := h.read(backup); got != oldHookSettings {
 		t.Fatalf("first backup:\n%s", got)
 	}
 	if got := h.perm(backup); got != 0o600 {
@@ -784,52 +976,58 @@ func TestClaudeBackupIsWrittenOnce(t *testing.T) {
 	}
 
 	// A later run must not overwrite the only copy of the file from before
-	// cattery.
-	h.write(path, `{"model":"sonnet"}`)
+	// cattery. This one has a hook left to remove, or nothing would be written
+	// at all.
+	h.write(path, `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cattery-state idle"}]}]}}`)
 	h.run()
-	if got := h.read(backup); got != unrelatedSettings {
+	if got := h.read(backup); got != oldHookSettings {
 		t.Fatalf("the backup was overwritten:\n%s", got)
 	}
 }
 
-func TestClaudeSettingsCreatedWhenAbsent(t *testing.T) {
-	h := newHarness(t)
-	h.opts.ClaudeDir = filepath.Join(h.claudeDir, "nested")
-	h.claudeDir = h.opts.ClaudeDir
+// Nothing of cattery's to take out means nothing to write, whether the file is
+// missing, empty, or somebody else's entirely.
+func TestClaudeSettingsLeftAlone(t *testing.T) {
+	cases := []struct {
+		name     string
+		existing string
+		absent   bool // no settings.json at all
+	}{
+		{name: "no settings.json", absent: true},
+		{name: "an empty file", existing: ""},
+		{name: "no hooks key", existing: `{"model":"opus"}`},
+		{
+			name:     "somebody else's hooks",
+			existing: `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"notify-send done"}]}]}}`,
+		},
+		// A hooks key that is not an object is somebody's typo, not cattery's
+		// to repair. Reported and left alone.
+		{name: "a hooks key holding null", existing: `{"hooks":null}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			path := h.claudePath("settings.json")
+			if !tc.absent {
+				h.write(path, tc.existing)
+			}
 
-	h.run()
+			out := h.run()
 
-	merged := h.read(h.claudePath("settings.json"))
-	for _, hook := range claudeHooks {
-		if !strings.Contains(merged, testBinary+" state "+hook.State) {
-			t.Errorf("settings.json missing the %s hook:\n%s", hook.Event, merged)
-		}
-		groups := groupsFor(t, merged, hook.Event)
-		if len(groups) != 1 {
-			t.Fatalf("%s groups: got %d, want 1:\n%s", hook.Event, len(groups), merged)
-		}
-		// Claude writes "matcher" before "hooks", and only SessionStart gets one
-		// at all: the other four fire once per turn and need no filtering.
-		want := []string{"hooks"}
-		if hook.Matcher != "" {
-			want = []string{"matcher", "hooks"}
-		}
-		if got := hookGroup(t, groups[0]).keys; !equal(got, want) {
-			t.Errorf("%s group keys: got %v, want %v:\n%s", hook.Event, got, want, merged)
-		}
-	}
-	wantEvents := []string{"SessionStart", "Notification", "UserPromptSubmit", "Stop", "SessionEnd"}
-	if got := eventKeys(t, merged); !equal(got, wantEvents) {
-		t.Errorf("hook event order: got %v, want %v", got, wantEvents)
-	}
-	// The literal, because claudeHooks is what the loop above compares against.
-	// A matcher that missed a source would leave that source with no hook, and
-	// one that named compact would mark a running agent finished.
-	if !strings.Contains(merged, `"matcher": "startup|resume|clear"`) {
-		t.Errorf("SessionStart carries no matcher:\n%s", merged)
-	}
-	if _, err := os.Stat(h.claudePath("settings.json.cattery-bak")); !errors.Is(err, os.ErrNotExist) {
-		t.Error("a backup was written for a file that did not exist")
+			if tc.absent {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Error("settings.json was created")
+				}
+			} else if got := h.read(path); got != tc.existing {
+				t.Errorf("settings.json was changed:\n%s", got)
+			}
+			if _, err := os.Stat(path + ".cattery-bak"); !errors.Is(err, os.ErrNotExist) {
+				t.Error("a backup was written")
+			}
+			if strings.Contains(out, "removed") {
+				t.Errorf("report claims a removal, got:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -844,8 +1042,8 @@ func TestClaudeInvalidJSONIsLeftAlone(t *testing.T) {
 	if got := h.read(path); got != broken {
 		t.Errorf("settings.json was changed:\n%s", got)
 	}
-	if !strings.Contains(out, "skipped") || !strings.Contains(out, "UserPromptSubmit") {
-		t.Errorf("report does not skip and explain, got:\n%s", out)
+	if !strings.Contains(out, "kept") || !strings.Contains(out, "settings.json") {
+		t.Errorf("report does not keep and explain, got:\n%s", out)
 	}
 }
 
@@ -885,9 +1083,8 @@ func TestConsent(t *testing.T) {
 
 			out := h.run()
 
-			_, err := os.Stat(h.claudePath("settings.json"))
-			if merged := err == nil; merged != tc.want.claude {
-				t.Errorf("settings.json written=%v, want %v; output:\n%s", merged, tc.want.claude, out)
+			if ran := len(h.ran("claude")) > 0; ran != tc.want.claude {
+				t.Errorf("claude plugin install ran=%v, want %v; output:\n%s", ran, tc.want.claude, out)
 			}
 			if ran := len(h.ran("pi")) > 0; ran != tc.want.pi {
 				t.Errorf("pi install ran=%v, want %v; output:\n%s", ran, tc.want.pi, out)
@@ -895,20 +1092,15 @@ func TestConsent(t *testing.T) {
 			if ran := len(h.ran("codex")) > 0; ran != tc.want.codex {
 				t.Errorf("codex plugin install ran=%v, want %v; output:\n%s", ran, tc.want.codex, out)
 			}
-			_, err = os.Stat(h.opencodePluginPath())
+			_, err := os.Stat(h.opencodePluginPath())
 			if written := err == nil; written != tc.want.opencode {
 				t.Errorf("opencode plugin written=%v, want %v; output:\n%s", written, tc.want.opencode, out)
 			}
 			// A skipped step says what to run by hand.
 			if !tc.want.claude {
-				for _, hook := range claudeHooks {
-					if !strings.Contains(out, hook.Event) || !strings.Contains(out, testBinary+" state "+hook.State) {
-						t.Errorf("report missing the manual %s command, got:\n%s", hook.Event, out)
-					}
-					// A hand-installed SessionStart without its matcher fires
-					// on a compaction, so the instructions have to name it.
-					if hook.Matcher != "" && !strings.Contains(out, `"matcher": "`+hook.Matcher+`"`) {
-						t.Errorf("report missing the %s matcher, got:\n%s", hook.Event, out)
+				for _, args := range claudeArgs {
+					if !strings.Contains(out, claudeCommand(args)) {
+						t.Errorf("report missing the manual %q, got:\n%s", claudeCommand(args), out)
 					}
 				}
 			}
@@ -1127,93 +1319,145 @@ func TestCodexHandWrittenHooksAreReported(t *testing.T) {
 	}
 }
 
-// The plugin is fetched from the published repository, so the manifests in
+// Both plugins are fetched from the published repository, so the manifests in
 // this checkout are the release. A drift between them and what the writer
-// accepts is silent: Codex would run a command that publishes nothing.
-func TestCodexPluginManifests(t *testing.T) {
-	var manifest struct {
-		Hooks map[string][]struct {
-			Matcher string `json:"matcher"`
-			Hooks   []struct {
-				Type    string `json:"type"`
-				Command string `json:"command"`
-				Timeout int    `json:"timeout"`
-			} `json:"hooks"`
-		} `json:"hooks"`
+// accepts is silent: the host would run a command that publishes nothing.
+func TestPluginManifests(t *testing.T) {
+	root := filepath.Join("..", "..")
+	cases := []struct {
+		name string
+		// dir is the plugin's directory under the repository root, and
+		// manifestDir the directory inside it that holds plugin.json.
+		dir, manifestDir string
+		marketplace      []string // the marketplace file, as path elements
+		selector         string   // the plugin@marketplace the CLI takes
+		market           string   // the marketplace name that selector's half names
+		kind             string   // the --kind word the hooks publish
+		// wantSource is the marketplace entry's source. Codex writes an object,
+		// Claude a plain string.
+		wantSource string
+		// wantHooksField is plugin.json's "hooks". Codex needs the path;
+		// Claude loads hooks/hooks.json by itself and refuses to load a plugin
+		// that names it a second time, so there it has to be absent.
+		wantHooksField string
+		events         []struct{ Event, State, Matcher string }
+	}{
+		{
+			name:        "claude",
+			dir:         "claude",
+			manifestDir: ".claude-plugin",
+			marketplace: []string{".claude-plugin", "marketplace.json"},
+			selector:    claudePlugin,
+			market:      claudeMarketplace,
+			kind:        "claude",
+			wantSource:  `"./claude"`,
+			events:      claudeHooks,
+		},
+		{
+			name:           "codex",
+			dir:            "codex",
+			manifestDir:    ".codex-plugin",
+			marketplace:    []string{".agents", "plugins", "marketplace.json"},
+			selector:       codexPlugin,
+			market:         codexMarketplace,
+			kind:           "codex",
+			wantSource:     `{"source":"local","path":"./codex"}`,
+			wantHooksField: "./hooks/hooks.json",
+			// The same five states Claude's hooks publish, on Codex's own
+			// events. SessionStart takes a matcher for the same reason Claude's
+			// does: an idle published for a compaction marks a running agent
+			// finished.
+			events: []struct{ Event, State, Matcher string }{
+				{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
+				{Event: "UserPromptSubmit", State: "working"},
+				{Event: "PermissionRequest", State: "blocked", Matcher: "*"},
+				{Event: "Stop", State: "idle"},
+				{Event: "SessionEnd", State: "clear"},
+			},
+		},
 	}
-	read(t, filepath.Join("..", "..", "codex", "hooks", "hooks.json"), &manifest)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var manifest struct {
+				Hooks map[string][]struct {
+					Matcher string `json:"matcher"`
+					Hooks   []struct {
+						Type    string `json:"type"`
+						Command string `json:"command"`
+						Timeout int    `json:"timeout"`
+					} `json:"hooks"`
+				} `json:"hooks"`
+			}
+			read(t, filepath.Join(root, tc.dir, "hooks", "hooks.json"), &manifest)
 
-	// The same five states the Claude hooks publish, on Codex's own events.
-	// SessionStart takes a matcher for the same reason Claude's does: an idle
-	// published for a compaction marks a running agent finished.
-	want := []struct{ Event, State, Matcher string }{
-		{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
-		{Event: "UserPromptSubmit", State: "working"},
-		{Event: "PermissionRequest", State: "blocked", Matcher: "*"},
-		{Event: "Stop", State: "idle"},
-		{Event: "SessionEnd", State: "clear"},
-	}
-	if len(manifest.Hooks) != len(want) {
-		t.Fatalf("events: got %v, want %d", slices.Sorted(maps.Keys(manifest.Hooks)), len(want))
-	}
-	for _, w := range want {
-		groups, ok := manifest.Hooks[w.Event]
-		if !ok || len(groups) != 1 || len(groups[0].Hooks) != 1 {
-			t.Fatalf("hooks.%s: got %v, want one command", w.Event, groups)
-		}
-		entry := groups[0].Hooks[0]
-		// The bare name off PATH: a static manifest cannot know where the
-		// binary is, and a Codex hook is a child of a process a shell started.
-		if command := "cattery state " + w.State + " --kind codex"; entry.Command != command {
-			t.Errorf("hooks.%s command: got %q, want %q", w.Event, entry.Command, command)
-		}
-		if groups[0].Matcher != w.Matcher {
-			t.Errorf("hooks.%s matcher: got %q, want %q", w.Event, groups[0].Matcher, w.Matcher)
-		}
-		// A hook that hangs holds up the turn, and the writer's own publish
-		// gives up after two seconds.
-		if entry.Timeout != 5 {
-			t.Errorf("hooks.%s timeout: got %d, want 5", w.Event, entry.Timeout)
-		}
-		if entry.Type != "command" {
-			t.Errorf("hooks.%s type: got %q, want %q", w.Event, entry.Type, "command")
-		}
-	}
+			if len(manifest.Hooks) != len(tc.events) {
+				t.Fatalf("events: got %v, want %d", slices.Sorted(maps.Keys(manifest.Hooks)), len(tc.events))
+			}
+			for _, w := range tc.events {
+				groups, ok := manifest.Hooks[w.Event]
+				if !ok || len(groups) != 1 || len(groups[0].Hooks) != 1 {
+					t.Fatalf("hooks.%s: got %v, want one command", w.Event, groups)
+				}
+				entry := groups[0].Hooks[0]
+				// The bare name off PATH: a static manifest cannot know where
+				// the binary is, and both hosts run a hook as a child of a
+				// process a shell started.
+				if command := "cattery state " + w.State + " --kind " + tc.kind; entry.Command != command {
+					t.Errorf("hooks.%s command: got %q, want %q", w.Event, entry.Command, command)
+				}
+				if groups[0].Matcher != w.Matcher {
+					t.Errorf("hooks.%s matcher: got %q, want %q", w.Event, groups[0].Matcher, w.Matcher)
+				}
+				// A hook that hangs holds up the turn, and the writer's own
+				// publish gives up after two seconds.
+				if entry.Timeout != 5 {
+					t.Errorf("hooks.%s timeout: got %d, want 5", w.Event, entry.Timeout)
+				}
+				if entry.Type != "command" {
+					t.Errorf("hooks.%s type: got %q, want %q", w.Event, entry.Type, "command")
+				}
+			}
 
-	// The two manifests name the plugin and reach the hooks file. A rename
-	// leaves `codex plugin add` naming something the marketplace does not hold.
-	var plugin struct {
-		Name  string `json:"name"`
-		Hooks string `json:"hooks"`
-	}
-	read(t, filepath.Join("..", "..", "codex", ".codex-plugin", "plugin.json"), &plugin)
-	wantName, _, _ := strings.Cut(codexPlugin, "@")
-	if plugin.Name != wantName {
-		t.Errorf("plugin name: got %q, want %q", plugin.Name, wantName)
-	}
-	if plugin.Hooks != "./hooks/hooks.json" {
-		t.Errorf("plugin hooks path: got %q", plugin.Hooks)
-	}
+			// The two manifests name the plugin and reach the hooks file. A
+			// rename leaves the install command naming something the
+			// marketplace does not hold.
+			var plugin struct {
+				Name  string `json:"name"`
+				Hooks string `json:"hooks"`
+			}
+			read(t, filepath.Join(root, tc.dir, tc.manifestDir, "plugin.json"), &plugin)
+			wantName, _, _ := strings.Cut(tc.selector, "@")
+			if plugin.Name != wantName {
+				t.Errorf("plugin name: got %q, want %q", plugin.Name, wantName)
+			}
+			if plugin.Hooks != tc.wantHooksField {
+				t.Errorf("plugin hooks field: got %q, want %q", plugin.Hooks, tc.wantHooksField)
+			}
 
-	var market struct {
-		Name    string `json:"name"`
-		Plugins []struct {
-			Name   string `json:"name"`
-			Source struct {
-				Source string `json:"source"`
-				Path   string `json:"path"`
-			} `json:"source"`
-		} `json:"plugins"`
-	}
-	read(t, filepath.Join("..", "..", ".agents", "plugins", "marketplace.json"), &market)
-	if market.Name != codexMarketplace {
-		t.Errorf("marketplace name: got %q, want %q", market.Name, codexMarketplace)
-	}
-	if len(market.Plugins) != 1 || market.Plugins[0].Name != plugin.Name {
-		t.Fatalf("marketplace plugins: got %+v, want one named %q", market.Plugins, plugin.Name)
-	}
-	if got := market.Plugins[0].Source; got.Source != "local" || got.Path != "./codex" {
-		t.Errorf("marketplace source: got %+v", got)
+			var market struct {
+				Name    string `json:"name"`
+				Plugins []struct {
+					Name string `json:"name"`
+					// Raw, because Codex names a source with an object and
+					// Claude with a path.
+					Source json.RawMessage `json:"source"`
+				} `json:"plugins"`
+			}
+			read(t, filepath.Join(append([]string{root}, tc.marketplace...)...), &market)
+			if market.Name != tc.market {
+				t.Errorf("marketplace name: got %q, want %q", market.Name, tc.market)
+			}
+			if len(market.Plugins) != 1 || market.Plugins[0].Name != plugin.Name {
+				t.Fatalf("marketplace plugins: got %+v, want one named %q", market.Plugins, plugin.Name)
+			}
+			var source bytes.Buffer
+			if err := json.Compact(&source, market.Plugins[0].Source); err != nil {
+				t.Fatalf("marketplace source: %v", err)
+			}
+			if got := source.String(); got != tc.wantSource {
+				t.Errorf("marketplace source: got %s, want %s", got, tc.wantSource)
+			}
+		})
 	}
 }
 
