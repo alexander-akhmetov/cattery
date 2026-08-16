@@ -319,10 +319,10 @@ func parseAgents(data []byte) ([]agent.Agent, error) {
 			Msg:       w.UserVars["AGENT_MSG"],
 			CreatedAt: w.CreatedAt,
 		}
-		if raw := w.UserVars["AGENT_SINCE"]; raw != "" {
-			if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
-				a.Since = time.Unix(secs, 0)
-			}
+		a.Since = agent.UnixSeconds(w.UserVars["AGENT_SINCE"])
+		if agent.PublishesTool(a.Kind, display) {
+			a.Tool = w.UserVars["AGENT_TOOL"]
+			a.ToolSince = agent.UnixSeconds(w.UserVars["AGENT_TOOL_SINCE"])
 		}
 		agents = append(agents, a)
 	}

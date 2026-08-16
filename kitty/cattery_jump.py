@@ -2,8 +2,8 @@
 cattery_jump: focus the next attention-worthy agent window.
 
 Walks every kitty window in every OS window, picks the most urgent one by
-AGENT_DISPLAY (blocked before done), and focuses it, switching OS window if
-needed. It does nothing when no agent window needs attention.
+AGENT_DISPLAY (blocked, then stalled, then done), and focuses it, switching OS
+window if needed. It does nothing when no agent window needs attention.
 
 Unbound by default. Bind with `map kitty_mod+a>j kitten cattery_jump.py`.
 """
@@ -15,7 +15,9 @@ from kittens.tui.handler import result_handler
 
 # The lower rank wins. "working" and "idle" are missing, because jumping to a
 # working agent is rarely useful and the user already dismissed the idle ones.
-_URGENCY = {"blocked": 0, "done": 1}
+# "stalled" ranks under blocked: a hung tool is worth a look, an unanswered
+# question more so.
+_URGENCY = {"blocked": 0, "stalled": 1, "done": 2}
 
 
 def main(args: list[str]) -> str:

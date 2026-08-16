@@ -73,6 +73,12 @@ NOTIFICATION_FIELDS = (
     "activation_token",
 )
 
+# Timers armed through the stubbed add_timer, as (callback, interval, repeats).
+# The watcher imports add_timer inside a try, so without this stub the sweep
+# would be silently disabled and every test about it would pass by doing
+# nothing.
+TIMERS: list[tuple] = []
+
 
 class _FailTitleWrites:
     """Context manager making the stubbed set_os_window_title raise."""
@@ -105,8 +111,13 @@ def _load_watcher():
             raise OSError("title write refused")
         TITLE_CALLS.append((os_window_id, title))
 
+    def add_timer(callback, interval, repeats):
+        TIMERS.append((callback, interval, repeats))
+        return len(TIMERS)
+
     fast_mod.set_os_window_title = set_os_window_title
     fast_mod.get_options = lambda: types.SimpleNamespace(env=KITTY_ENV)
+    fast_mod.add_timer = add_timer
 
     utils_mod = types.ModuleType("kitty.utils")
     utils_mod.log_error = LOG_CALLS.append
@@ -155,6 +166,8 @@ class FakeWindow:
         os_window_id=1,
         cwd="",
         msg=None,
+        tool=None,
+        tool_since=None,
     ):
         self.id = window_id
         self.os_window_id = os_window_id
@@ -173,6 +186,10 @@ class FakeWindow:
             self.user_vars["AGENT_STATE"] = state
         if kind is not None:
             self.user_vars["AGENT_KIND"] = kind
+        if tool is not None:
+            self.user_vars["AGENT_TOOL"] = tool
+        if tool_since is not None:
+            self.user_vars["AGENT_TOOL_SINCE"] = tool_since
 
     def set_user_var(self, key, val=None):
         # kitty drops the key first and stores a value only when there is one,
@@ -244,6 +261,7 @@ class FakeBoss:
     def __init__(self, tab_manager=None, os_window_id=1, windows=()):
         self.os_window_map = {os_window_id: tab_manager} if tab_manager else {}
         self.notification_manager = RecordingNotifications()
+        # The flat map the sweep and cattery_jump.py both walk.
         self.window_id_map = {w.id: w for w in windows}
         # Every focus, as (window, switch, token), and every launch, as its argv.
         self.focused = []
@@ -318,28 +336,43 @@ class WatcherTestCase(unittest.TestCase):
 
 class DeriveDisplayTest(unittest.TestCase):
     def test_display_for_state(self):
+        old = time.time() - watcher._STALL_THRESHOLD - 60
+        fresh = time.time() - 5
         cases = [
-            # name, state, prev, focused, seen_before, want_display, want_seen_after
-            ("working", "working", None, False, False, "working", False),
-            ("working clears seen", "working", "done", False, True, "working", False),
-            ("blocked", "blocked", "working", False, False, "blocked", False),
-            ("blocked clears seen", "blocked", "idle", False, True, "blocked", False),
-            ("finished unseen", "idle", "working", False, False, "done", False),
-            ("finished after blocked", "idle", "blocked", False, False, "done", False),
-            ("stays done until seen", "idle", "done", False, False, "done", False),
-            ("finished while watched", "idle", "working", True, False, "idle", True),
-            ("already acknowledged", "idle", "working", False, True, "idle", True),
+            # name, state, prev, focused, seen_before, tool_since, want_display, want_seen_after
+            ("working", "working", None, False, False, None, "working", False),
+            ("working clears seen", "working", "done", False, True, None, "working", False),
+            ("blocked", "blocked", "working", False, False, None, "blocked", False),
+            ("blocked clears seen", "blocked", "idle", False, True, None, "blocked", False),
+            ("finished unseen", "idle", "working", False, False, None, "done", False),
+            ("finished after blocked", "idle", "blocked", False, False, None, "done", False),
+            ("stays done until seen", "idle", "done", False, False, None, "done", False),
+            ("finished while watched", "idle", "working", True, False, None, "idle", True),
+            ("already acknowledged", "idle", "working", False, True, None, "idle", True),
             # An agent that announces idle at startup has finished nothing, so
             # it must not become "done".
-            ("idle before any work", "idle", None, False, False, "idle", False),
-            ("idle stays idle", "idle", "idle", False, False, "idle", False),
-            ("no state", None, "working", False, False, None, False),
-            ("unknown state", "thinking", "working", False, False, None, False),
+            ("idle before any work", "idle", None, False, False, None, "idle", False),
+            ("idle stays idle", "idle", "idle", False, False, None, "idle", False),
+            ("no state", None, "working", False, False, None, None, False),
+            ("unknown state", "thinking", "working", False, False, None, None, False),
+            # A tool that has run past the threshold, and one that has not.
+            ("a hung tool", "working", "working", False, False, old, "stalled", False),
+            ("a tool inside the threshold", "working", "working", False, False, fresh, "working", False),
+            ("stalled stays stalled", "working", "stalled", False, False, old, "stalled", False),
+            # The tool ended, so the label goes and the agent is working again.
+            ("a stalled tool that ended", "working", "stalled", False, False, None, "working", False),
+            # An agent waiting on a question is not stuck, whatever the tool it
+            # left open says.
+            ("blocked ignores the tool", "blocked", "working", False, False, old, "blocked", False),
+            # _WORKED has to carry "stalled", or the run finishes with no marker
+            # and no notification. Silently: that is the agent you most wanted
+            # to hear about.
+            ("a stalled agent finishes", "idle", "stalled", False, False, None, "done", False),
         ]
-        for name, state, prev, focused, seen_before, want, want_seen in cases:
+        for name, state, prev, focused, seen_before, tool_since, want, want_seen in cases:
             with self.subTest(name):
                 seen = {7} if seen_before else set()
-                got = watcher._derive_display(state, 7, seen, focused, prev)
+                got = watcher._derive_display(state, 7, seen, focused, prev, tool_since)
                 self.assertEqual(got, want)
                 self.assertEqual(7 in seen, want_seen, "seen bookkeeping")
 
@@ -833,6 +866,145 @@ class PublishTest(WatcherTestCase):
         self.assertEqual(len(self.sock.sent), 2)
 
 
+class SweepTest(WatcherTestCase):
+    """The timer behind "stalled", which no event can reach."""
+
+    def setUp(self):
+        super().setUp()
+        TIMERS.clear()
+
+    def hung(self, **kwargs):
+        """A working window whose one tool call has outlived the threshold."""
+        since = str(int(time.time() - watcher._STALL_THRESHOLD - 60))
+        return FakeWindow(state="working", kind="pi", tool="bash: sleep 900", tool_since=since, **kwargs)
+
+    def test_a_hung_tool_reaches_stalled_with_no_event(self):
+        window = self.hung(display="working")
+        window.user_vars["AGENT_SINCE"] = "1700000000"
+        boss = boss_for([window])
+
+        watcher._sweep(boss)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "stalled")
+        # working and stalled are one turn seen twice. Restamping would zero the
+        # tab's elapsed minutes exactly when the number starts mattering.
+        self.assertEqual(window.user_vars["AGENT_SINCE"], "1700000000")
+        self.assertEqual(len(boss.notification_manager.calls), 1, "an unfocused stall is worth a notification")
+
+    def test_a_dead_pis_tool_does_not_stall_the_next_agent(self):
+        # `cattery state clear` drops AGENT_STATE, AGENT_KIND and AGENT_MSG and
+        # nothing else, so a pi killed mid-call leaves its label on the window.
+        # Without the kind test the Claude started there would go stalled, and
+        # notify, inside its first second.
+        window = self.hung(display="working")
+        window.user_vars["AGENT_KIND"] = "claude"
+        boss = boss_for([window])
+
+        watcher._sweep(boss)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "working")
+        self.assertEqual(boss.notification_manager.calls, [], "and no notification either")
+
+    def test_the_sweep_leaves_other_windows_alone(self):
+        # _apply's "no display" branch marks the tab bar dirty and rewrites the
+        # OS-window title whatever it finds, so an unfiltered sweep would do
+        # both for every window in the process once a minute, forever.
+        shell = FakeWindow(1, title="fish")
+        idle = FakeWindow(2, display="idle", state="idle", kind="pi")
+        boss = boss_for([shell, idle])
+
+        watcher._sweep(boss)
+
+        self.assertEqual(shell.var_calls, [])
+        self.assertEqual(idle.var_calls, [])
+        self.assertEqual(boss.os_window_map[1].dirty, 0)
+        self.assertEqual(TITLE_CALLS, [])
+
+    def test_a_fresh_tool_is_left_working(self):
+        window = FakeWindow(
+            display="working", state="working", kind="pi", tool="bash: go test", tool_since=str(int(time.time()))
+        )
+        boss = boss_for([window])
+
+        watcher._sweep(boss)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "working")
+        self.assertEqual(window.var_calls, [])
+
+    def test_the_threshold_is_ten_minutes(self):
+        # The same ages as TestStalled in internal/agent/agent_test.go, written
+        # out rather than derived from _STALL_THRESHOLD: the picker and the tab
+        # bar hold one rule in two languages, and only these two tables stop the
+        # numbers drifting apart.
+        for age, want in ((9 * 60, "working"), (11 * 60, "stalled")):
+            with self.subTest(age=age):
+                window = FakeWindow(
+                    display="working",
+                    state="working",
+                    kind="pi",
+                    tool="bash: sleep 900",
+                    tool_since=str(int(time.time() - age)),
+                )
+
+                watcher._sweep(boss_for([window]))
+
+                self.assertEqual(window.user_vars["AGENT_DISPLAY"], want)
+
+    def test_on_load_arms_one_repeating_timer(self):
+        boss = boss_for([])
+
+        watcher.on_load(boss, {})
+        # A config reload re-executes the module against the same boss, and a
+        # second timer would sweep twice a minute forever.
+        watcher.on_load(boss, {})
+
+        self.assertEqual(len(TIMERS), 1)
+        _callback, interval, repeats = TIMERS[0]
+        self.assertEqual(interval, watcher._SWEEP_INTERVAL)
+        self.assertTrue(repeats)
+
+    def test_the_timer_sweeps(self):
+        window = self.hung(display="working")
+        boss = boss_for([window])
+        watcher.on_load(boss, {})
+
+        # kitty passes the timer id; the callback takes whatever it is given.
+        TIMERS[0][0](7)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "stalled")
+
+    def test_a_raising_window_does_not_take_the_timer_with_it(self):
+        class Exploding:
+            id = 1
+            user_vars = property(lambda self: (_ for _ in ()).throw(RuntimeError("gone")))
+
+        watcher._sweep(FakeBoss(windows=[Exploding()]))
+
+    def test_a_kitty_without_add_timer_still_loads(self):
+        # add_timer is exported by kitty 0.48.1 but documented nowhere, so an
+        # older or a future kitty may not carry it. The picker derives stalled
+        # for itself either way; only the tab marker is lost.
+        fast = sys.modules["kitty.fast_data_types"]
+        self.addCleanup(setattr, fast, "add_timer", fast.add_timer)
+        del fast.add_timer
+        boss = boss_for([])
+
+        watcher.on_load(boss, {})
+
+        self.assertIsNone(boss._agent_timer)
+        self.assertEqual(TIMERS, [])
+
+    def test_a_stalled_agent_that_finishes_still_reports_done(self):
+        window = self.hung(display="stalled")
+        boss = boss_for([window])
+        window.user_vars["AGENT_STATE"] = "idle"
+
+        watcher._apply(boss, window)
+
+        self.assertEqual(window.user_vars["AGENT_DISPLAY"], "done")
+        self.assertEqual(len(boss.notification_manager.calls), 1, "the marker and the notification are the point")
+
+
 class EntryPointTest(WatcherTestCase):
     """The callbacks kitty invokes."""
 
@@ -840,6 +1012,12 @@ class EntryPointTest(WatcherTestCase):
         cases = [
             ("AGENT_STATE", True),
             ("AGENT_KIND", True),
+            # A tool boundary can move the agent in and out of "stalled", so it
+            # has to be recomputed rather than left to the next sweep.
+            ("AGENT_TOOL", True),
+            # Its timestamp is written first, so reacting to it would apply the
+            # new stamp against the previous label.
+            ("AGENT_TOOL_SINCE", False),
             # The watcher's own writes come back through this callback, and
             # applying them would recurse.
             ("AGENT_DISPLAY", False),

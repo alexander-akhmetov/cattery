@@ -7,11 +7,14 @@
  * demand. `fire` swaps `process.stdout.write` for one event, so the escapes are
  * decoded instead of printed.
  *
+ * The tool label is published behind a debounce, so the tests that want one run
+ * under node:test's mocked timers and move the clock rather than wait.
+ *
  * Run with `make test-ts`, or `npm test`.
  */
 
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -20,16 +23,24 @@ import register, { setRunner } from "../extensions/cattery.ts";
 /** One user variable write. A null value means the variable was deleted. */
 type VarWrite = [key: string, value: string | null];
 
-const SET_USER_VAR = /^\x1b\]1337;SetUserVar=([A-Z_]+)(?:=([A-Za-z0-9+/=]*))?\x07$/;
+// One chunk can carry several escapes: the extension batches a publish into one
+// write, so a tool boundary is one OSC run rather than two.
+const SET_USER_VAR = /\x1b\]1337;SetUserVar=([A-Z_]+)(?:=([A-Za-z0-9+/=]*))?\x07/g;
 
-function parseSetUserVar(chunk: string): VarWrite {
-  const match = SET_USER_VAR.exec(chunk);
-  if (match === null) {
-    // Anything else on stdout would appear in the middle of pi's TUI.
-    throw new Error(`not a SetUserVar escape: ${JSON.stringify(chunk)}`);
+function parseSetUserVars(chunk: string): VarWrite[] {
+  const out: VarWrite[] = [];
+  let consumed = 0;
+  for (const match of chunk.matchAll(SET_USER_VAR)) {
+    if (match.index !== consumed) break;
+    consumed += match[0].length;
+    const [, key, encoded] = match;
+    out.push([key!, encoded === undefined ? null : Buffer.from(encoded, "base64").toString("utf-8")]);
   }
-  const [, key, encoded] = match;
-  return [key!, encoded === undefined ? null : Buffer.from(encoded, "base64").toString("utf-8")];
+  if (consumed !== chunk.length) {
+    // Anything else on stdout would appear in the middle of pi's TUI.
+    throw new Error(`not a SetUserVar escape run: ${JSON.stringify(chunk)}`);
+  }
+  return out;
 }
 
 type Handler = (event: Record<string, unknown>, ctx: FakeContext) => Promise<unknown>;
@@ -77,21 +88,30 @@ function inKittyOnly(): void {
   delete process.env.TMUX_PANE;
 }
 
-/** Fire one pi event and return the user variables the extension wrote. */
-async function fire(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<VarWrite[]> {
+/** Run `fn` with stdout captured, and return the user variables it wrote. */
+async function captured(fn: () => Promise<void> | void): Promise<VarWrite[]> {
   const written: VarWrite[] = [];
   const original = process.stdout.write;
   process.stdout.write = ((chunk: string | Uint8Array): boolean => {
-    written.push(parseSetUserVar(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8")));
+    written.push(...parseSetUserVars(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8")));
     return true;
   }) as typeof process.stdout.write;
   try {
-    await pi.emit(event, payload);
+    await fn();
   } finally {
     process.stdout.write = original;
   }
   return written;
 }
+
+/** Fire one pi event and return the user variables the extension wrote. */
+async function fire(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<VarWrite[]> {
+  return captured(() => pi.emit(event, payload));
+}
+
+// Long enough to pass the extension's tool debounce. The tests move a mocked
+// clock rather than wait, so this only has to be past it, not equal to it.
+const PAST_DEBOUNCE_MS = 5_000;
 
 /**
  * A registered extension in a window that has already started its session.
@@ -133,8 +153,10 @@ test("a session opens as an idle pi agent with no stale message", async () => {
   assert.deepEqual(written, [
     ["AGENT_KIND", "pi"],
     ["AGENT_RESUME", `pi --session ${SESSION_FILE}`],
-    // A previous agent in this window may have left one behind.
+    // A previous agent in this window may have left these behind.
     ["AGENT_MSG", null],
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
     ["AGENT_STATE", "idle"],
   ]);
 });
@@ -224,6 +246,8 @@ test("the extension survives a pi with no session manager", async () => {
     ["AGENT_KIND", "pi"],
     ["AGENT_RESUME", null],
     ["AGENT_MSG", null],
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
     ["AGENT_STATE", "idle"],
   ]);
 });
@@ -311,8 +335,168 @@ test("an ordinary tool does not touch the state", async () => {
   const pi = await startedSession();
   await fire(pi, "agent_start");
 
-  assert.deepEqual(await fire(pi, "tool_execution_start", { toolName: "bash" }), []);
-  assert.deepEqual(await fire(pi, "tool_execution_end", { toolName: "bash" }), []);
+  assert.deepEqual(await fire(pi, "tool_execution_start", { toolCallId: "c1", toolName: "bash" }), []);
+  assert.deepEqual(await fire(pi, "tool_execution_end", { toolCallId: "c1", toolName: "bash" }), []);
+});
+
+// --- the running tool ---------------------------------------------------------
+
+type Timers = TestContext["mock"]["timers"];
+
+/**
+ * Start a session with the tool debounce under the test's own clock.
+ *
+ * node:test restores the clock at the end of each test, and enable() refuses a
+ * second call, so a test that starts several sessions calls this once and
+ * startedSession after it.
+ */
+async function toolSession(timers: Timers): Promise<FakePi> {
+  timers.enable({ apis: ["setTimeout"] });
+  return startedSession();
+}
+
+/** Fire pi events, then let the debounce elapse, and return what was written. */
+async function fireTools(
+  timers: Timers,
+  pi: FakePi,
+  events: Array<[event: string, payload: Record<string, unknown>]>,
+): Promise<VarWrite[]> {
+  return captured(async () => {
+    for (const [event, payload] of events) await pi.emit(event, payload);
+    timers.tick(PAST_DEBOUNCE_MS);
+  });
+}
+
+function start(id: string, toolName: string, args?: Record<string, unknown>): [string, Record<string, unknown>] {
+  return ["tool_execution_start", { toolCallId: id, toolName, args }];
+}
+
+function end(id: string, toolName: string): [string, Record<string, unknown>] {
+  return ["tool_execution_end", { toolCallId: id, toolName }];
+}
+
+test("a running tool is published with the second it started", async (t) => {
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+  const before = Math.floor(Date.now() / 1000);
+
+  const written = await fireTools(t.mock.timers, pi, [start("c1", "bash", { command: "go test ./..." })]);
+
+  // The timestamp goes first: AGENT_TOOL is the key that wakes the kitty
+  // watcher, and the other order would have it read the previous tool's stamp.
+  assert.equal(written.length, 2);
+  const [sinceKey, since] = written[0]!;
+  assert.equal(sinceKey, "AGENT_TOOL_SINCE");
+  assert.ok(Number(since) >= before && Number(since) <= Math.floor(Date.now() / 1000), `stamp ${since}`);
+  assert.deepEqual(written[1], ["AGENT_TOOL", "bash: go test ./..."]);
+});
+
+test("the label names the argument that says what the tool is doing", async (t) => {
+  const cases: Array<[name: string, args: Record<string, unknown> | undefined, want: string]> = [
+    ["a path", { path: "/tmp/x.go" }, "read: /tmp/x.go"],
+    ["no known argument", { offset: 3 }, "read"],
+    ["no arguments at all", undefined, "read"],
+    // An extension can register a tool taking anything, and a number is not a
+    // label.
+    ["a non-string argument", { path: 7 }, "read"],
+    ["whitespace collapses", { path: "a\n  b" }, "read: a b"],
+    ["a long argument is capped", { path: "x".repeat(300) }, `read: ${"x".repeat(113)}…`],
+  ];
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const [name, args, want] of cases) {
+    const pi = await startedSession();
+    await fire(pi, "agent_start");
+
+    const written = await fireTools(t.mock.timers, pi, [start("c1", "read", args)]);
+
+    assert.deepEqual(written[1], ["AGENT_TOOL", want], name);
+  }
+});
+
+test("two calls in flight report the earliest, and promote the next one", async (t) => {
+  // pi runs siblings concurrently, and an immediate failure can end before a
+  // sibling starts. Publishing the newest would let a fast read restamp the
+  // timestamp of a bash that has hung for 19 minutes.
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+
+  const both = await fireTools(t.mock.timers, pi, [
+    start("c1", "read", { path: "/tmp/x.go" }),
+    start("c2", "bash", { command: "go test ./..." }),
+  ]);
+  const promoted = await fireTools(t.mock.timers, pi, [end("c1", "read")]);
+  const cleared = await fireTools(t.mock.timers, pi, [end("c2", "bash")]);
+
+  assert.deepEqual(both[1], ["AGENT_TOOL", "read: /tmp/x.go"]);
+  assert.deepEqual(promoted[1], ["AGENT_TOOL", "bash: go test ./..."]);
+  assert.deepEqual(cleared, [
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
+  ]);
+});
+
+test("a tool shorter than the debounce is never published", async (t) => {
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+
+  const written = await fireTools(t.mock.timers, pi, [start("c1", "read", { path: "/tmp/x.go" }), end("c1", "read")]);
+
+  assert.deepEqual(written, []);
+});
+
+test("an interactive tool publishes no label", async (t) => {
+  // ask_user_question sets "blocked", which already carries its own elapsed
+  // time through AGENT_SINCE. A question is not a stall.
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+
+  const written = await fireTools(t.mock.timers, pi, [start("c1", "ask_user_question", { question: "which?" })]);
+
+  assert.deepEqual(written, [["AGENT_STATE", "blocked"]]);
+});
+
+test("a new run clears a tool left open by an interrupt", async (t) => {
+  // An interrupt tears the process down with no tool_execution_end. Left
+  // standing, the label would keep an hours-old timestamp and the next run
+  // would read as stalled from its first second.
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+  await fireTools(t.mock.timers, pi, [start("c1", "bash", { command: "sleep 900" })]);
+
+  const restarted = await fireTools(t.mock.timers, pi, [["agent_start", {}]]);
+
+  // AGENT_STATE is missing because the agent never left "working": pi
+  // auto-retries, and a run can start again without settling the last one.
+  assert.deepEqual(restarted, [
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
+  ]);
+});
+
+test("settling clears the tool before it publishes idle", async (t) => {
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+  await fireTools(t.mock.timers, pi, [start("c1", "bash", { command: "sleep 900" })]);
+
+  const settled = await fireTools(t.mock.timers, pi, [["agent_settled", {}]]);
+
+  assert.deepEqual(settled, [
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
+    ["AGENT_STATE", "idle"],
+  ]);
+});
+
+test("a value carrying a control character publishes without it", async (t) => {
+  // \x1f separates the fields of a tmux list-panes row, and the picker drops a
+  // row whose field count is wrong: the agent would leave the picker rather
+  // than show bad text.
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+
+  const written = await fireTools(t.mock.timers, pi, [start("c1", "bash", { command: "printf 'a\x1fb'" })]);
+
+  assert.deepEqual(written[1], ["AGENT_TOOL", "bash: printf 'a b'"]);
 });
 
 test("a new run clears a question left open by the previous one", async () => {
@@ -344,7 +528,8 @@ test("shutdown clears the state and the message but keeps the kind", async () =>
     ["AGENT_MSG", null],
     // AGENT_KIND stays, so a quick resume keeps the tag. AGENT_RESUME is
     // missing from this list too, because a session that just ended is the one
-    // worth restoring after a reboot.
+    // worth restoring after a reboot. So is the tool pair, which this run never
+    // published.
     ["AGENT_STATE", null],
   ]);
 });
@@ -376,8 +561,8 @@ function inPane(): { pi: FakePi; runs: TmuxRun[] } {
   return { pi, runs };
 }
 
-/** Fire one pi event in a pane and return the tmux command lines it ran. */
-async function firePane(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<TmuxRun[]> {
+/** Run `fn` in a pane and return the tmux command lines it ran. */
+async function capturedRuns(fn: () => Promise<void> | void): Promise<TmuxRun[]> {
   const runs: TmuxRun[] = [];
   setRunner((_file, args) => {
     runs.push(args);
@@ -387,11 +572,16 @@ async function firePane(pi: FakePi, event: string, payload: Record<string, unkno
     throw new Error("wrote an escape sequence from a tmux pane");
   }) as typeof process.stdout.write;
   try {
-    await pi.emit(event, payload);
+    await fn();
   } finally {
     process.stdout.write = original;
   }
   return runs;
+}
+
+/** Fire one pi event in a pane and return the tmux command lines it ran. */
+async function firePane(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<TmuxRun[]> {
+  return capturedRuns(() => pi.emit(event, payload));
 }
 
 /** The options one tmux command line sets, deletions marked with "-u". */
@@ -419,10 +609,12 @@ test("in a pane the extension publishes options, not escapes", async () => {
     ["set", "-p", "-u", "-t", "%17", "@AGENT_WORKED"],
     ["set", "-p", "-u", "-t", "%17", "@AGENT_MSG"],
   ]);
+  // The same goes for the tool it was running, which nothing else clears.
+  assert.deepEqual(options(runs[4]!), ["-u @AGENT_TOOL_SINCE", "-u @AGENT_TOOL"]);
   // The state chains the stamp the picker counts elapsed time from into the
   // same command line, so a state change costs one process.
-  assert.deepEqual(runs[4]!.slice(0, 7), ["set", "-p", "-t", "%17", "@AGENT_STATE", "idle", ";"]);
-  assert.deepEqual(options(runs[4]!), ["@AGENT_STATE", "@AGENT_SINCE"]);
+  assert.deepEqual(runs[5]!.slice(0, 7), ["set", "-p", "-t", "%17", "@AGENT_STATE", "idle", ";"]);
+  assert.deepEqual(options(runs[5]!), ["@AGENT_STATE", "@AGENT_SINCE"]);
 });
 
 // tmux ends a command at any argument ending in ";", so a prompt ending in one
@@ -449,7 +641,7 @@ test("a pane with no kitty window at all still publishes", async () => {
 
   const runs = await firePane(pi, "session_start");
 
-  assert.equal(runs.length, 5);
+  assert.equal(runs.length, 6);
 });
 
 test("the pane options a state change leaves behind", async () => {
@@ -478,6 +670,40 @@ test("a state already published is not published again in a pane", async () => {
   await firePane(pi, "agent_start");
 
   assert.deepEqual(await firePane(pi, "agent_start"), []);
+});
+
+test("a tool boundary in a pane costs one process", async (t) => {
+  // Every write in a pane is a fork on pi's main thread, so the pair goes out
+  // as one chained command rather than two.
+  const { pi } = inPane();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await firePane(pi, "session_start");
+  await firePane(pi, "agent_start");
+
+  const runs = await capturedRuns(async () => {
+    await pi.emit("tool_execution_start", { toolCallId: "c1", toolName: "bash", args: { command: "go test ./..." } });
+    t.mock.timers.tick(PAST_DEBOUNCE_MS);
+  });
+
+  assert.equal(runs.length, 1);
+  assert.deepEqual(options(runs[0]!), ["@AGENT_TOOL_SINCE", "@AGENT_TOOL"]);
+  assert.equal(runs[0]!.at(-1), "bash: go test ./...");
+});
+
+test("a tool label that ends in a semicolon is escaped", async (t) => {
+  // tmux ends a command at any argument ending in ";", so the label would lose
+  // that character and take the option chained behind it with it.
+  const { pi } = inPane();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await firePane(pi, "session_start");
+  await firePane(pi, "agent_start");
+
+  const runs = await capturedRuns(async () => {
+    await pi.emit("tool_execution_start", { toolCallId: "c1", toolName: "bash", args: { command: "make test;" } });
+    t.mock.timers.tick(PAST_DEBOUNCE_MS);
+  });
+
+  assert.equal(runs[0]!.at(-1), "bash: make test\\;");
 });
 
 test("@AGENT_SINCE is unix seconds", async () => {

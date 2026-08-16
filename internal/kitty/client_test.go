@@ -2,6 +2,7 @@ package kitty
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"maps"
 	"os"
@@ -114,6 +115,101 @@ func TestParseAgents(t *testing.T) {
 	}
 	if !agents[1].CreatedAt.IsZero() {
 		t.Errorf("missing created_at should be zero time, got %v", agents[1].CreatedAt)
+	}
+}
+
+// A window outlives its agents, so a label a killed pi left behind must not
+// pin itself to whatever runs there next, and a timestamp that is not one must
+// not read as decades of running time.
+func TestParseAgentsTool(t *testing.T) {
+	cases := []struct {
+		name      string
+		vars      map[string]string
+		wantTool  string
+		wantSince time.Time
+	}{
+		{
+			name: "a working agent",
+			vars: map[string]string{
+				"AGENT_DISPLAY": "working", "AGENT_TOOL": "bash: go test ./...",
+				"AGENT_TOOL_SINCE": "1700000000",
+			},
+			wantTool: "bash: go test ./...", wantSince: time.Unix(1700000000, 0),
+		},
+		{
+			// The watcher publishes this one itself, and it is the row the tool
+			// line exists for.
+			name: "an agent the watcher already called stalled",
+			vars: map[string]string{
+				"AGENT_DISPLAY": "stalled", "AGENT_TOOL": "bash: sleep 900",
+				"AGENT_TOOL_SINCE": "1700000000",
+			},
+			wantTool: "bash: sleep 900", wantSince: time.Unix(1700000000, 0),
+		},
+		{
+			name: "an idle agent ignores a stale label",
+			vars: map[string]string{
+				"AGENT_DISPLAY": "idle", "AGENT_TOOL": "bash: go test ./...",
+				"AGENT_TOOL_SINCE": "1700000000",
+			},
+		},
+		{
+			// The window a killed pi left behind. Nothing clears the pair for
+			// the agent that starts next, and it would read as stalled at once.
+			name: "a claude agent in a window a pi died in",
+			vars: map[string]string{
+				"AGENT_DISPLAY": "working", "AGENT_KIND": "claude",
+				"AGENT_TOOL": "bash: sleep 900", "AGENT_TOOL_SINCE": "1700000000",
+			},
+		},
+		{name: "no tool published", vars: map[string]string{"AGENT_DISPLAY": "working"}},
+		{
+			name:     "a label with no timestamp",
+			vars:     map[string]string{"AGENT_DISPLAY": "working", "AGENT_TOOL": "bash: x"},
+			wantTool: "bash: x",
+		},
+		{
+			name: "a zero timestamp is not a timestamp",
+			vars: map[string]string{
+				"AGENT_DISPLAY": "working", "AGENT_TOOL": "bash: x", "AGENT_TOOL_SINCE": "0",
+			},
+			wantTool: "bash: x",
+		},
+		{
+			name: "an unparsable timestamp is dropped",
+			vars: map[string]string{
+				"AGENT_DISPLAY": "working", "AGENT_TOOL": "bash: x", "AGENT_TOOL_SINCE": "soon",
+			},
+			wantTool: "bash: x",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// pi is the only kind that publishes a tool, so every case that is
+			// not about the kind is a pi agent.
+			if _, ok := tc.vars["AGENT_KIND"]; !ok {
+				tc.vars["AGENT_KIND"] = "pi"
+			}
+			vars, err := json.Marshal(tc.vars)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			data := `[{"tabs":[{"windows":[{"id":1,"title":"t","cwd":"/p","user_vars":` + string(vars) + `}]}]}]`
+
+			agents, err := parseAgents([]byte(data))
+			if err != nil {
+				t.Fatalf("parseAgents: %v", err)
+			}
+			if len(agents) != 1 {
+				t.Fatalf("got %d agents, want 1", len(agents))
+			}
+			if got := agents[0].Tool; got != tc.wantTool {
+				t.Errorf("tool: got %q, want %q", got, tc.wantTool)
+			}
+			if got := agents[0].ToolSince; !got.Equal(tc.wantSince) {
+				t.Errorf("tool since: got %v, want %v", got, tc.wantSince)
+			}
+		})
 	}
 }
 

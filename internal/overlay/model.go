@@ -20,7 +20,22 @@ import (
 )
 
 // filters are the status tabs, in cycle order for the "f" key.
-var filters = []string{"all", "working", "blocked", "done", "idle"}
+var filters = []string{"all", "working", "stalled", "blocked", "done", "idle"}
+
+// matchesFilter reports whether one status tab lists this display. It is exact
+// except for "working", which keeps its stalled agents: stalled is a working
+// agent whose tool has run too long, and an agent must not disappear from under
+// a user sitting on the working tab.
+func matchesFilter(filter, display string) bool {
+	switch filter {
+	case "all":
+		return true
+	case "working":
+		return display == "working" || display == "stalled"
+	default:
+		return display == filter
+	}
+}
 
 // Client is the inventory the picker lists and jumps into. An interface, so a
 // test can drive the model without a live kitty or tmux.
@@ -1023,7 +1038,7 @@ func (m Model) visible() []agent.Agent {
 	q := strings.ToLower(strings.TrimSpace(m.search.Value()))
 	var out []agent.Agent
 	for _, a := range m.agents {
-		if m.filter != "all" && a.Display != m.filter {
+		if !matchesFilter(m.filter, a.Display) {
 			continue
 		}
 		if q != "" && !matches(a, q) {
@@ -1036,7 +1051,7 @@ func (m Model) visible() []agent.Agent {
 
 func matches(a agent.Agent, q string) bool {
 	hay := strings.ToLower(strings.Join([]string{
-		a.Display, a.Kind, a.Project, agentName(a), a.Branch, a.CWD, a.Title, a.Msg,
+		a.Display, a.Kind, a.Project, agentName(a), a.Branch, a.CWD, a.Title, a.Msg, a.Tool,
 	}, " "))
 	return strings.Contains(hay, q)
 }
@@ -1087,12 +1102,18 @@ func sameProject(a, b agent.Agent) bool {
 	return a.ProjectKey == b.ProjectKey && a.Project == b.Project
 }
 
-// counts is the number of agents per status, plus "all". The keys are filter
-// names, so the status tabs and the footer index it directly.
+// counts is how many agents each status tab lists, plus "all". The keys are
+// filter names, so the status tabs and the footer index it directly, and the
+// count comes from the same predicate the tab's contents do: a working tab
+// reading 0 while it lists a stalled agent would be a lie.
 func (m Model) counts() map[string]int {
 	c := map[string]int{"all": len(m.agents)}
 	for _, a := range m.agents {
-		c[a.Display]++
+		for _, f := range filters {
+			if f != "all" && matchesFilter(f, a.Display) {
+				c[f]++
+			}
+		}
 	}
 	return c
 }

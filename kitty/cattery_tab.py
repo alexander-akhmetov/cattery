@@ -28,15 +28,20 @@ import time
 # (color_name, glyph, urgency_rank). The lower rank wins, so a tab holding one
 # blocked agent and three working ones shows blocked. A seen idle agent is
 # missing from the table, because it draws nothing.
+#
+# The colour name has to be one kitty carries: getattr on fmt.fg raises for
+# anything else, and the bare except in agent_prefix turns that into no marker
+# at all rather than into an error.
 _AGENT_STATE_STYLE = {
-    "blocked": ("red", "◆", 0),     # ◆ needs input
-    "done":    ("green", "●", 1),   # ● finished, unseen
-    "working": ("yellow", "●", 2),  # ● working
+    "blocked": ("red", "◆", 0),      # ◆ needs input
+    "stalled": ("magenta", "◐", 1),  # ◐ one tool call has run too long
+    "done":    ("green", "●", 2),    # ● finished, unseen
+    "working": ("yellow", "●", 3),   # ● working
 }
 
 # Displays that carry an elapsed time. A finished agent has a timestamp too, and
 # the tab bar leaves that to the picker, which phrases it as "… ago".
-_TIMED = ("working", "blocked")
+_TIMED = ("working", "blocked", "stalled")
 
 
 def _collect_agent_display(tab):

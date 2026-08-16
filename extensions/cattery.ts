@@ -10,31 +10,43 @@
  *
  * The contract with the cattery kitty watcher:
  *
- *   AGENT_KIND    "pi"                                       (set once)
- *   AGENT_STATE   "working" | "blocked" | "idle"             (live)
- *   AGENT_MSG     most recent user message                   (live)
- *   AGENT_RESUME  the command that brings this session back  (per session)
+ *   AGENT_KIND        "pi"                                       (set once)
+ *   AGENT_STATE       "working" | "blocked" | "idle"             (live)
+ *   AGENT_MSG         most recent user message                   (live)
+ *   AGENT_TOOL        the tool running now, "bash: go test ./..." (live)
+ *   AGENT_TOOL_SINCE  unix seconds when that tool started         (live)
+ *   AGENT_RESUME      the command that brings this session back  (per session)
  *
  * Each value is base64 inside OSC `1337;SetUserVar=KEY=...`. The watcher derives
  * AGENT_DISPLAY from AGENT_STATE and its own seen/unseen bookkeeping, and owns
  * the tab marker, the notifications, and the OS-window title. The picker draws
- * AGENT_MSG as the row's current-task line.
+ * AGENT_MSG as the row's current-task line, and AGENT_TOOL with a live elapsed
+ * time in front of it.
  *
  * Lifecycle mapping:
  *   session_start                              -> AGENT_KIND=pi, AGENT_RESUME,
  *                                                 AGENT_MSG cleared,
+ *                                                 AGENT_TOOL* cleared,
  *                                                 AGENT_STATE=idle,
  *                                                 @AGENT_WORKED cleared (tmux)
  *   before_agent_start                         -> AGENT_MSG=<prompt>
- *   agent_start                                -> AGENT_STATE=working
+ *   agent_start                                -> AGENT_TOOL* cleared,
+ *                                                 AGENT_STATE=working
+ *   tool_execution_start                       -> AGENT_TOOL_SINCE, AGENT_TOOL
  *   tool_execution_start (interactive tool)    -> AGENT_STATE=blocked
+ *   tool_execution_end                         -> the next-earliest call, or
+ *                                                 AGENT_TOOL* cleared
  *   tool_execution_end   (interactive tool)    -> AGENT_STATE=working
- *   agent_settled                              -> AGENT_STATE=idle
- *   session_shutdown                           -> AGENT_MSG, AGENT_STATE cleared
+ *   agent_settled                              -> AGENT_TOOL* cleared,
+ *                                                 AGENT_STATE=idle
+ *   session_shutdown                           -> AGENT_MSG, AGENT_TOOL*,
+ *                                                 AGENT_STATE cleared
  *
  * AGENT_STATE is written last in every one of those, because writing it is what
  * wakes the watcher: a variable written after it is missing from the transition
- * the watcher publishes.
+ * the watcher publishes. AGENT_TOOL_SINCE goes before AGENT_TOOL for the same
+ * reason one level down: AGENT_TOOL is the key the watcher reacts to, so the
+ * other order would have it read the previous tool's timestamp.
  *
  * Shutdown leaves AGENT_RESUME alone, because `cattery save` reads it off the
  * window long after the agent is gone.
@@ -47,8 +59,11 @@
  * while pi-tui owns the screen. Outside both kitty and tmux the extension does
  * nothing.
  *
- * Known limitation: pi's command-approval prompt fires no tool_execution_start
- * event, so the tab stays "working" while pi waits for the user.
+ * Known limitation: pi's command-approval prompt is not a state of its own, so
+ * the tab stays "working" while pi waits for the user. tool_execution_start
+ * fires before prepareToolCall, which is where the approval gate runs, so a
+ * tool waiting for an answer does publish AGENT_TOOL and does age towards
+ * "stalled".
  */
 
 import { spawnSync } from "node:child_process";
@@ -94,28 +109,58 @@ export function setRunner(next: Runner): void {
   runner = next;
 }
 
-// Publish one user variable, on whichever transport reaches this agent.
+/** One variable update. A null value deletes the variable. */
+type VarUpdate = [key: string, value: string | null];
+
+// C0 and C1 control characters. No published value may carry one.
 //
-// A null `value` deletes the variable.
-function setUserVar(key: string, value: string | null): void {
+// \x1f separates the fields of a `tmux list-panes` row, and the picker drops a
+// row whose field count is wrong, so one of these in any value takes the agent
+// out of the picker with no error anywhere. On kitty the value travels base64
+// and reaches the picker instead, which draws it into its own frame: one \x1b
+// there moves the cursor rather than a column. JavaScript's \s matches neither
+// byte, so sanitizeMessage's whitespace fold does not cover this.
+const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]/g;
+
+// Publish several user variables at once, on whichever transport reaches this
+// agent: one OSC run on kitty, one chained command on tmux. Batching is what
+// makes a tool boundary one process rather than two.
+//
+// Every value is stripped here rather than at each call site, so nothing a
+// prompt, a tool argument or a session path carries can hide the agent.
+function setUserVars(updates: VarUpdate[]): void {
+  const clean: VarUpdate[] = updates.map(([key, value]) => [
+    key,
+    value === null ? null : value.replace(CONTROL_CHARS, " "),
+  ]);
   if (inTmux()) {
     // The pane wins whenever there is one, for the two reasons at the top of
     // this file.
-    runner("tmux", paneArgs(paneUpdates(key, value)));
+    const pane: PaneUpdate[] = [];
+    for (const [key, value] of clean) pane.push(...paneUpdates(key, value));
+    runner("tmux", paneArgs(pane));
     return;
   }
   // base64 over the UTF-8 bytes. AGENT_MSG carries prompt text in any script,
   // and kitty decodes the value as UTF-8.
-  let payload: string;
-  if (value === null) {
-    payload = `\x1b]1337;SetUserVar=${key}\x07`;
-  } else {
+  let payload = "";
+  for (const [key, value] of clean) {
+    if (value === null) {
+      payload += `\x1b]1337;SetUserVar=${key}\x07`;
+      continue;
+    }
     const b64 = Buffer.from(value, "utf-8").toString("base64");
-    payload = `\x1b]1337;SetUserVar=${key}=${b64}\x07`;
+    payload += `\x1b]1337;SetUserVar=${key}=${b64}\x07`;
   }
+  if (payload === "") return;
   // Write directly, around pi-tui's stdout pipeline. The OSC sequence is
   // invisible in the rendered TUI, but the pi.ui APIs would log it as content.
   process.stdout.write(payload);
+}
+
+/** Publish one user variable. A null `value` deletes it. */
+function setUserVar(key: string, value: string | null): void {
+  setUserVars([[key, value]]);
 }
 
 /** One pane-option update. A null value deletes the option. */
@@ -193,6 +238,138 @@ function sanitizeMessage(text: string): string {
   return oneLine.length > max ? oneLine.slice(0, max - 1) + "\u2026" : oneLine;
 }
 
+// --- the running tool ---------------------------------------------------------
+
+/** One tool call pi has started and not finished. */
+type ToolCall = { label: string; startedAt: number };
+
+// The calls in flight, keyed by toolCallId. pi runs siblings concurrently, so
+// several are open at once and an immediate failure can end before a sibling
+// starts.
+const openTools = new Map<string, ToolCall>();
+
+// What the host currently shows, so a repeat costs nothing. Both halves have to
+// match: two concurrent calls can share a label, and promoting the second one
+// has to move the timestamp.
+let publishedTool: ToolCall | null = null;
+
+let toolTimer: ReturnType<typeof setTimeout> | null = null;
+
+// How long a tool has to run before the host hears about it. `runner` is
+// spawnSync on pi's main thread, and a turn of 200 fast calls would otherwise
+// cost 400 blocking forks where a whole turn costs about four today. A tool
+// worth showing runs for minutes, so the delay costs nothing that matters.
+const TOOL_DEBOUNCE_MS = 2000;
+
+// The one argument worth showing per built-in tool. Anything else, an extension
+// tool included, publishes its bare name.
+const TOOL_ARG: Record<string, string> = {
+  bash: "command",
+  read: "path",
+  write: "path",
+  edit: "path",
+  ls: "path",
+  grep: "pattern",
+  find: "pattern",
+};
+
+// Shorter than the 200 AGENT_MSG uses: the label shares the picker's second
+// line with the agent's directory and an elapsed time, and it is cut there
+// rather than wrapped.
+const MAX_TOOL_LABEL = 120;
+
+// "bash: go test ./...", or the bare tool name when there is no argument to
+// show. The name always leads, so a value can never start with the argument and
+// be read as a flag by whatever publishes it.
+function toolLabel(toolName: string, args: unknown): string {
+  const key = TOOL_ARG[toolName];
+  let detail = "";
+  if (key !== undefined && typeof args === "object" && args !== null) {
+    const value = (args as Record<string, unknown>)[key];
+    if (typeof value === "string") detail = value.replace(/\s+/g, " ").trim();
+  }
+  const label = detail === "" ? toolName : `${toolName}: ${detail}`;
+  return label.length > MAX_TOOL_LABEL ? label.slice(0, MAX_TOOL_LABEL - 1) + "\u2026" : label;
+}
+
+// The earliest-started open call, never the newest. That call is the stall
+// candidate: a fast `read` starting beside a `bash` hung for 19 minutes would
+// otherwise restamp the timestamp and the stall would never fire. Map iteration
+// is insertion-ordered, so two calls stamped in the same second keep the order
+// pi started them in.
+function earliestTool(): ToolCall | null {
+  let best: ToolCall | null = null;
+  for (const call of openTools.values()) {
+    if (best === null || call.startedAt < best.startedAt) best = call;
+  }
+  return best;
+}
+
+// Write the earliest open call, or delete both variables when there is none.
+function publishTool(): void {
+  const next = earliestTool();
+  if (next === null) {
+    if (publishedTool === null) return;
+    clearTool();
+    return;
+  }
+  if (publishedTool !== null && publishedTool.label === next.label && publishedTool.startedAt === next.startedAt) {
+    return;
+  }
+  publishedTool = next;
+  setUserVars([
+    ["AGENT_TOOL_SINCE", String(next.startedAt)],
+    ["AGENT_TOOL", next.label],
+  ]);
+}
+
+function scheduleToolPublish(): void {
+  if (toolTimer !== null) return;
+  const timer = setTimeout(() => {
+    toolTimer = null;
+    // The only publish outside a pi handler, so the only one pi's dispatch does
+    // not catch for us. A throw here would be an uncaught exception on the
+    // event loop and would take the agent down for a tab marker.
+    try {
+      publishTool();
+    } catch {
+      // Nothing to fall back to: the label is cosmetic and the next tool
+      // boundary tries again.
+    }
+  }, TOOL_DEBOUNCE_MS);
+  // A pending label must never hold pi open on its way out.
+  timer.unref?.();
+  toolTimer = timer;
+}
+
+function cancelToolPublish(): void {
+  if (toolTimer === null) return;
+  clearTimeout(toolTimer);
+  toolTimer = null;
+}
+
+// Delete both variables, whatever this process has published. A window or a pane
+// outlives its agents and nothing else clears the pair, so a session opening in
+// one has to drop what a killed agent left behind.
+function clearTool(): void {
+  publishedTool = null;
+  setUserVars([
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
+  ]);
+}
+
+// Forget every open call and take the label off the host. Called at every run
+// boundary, `agent_start` included: an interrupt tears the process down with no
+// tool_execution_end, so the next run has to clear what the last one left. A
+// label pinned with an hours-old timestamp reads as stalled from that run's
+// first second.
+function resetTools(): void {
+  openTools.clear();
+  cancelToolPublish();
+  publishTool();
+}
+
 function emit(state: AgentState): void {
   if (!published()) return;
   if (state === lastState) return;
@@ -256,8 +433,11 @@ export default function (pi: ExtensionAPI) {
     blockedDepth = 0;
     lastState = null;
     clearPaneWork();
-    // Drop a stale message from a prior agent that ran in this window.
+    // Drop a stale message and a stale tool from a prior agent that ran here.
     setUserVar("AGENT_MSG", null);
+    openTools.clear();
+    cancelToolPublish();
+    clearTool();
     emit("idle");
   });
 
@@ -272,22 +452,44 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", async () => {
     blockedDepth = 0;
+    resetTools();
     emit("working");
   });
 
   pi.on("agent_settled", async () => {
     blockedDepth = 0;
+    resetTools();
     emit("idle");
   });
 
   pi.on("tool_execution_start", async (event) => {
-    if (!INTERACTIVE_TOOLS.has(event.toolName)) return;
+    // An interactive tool publishes no label. It sets "blocked", which already
+    // carries its own elapsed time through AGENT_SINCE, and a question the user
+    // has not answered is not a stall.
+    if (!INTERACTIVE_TOOLS.has(event.toolName)) {
+      openTools.set(event.toolCallId, {
+        label: toolLabel(event.toolName, event.args),
+        startedAt: Math.floor(Date.now() / 1000),
+      });
+      scheduleToolPublish();
+      return;
+    }
     blockedDepth += 1;
     emit("blocked");
   });
 
   pi.on("tool_execution_end", async (event) => {
-    if (!INTERACTIVE_TOOLS.has(event.toolName)) return;
+    if (!INTERACTIVE_TOOLS.has(event.toolName)) {
+      if (!openTools.delete(event.toolCallId)) return;
+      if (openTools.size === 0 && publishedTool === null) {
+        // Nothing reached the host and nothing is running: drop the pending
+        // write rather than fork for a tool that is already over.
+        cancelToolPublish();
+        return;
+      }
+      scheduleToolPublish();
+      return;
+    }
     blockedDepth = Math.max(0, blockedDepth - 1);
     if (blockedDepth === 0) emit("working");
   });
@@ -297,9 +499,11 @@ export default function (pi: ExtensionAPI) {
     // AGENT_KIND so a quick `/resume` keeps its tag; the watcher tolerates a
     // kind with no state.
     //
-    // AGENT_MSG goes first: clearing AGENT_STATE is what wakes the watcher, and
-    // the event it publishes would otherwise carry the last prompt.
+    // AGENT_MSG and the tool go first: clearing AGENT_STATE is what wakes the
+    // watcher, and the event it publishes would otherwise carry the last
+    // prompt.
     setUserVar("AGENT_MSG", null);
+    resetTools();
     if (lastState !== null) {
       lastState = null;
       setUserVar("AGENT_STATE", null);

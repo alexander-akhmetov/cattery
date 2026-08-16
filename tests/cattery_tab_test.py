@@ -45,6 +45,7 @@ class FakeFg:
     red = "<red>"
     green = "<green>"
     yellow = "<yellow>"
+    magenta = "<magenta>"
 
 
 class FakeFmt:
@@ -72,9 +73,13 @@ class AgentPrefixTest(unittest.TestCase):
             ("working", [FakeWindow(1, "working", str(now))], "<yellow>● <tab>"),
             ("blocked wins over working", [FakeWindow(1, "working"), FakeWindow(2, "blocked")], "<red>◆ <tab>"),
             ("done wins over working", [FakeWindow(1, "working"), FakeWindow(2, "done")], "<green>● <tab>"),
+            ("stalled wins over done", [FakeWindow(1, "done"), FakeWindow(2, "stalled")], "<magenta>◐ <tab>"),
+            ("blocked wins over stalled", [FakeWindow(1, "stalled"), FakeWindow(2, "blocked")], "<red>◆ <tab>"),
             # Only a live agent shows minutes. The picker times a finished one.
             ("working carries elapsed minutes", [FakeWindow(1, "working", str(now - 185))], "<yellow>● 3m <tab>"),
             ("done carries no elapsed", [FakeWindow(1, "done", str(now - 185))], "<green>● <tab>"),
+            # A stalled agent is the one whose minutes matter most.
+            ("stalled carries elapsed minutes", [FakeWindow(1, "stalled", str(now - 725))], "<magenta>◐ 12m <tab>"),
             ("under a minute stays bare", [FakeWindow(1, "blocked", str(now - 5))], "<red>◆ <tab>"),
             ("unparsable timestamp is dropped", [FakeWindow(1, "working", "not-a-number")], "<yellow>● <tab>"),
         ]

@@ -33,6 +33,98 @@ func TestKey(t *testing.T) {
 	}
 }
 
+func TestUnixSeconds(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want time.Time
+	}{
+		{name: "a timestamp", raw: "1700000000", want: time.Unix(1700000000, 0)},
+		{name: "unset"},
+		// time.Unix(0, 0) is not IsZero, so without the guard this reads as a
+		// value fifty-odd years old and every threshold fires on it.
+		{name: "zero", raw: "0"},
+		{name: "negative", raw: "-1"},
+		{name: "not a number", raw: "soon"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UnixSeconds(tc.raw); !got.Equal(tc.want) {
+				t.Fatalf("UnixSeconds(%q): got %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// A window or a pane outlives its agents, and `cattery state clear` drops the
+// state, the kind and the message and nothing else. So a pi killed mid-call
+// leaves its label standing, and the kind is what keeps the next agent in that
+// window from wearing it.
+func TestPublishesTool(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		display string
+		want    bool
+	}{
+		{name: "pi working", kind: "pi", display: "working", want: true},
+		{name: "pi stalled", kind: "pi", display: "stalled", want: true},
+		{name: "pi idle", kind: "pi", display: "idle"},
+		{name: "pi done", kind: "pi", display: "done"},
+		{name: "pi blocked", kind: "pi", display: "blocked"},
+		{name: "claude in a window a pi died in", kind: "claude", display: "working"},
+		{name: "an untagged agent", display: "working"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PublishesTool(tc.kind, tc.display); got != tc.want {
+				t.Fatalf("PublishesTool(%q, %q): got %v, want %v", tc.kind, tc.display, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStalled(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+
+	cases := []struct {
+		name string
+		in   Agent
+		want bool
+	}{
+		{
+			name: "one tool past the threshold",
+			in:   Agent{Display: "working", Tool: "bash: sleep 900", ToolSince: ago(11 * time.Minute)},
+			want: true,
+		},
+		{
+			name: "a tool still inside it",
+			in:   Agent{Display: "working", Tool: "bash: go test ./...", ToolSince: ago(9 * time.Minute)},
+		},
+		// The zero value is older than every threshold, so a rule comparing
+		// timestamps alone would call every working agent stalled.
+		{name: "no timestamp", in: Agent{Display: "working", Tool: "bash: x"}},
+		{name: "no tool at all", in: Agent{Display: "working", ToolSince: ago(time.Hour)}},
+		{
+			name: "a blocked agent is waiting, not stuck",
+			in:   Agent{Display: "blocked", Tool: "bash: x", ToolSince: ago(time.Hour)},
+		},
+		{
+			// Idempotent: the kitty watcher may have published it already.
+			name: "an agent already stalled",
+			in:   Agent{Display: "stalled", Tool: "bash: x", ToolSince: ago(time.Hour)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Stalled(tc.in, now); got != tc.want {
+				t.Fatalf("Stalled: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSort(t *testing.T) {
 	at := func(sec int64) time.Time { return time.Unix(sec, 0) }
 

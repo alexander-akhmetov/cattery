@@ -37,12 +37,14 @@ const fieldSep = "\x1f"
 // The pane options carrying the agent contract. @AGENT_WORKED and @AGENT_SEEN
 // are what the kitty watcher keeps on the boss object instead.
 const (
-	optKind   = "@AGENT_KIND"
-	optState  = "@AGENT_STATE"
-	optMsg    = "@AGENT_MSG"
-	optSince  = "@AGENT_SINCE"
-	optWorked = "@AGENT_WORKED"
-	optSeen   = "@AGENT_SEEN"
+	optKind      = "@AGENT_KIND"
+	optState     = "@AGENT_STATE"
+	optMsg       = "@AGENT_MSG"
+	optSince     = "@AGENT_SINCE"
+	optWorked    = "@AGENT_WORKED"
+	optSeen      = "@AGENT_SEEN"
+	optTool      = "@AGENT_TOOL"
+	optToolSince = "@AGENT_TOOL_SINCE"
 )
 
 // listFormat is the row `tmux list-panes -a` prints per pane. The order matches
@@ -52,6 +54,7 @@ var listFormat = strings.Join([]string{
 	"#{pane_current_path}", "#{pane_title}",
 	"#{" + optKind + "}", "#{" + optState + "}", "#{" + optMsg + "}",
 	"#{" + optSince + "}", "#{" + optWorked + "}", "#{" + optSeen + "}",
+	"#{" + optTool + "}", "#{" + optToolSince + "}",
 }, fieldSep)
 
 // The index of each field in a list-panes row.
@@ -68,6 +71,8 @@ const (
 	fSince
 	fWorked
 	fSeen
+	fTool
+	fToolSince
 	fieldCount
 )
 
@@ -233,8 +238,10 @@ func parseAgent(fields []string) (agent.Agent, bool) {
 		// picker matches when the same agent is picked twice.
 		Target: fields[fSession] + ":" + fields[fWindowIndex] + "." + fields[fPaneID],
 	}
-	if secs, err := strconv.ParseInt(fields[fSince], 10, 64); err == nil && secs > 0 {
-		a.Since = time.Unix(secs, 0)
+	a.Since = agent.UnixSeconds(fields[fSince])
+	if agent.PublishesTool(a.Kind, display) {
+		a.Tool = fields[fTool]
+		a.ToolSince = agent.UnixSeconds(fields[fToolSince])
 	}
 	return a, true
 }
@@ -247,7 +254,8 @@ func parseAgent(fields []string) (agent.Agent, bool) {
 //	seen    someone has attached to the pane since it went idle
 //
 // An empty result means the pane is not an agent, or announced a word this
-// picker does not know.
+// picker does not know. "stalled" is not derived here: it needs a clock, and
+// agents.Client.markStalled holds the one the picker reads.
 func display(state, worked, seen string) string {
 	switch state {
 	case "working", "blocked":

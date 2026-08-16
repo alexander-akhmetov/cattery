@@ -28,6 +28,11 @@ Reload kitty afterwards. Press `opt+a` twice to open the picker.
 `cattery setup` installs copies of the kitty files, and an upgrade of the binary
 does not update those copies. Run it again after every upgrade.
 
+`cattery setup` also offers to run
+`pi install git:github.com/alexander-akhmetov/cattery`. Say yes after every
+upgrade: the picker warns about stale kitty files, but nothing notices a stale
+pi extension.
+
 `cattery -version` prints the release the binary was built from. `cattery help`
 lists the commands, and `cattery help <command>` says what one of them does.
 
@@ -36,18 +41,19 @@ lists the commands, and `cattery help <command>` says what one of them does.
 | Display state | Marker | Meaning |
 |---|---:|---|
 | `blocked` | red `◆` | the agent needs input |
+| `stalled` | magenta `◐` | one tool call has run past ten minutes |
 | `done` | green `●` | the agent finished while you were elsewhere |
 | `working` | yellow `●` | the agent is running |
 | `idle` | none | nothing to report |
 
-A `working` or `blocked` tab also shows elapsed minutes. An OS window holding a
-`blocked` or `done` agent gets a `(N need you)` title prefix, which the Dock and
-the ⌘-Tab switcher pick up.
+A `working`, `blocked` or `stalled` tab also shows elapsed minutes. An OS window
+holding a `blocked`, `stalled` or `done` agent gets a `(N need you)` title
+prefix, which the Dock and the ⌘-Tab switcher pick up.
 
-A notification fires on entry to `blocked` or `done`, unless that window has
-focus. kitty sends it, so nothing beyond kitty needs installing. Clicking the
-body focuses that exact window, switching OS window if it is in another one,
-which marks the agent seen and drops its marker. The banner also carries an
+A notification fires on entry to `blocked`, `stalled` or `done`, unless that
+window has focus. kitty sends it, so nothing beyond kitty needs installing.
+Clicking the body focuses that exact window, switching OS window if it is in
+another one, which marks the agent seen and drops its marker. The banner also carries an
 **Open picker** button, which opens the overlay and leaves focus where it is. On
 macOS that button is a drop-down menu, which appears when you hover the banner.
 The button needs the binary path `cattery setup` writes into kitty.conf, so an
@@ -63,10 +69,31 @@ No agent writes `done`. The watcher derives it when the agent goes idle after
 working and you have not focused the window since. Focusing the window marks it
 seen and drops the marker.
 
+No agent writes `stalled` either, and none can: a hung tool call fires no event
+at all. The watcher sweeps its working windows once a minute and moves one there
+when the tool that window published has been running for more than ten minutes.
+An agent that publishes no tool never reaches the state, which today is every
+Claude agent. The elapsed minutes keep counting across the change, because it is
+still the same turn.
+
 ## Overlay
 
 `opt+a` `opt+a` opens the management overlay. It lists all running agents, grouped 
 by git repository.
+
+A row for a pi agent names the tool it is running and how long that one call has
+taken, on the line above the prompt it is working on:
+
+```
+  2 ● working  cat-muv9  pi   kontora/publish-running-tool          3m 12s
+    ~/…/cat-muv9 · ⠹ bash: go test -race ./... 1m 04s
+                     publish the running tool
+```
+
+The time appears once the call passes ten seconds. The picker recomputes it once
+a second from the timestamp the agent published, so it keeps rising while the
+agent prints nothing. Only pi publishes this; a Claude agent's row shows its
+prompt as before.
 
 `v` opens a drawer beside the list, showing the screen of the agent under the
 cursor. It works on a kitty window you are not looking at and on a tmux pane
@@ -116,12 +143,13 @@ once `cattery setup` has installed this version's copy of it.
 ## tmux agents
 
 An agent in a tmux pane publishes the same states as one in a kitty window, as
-pane options: `@AGENT_STATE`, `@AGENT_KIND`, `@AGENT_MSG`. `cattery state` and
-the pi extension write there whenever `$TMUX` and `$TMUX_PANE` are set, which
-covers a pane nobody is attached to. To see what an agent published:
+pane options: `@AGENT_STATE`, `@AGENT_KIND`, `@AGENT_MSG`, plus `@AGENT_TOOL`
+and `@AGENT_TOOL_SINCE` from pi. `cattery state` and the pi extension write
+there whenever `$TMUX` and `$TMUX_PANE` are set, which covers a pane nobody is
+attached to. To see what an agent published:
 
 ```bash
-tmux list-panes -a -F '#{pane_id} #{@AGENT_STATE} #{@AGENT_KIND}'
+tmux list-panes -a -F '#{pane_id} #{@AGENT_STATE} #{@AGENT_KIND} #{@AGENT_TOOL}'
 ```
 
 The picker lists those panes beside the kitty agents, in the same repository
@@ -169,7 +197,7 @@ Each line is one JSON object:
 | `window` | the kitty window id |
 | `kind` | what the agent calls itself, `pi` or `claude`, and empty on a `cleared` event from Claude, which drops `AGENT_KIND` in the same batch |
 | `from` | the display state before this change, `null` the first time the window is seen |
-| `to` | `working`, `blocked`, `done`, `idle`, `cleared` when the agent dropped its state, `closed` when the window went away |
+| `to` | `working`, `stalled`, `blocked`, `done`, `idle`, `cleared` when the agent dropped its state, `closed` when the window went away |
 | `title` | the window title, cut to 200 characters |
 | `cwd` | the agent's directory, the one the picker shows |
 | `msg` | the prompt the agent is on |

@@ -42,7 +42,7 @@ var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 // label on line 1: bar + 2-wide number + gutter + dot + gutter.
 const (
 	colNum    = 2 // right-aligned row number
-	colStatus = 7 // "working" / "blocked" / "done" (padded)
+	colStatus = 7 // "working" / "stalled" / "blocked" / "done" (padded)
 	rowIndent = 1 + colNum + 1 + 1 + 1
 	maxName   = 26
 	maxBranch = 22
@@ -131,6 +131,8 @@ func statusColor(display string) lipgloss.Color {
 		return cGreen
 	case "working":
 		return cYellow
+	case "stalled":
+		return cMauve
 	default:
 		return cOverlay2
 	}
@@ -143,6 +145,8 @@ func statusGlyph(display string) string {
 	switch display {
 	case "blocked":
 		return "◆"
+	case "stalled":
+		return "◐"
 	case "done", "working":
 		return "●"
 	default:
@@ -169,6 +173,8 @@ func activityColor(display string) lipgloss.Color {
 		return cMaroon
 	case "done":
 		return cGreen
+	case "stalled":
+		return cMauve
 	default:
 		return cSubtext
 	}
@@ -177,25 +183,60 @@ func activityColor(display string) lipgloss.Color {
 // activityGlyph leads the line-2 task with a steady status glyph. A working
 // agent shows the animated braille spinner instead. An idle agent gets none,
 // because its middot repeats the separator before it and reads as a typo.
+//
+// A stalled agent loses the spinner. An animation claims progress, which is the
+// claim this state exists to doubt.
 func activityGlyph(a agent.Agent, spin int) string {
 	switch a.Display {
 	case "working":
 		return string(spinnerFrames[spin%len(spinnerFrames)])
-	case "blocked", "done":
+	case "blocked", "done", "stalled":
 		return statusGlyph(a.Display)
 	default:
 		return ""
 	}
 }
 
-// activity is the prompt text on line 2. It prefers the agent's published user
-// message (AGENT_MSG) and falls back to the window title.
-func activity(a agent.Agent) string {
+// toolCell is what the agent is running right now, laid into the columns the
+// row has for it: the tool it published and, once that one call has run past
+// minToolElapsed, how long it has taken. Empty for an agent that publishes no
+// tool, which is every Claude agent and every pi between calls.
+//
+// The label is what gets cut, never the time. A label cut in the middle still
+// names the tool, and the number is the reason the line is drawn at all: a long
+// `bash` command is exactly the call worth timing, and cutting the line as one
+// string drops the time off every one of them. Below minToolLabel the label
+// goes alone, because a line of number and ellipsis names nothing.
+func toolCell(now time.Time, a agent.Agent, width int) string {
+	tool := oneLine(a.Tool)
+	if tool == "" {
+		return ""
+	}
+	if a.ToolSince.IsZero() || now.Sub(a.ToolSince) < minToolElapsed {
+		return truncate(tool, width)
+	}
+	took := elapsed(now, a.ToolSince)
+	room := width - ansi.StringWidth(took) - 1
+	if room < minToolLabel {
+		return truncate(tool, width)
+	}
+	return truncate(tool, room) + " " + took
+}
+
+// prompt is what this agent was asked to do: the message it published
+// (AGENT_MSG), or the window title when it has published none.
+func prompt(a agent.Agent) string {
 	if msg := strings.TrimSpace(a.Msg); msg != "" {
 		return msg
 	}
-	if title := strings.TrimSpace(a.Title); title != "" {
-		return title
+	return strings.TrimSpace(a.Title)
+}
+
+// activity is the prompt text on line 2, or a word for the state when the agent
+// has published neither a message nor a title.
+func activity(a agent.Agent) string {
+	if p := prompt(a); p != "" {
+		return p
 	}
 	switch a.Display {
 	case "blocked":
@@ -204,6 +245,10 @@ func activity(a agent.Agent) string {
 		return "finished"
 	case "working":
 		return "working"
+	case "stalled":
+		// Only reachable in the tick between a tool ending and the reload that
+		// takes the row out of this state.
+		return "may be stuck"
 	default:
 		// An idle agent has nothing to report, and line 1 already says "idle",
 		// so line 2 drops the activity clause.
@@ -232,7 +277,7 @@ func timeLabel(now time.Time, a agent.Agent) string {
 // metaRight is the footer's right-hand summary for the selected agent.
 func metaRight(now time.Time, a agent.Agent) string {
 	switch a.Display {
-	case "working":
+	case "working", "stalled":
 		return elapsed(now, a.Since)
 	case "blocked":
 		return timeLabel(now, a)
@@ -245,6 +290,17 @@ func metaRight(now time.Time, a agent.Agent) string {
 		return ""
 	}
 }
+
+// minToolElapsed is how long a tool call has to have run before the row times
+// it. A fast tool would otherwise flicker a single-digit second count on every
+// tick, the way _agent_elapsed in kitty/cattery_tab.py shows nothing under a
+// minute.
+const minToolElapsed = 10 * time.Second
+
+// minToolLabel is how many cells of the tool label a row keeps before it drops
+// the elapsed time instead. Eight holds "bash: g…", which still says which tool
+// is running.
+const minToolLabel = 8
 
 func elapsed(now, since time.Time) string {
 	if since.IsZero() {
@@ -857,7 +913,7 @@ func (m Model) blocks(vis []agent.Agent, inner int) ([]block, int) {
 		}
 		// A wrapped prompt makes a row taller than two lines, so the block takes
 		// its height from the same wrap renderRow will do.
-		height := rowHeight(a, inner)
+		height := rowHeight(m.now, a, inner)
 		out = append(out, block{
 			render: func() []string {
 				lines := m.renderRow(i, a, inner, true)
@@ -1116,16 +1172,31 @@ func wrapActivity(text string, first, cont, maxLines int) []string {
 	return out
 }
 
-// rowActivity is a row's prompt, wrapped to the row's own columns.
-func rowActivity(a agent.Agent, inner int) []string {
+// rowActivity is a row's line-2 text and the lines it wraps onto: the running
+// tool, then the prompt it is running for.
+//
+// The tool keeps the first line to itself and is cut rather than wrapped. The
+// elapsed time on it gains a cell at "10m 00s" and again at "10h 00m", and a
+// number that grows inside wrapped text moves the wrap: the row would gain and
+// lose a line on its own, and rowHeight and renderRow agreeing is what keeps
+// the viewport from tearing.
+func rowActivity(now time.Time, a agent.Agent, inner int) []string {
 	first, cont := activityWidths(a, inner)
-	return wrapActivity(oneLine(activity(a)), first, cont, maxActivityLines)
+	tool := toolCell(now, a, first)
+	if tool == "" {
+		return wrapActivity(oneLine(activity(a)), first, cont, maxActivityLines)
+	}
+	// Only the prompt follows a tool: activity()'s state words would repeat the
+	// tool line above in less detail.
+	lines := make([]string, 0, maxActivityLines)
+	lines = append(lines, tool)
+	return append(lines, wrapActivity(oneLine(prompt(a)), cont, cont, maxActivityLines-1)...)
 }
 
 // rowHeight is how many lines renderRow returns for this agent, without drawing
 // it. windowBlocks sizes blocks it may never render.
-func rowHeight(a agent.Agent, inner int) int {
-	return 1 + max(len(rowActivity(a, inner)), 1)
+func rowHeight(now time.Time, a agent.Agent, inner int) int {
+	return 1 + max(len(rowActivity(now, a, inner)), 1)
 }
 
 // renderRow returns the lines for one agent row: the status line, the cwd and
@@ -1215,7 +1286,7 @@ func (m Model) renderRow(i int, a agent.Agent, inner int, grouped bool) []string
 		{strings.Repeat(" ", rowIndent), cText, false, ""},
 		{cwd, cOverlay0, false, ""},
 	}
-	act := rowActivity(a, inner)
+	act := rowActivity(m.now, a, inner)
 	if len(act) > 0 {
 		left2 = append(left2, span{sep, cFaint, false, ""})
 		if glyph != "" {
@@ -1340,7 +1411,8 @@ func (m Model) renderHints(width int) string {
 	c := m.counts()
 
 	// Position leads the summary. Truncation takes the right side first, and
-	// the cursor position matters most while scrolling.
+	// the cursor position matters most while scrolling. The working count
+	// carries the stalled agents, which are still turns nobody has finished.
 	summary := fmt.Sprintf("%d active · %d agents", c["working"]+c["blocked"], c["all"])
 	vis := m.visible()
 	if len(vis) > 0 && m.selected >= 0 && m.selected < len(vis) {

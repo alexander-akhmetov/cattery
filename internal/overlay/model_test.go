@@ -132,22 +132,30 @@ func sampleModel() Model {
 // The status filter and the query narrow the same list. The query searches
 // inside the filter.
 func TestVisible(t *testing.T) {
+	// A stalled agent is a working one whose tool has run too long, so the
+	// working tab keeps it rather than letting it vanish from under the cursor.
+	stalled := []agent.Agent{{ID: 9, Kind: "pi", Display: "stalled"}}
 	cases := []struct {
 		name   string
 		filter string
 		query  string
+		extra  []agent.Agent
 		want   []int
 	}{
-		{"no filter, no query", "all", "", []int{3, 2, 1, 4}},
-		{"filter keeps only its status", "working", "", []int{3, 2}},
-		{"query matches a branch", "all", "oauth", []int{3}},
-		{"query matches a kind", "all", "pi", []int{3, 2}},
-		{"query matches nothing", "all", "nomatch", nil},
-		{"query searches inside the filter", "working", "master", nil},
+		{"no filter, no query", "all", "", nil, []int{3, 2, 1, 4}},
+		{"filter keeps only its status", "working", "", nil, []int{3, 2}},
+		{"query matches a branch", "all", "oauth", nil, []int{3}},
+		{"query matches a kind", "all", "pi", nil, []int{3, 2}},
+		{"query matches nothing", "all", "nomatch", nil, nil},
+		{"query searches inside the filter", "working", "master", nil, nil},
+		{"the working tab keeps a stalled agent", "working", "", stalled, []int{3, 2, 9}},
+		{"the stalled tab isolates it", "stalled", "", stalled, []int{9}},
+		{"another tab is unaffected", "blocked", "", stalled, []int{1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := sampleModel()
+			m.agents = append(m.agents, tc.extra...)
 			m.filter = tc.filter
 			m.search.SetValue(tc.query)
 			vis := m.visible()
@@ -195,18 +203,11 @@ func TestCycleFilterResetsSelection(t *testing.T) {
 	if m.selected != 0 {
 		t.Errorf("cycle should reset selection, got %d", m.selected)
 	}
-	m.cycleFilter()
-	m.cycleFilter()
-	if m.filter != "done" {
-		t.Errorf("third cycle: got %q, want done", m.filter)
-	}
-	m.cycleFilter()
-	if m.filter != "idle" {
-		t.Errorf("fourth cycle: got %q, want idle", m.filter)
-	}
-	m.cycleFilter()
-	if m.filter != "all" {
-		t.Errorf("cycle wraps to all, got %q", m.filter)
+	for _, want := range []string{"stalled", "blocked", "done", "idle", "all"} {
+		m.cycleFilter()
+		if m.filter != want {
+			t.Errorf("cycle: got %q, want %q", m.filter, want)
+		}
 	}
 }
 
@@ -291,7 +292,7 @@ func TestCounts(t *testing.T) {
 	m := sampleModel()
 	m.agents = append(m.agents, agent.Agent{ID: 5, Display: "idle"})
 	c := m.counts()
-	want := map[string]int{"all": 5, "working": 2, "blocked": 1, "done": 1, "idle": 1}
+	want := map[string]int{"all": 5, "working": 2, "stalled": 0, "blocked": 1, "done": 1, "idle": 1}
 	for k, v := range want {
 		if c[k] != v {
 			t.Errorf("counts[%q]: got %d, want %d", k, c[k], v)
@@ -372,6 +373,97 @@ func TestActivity(t *testing.T) {
 	}
 }
 
+func TestToolCell(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	running := func(age time.Duration) agent.Agent {
+		return agent.Agent{Tool: "bash: go test ./...", ToolSince: now.Add(-age)}
+	}
+	cases := []struct {
+		name  string
+		in    agent.Agent
+		width int
+		want  string
+	}{
+		{"no tool", agent.Agent{Display: "working", Msg: "fix the tab bar"}, 60, ""},
+		// Under the threshold the number would flicker a single digit on every
+		// tick, so the label goes out on its own.
+		{"a tool that has just started", running(2 * time.Second), 60, "bash: go test ./..."},
+		{"a tool past the threshold", running(4*time.Minute + 12*time.Second), 60, "bash: go test ./... 4m 12s"},
+		{"a tool with no timestamp", agent.Agent{Tool: "bash: go test ./..."}, 60, "bash: go test ./..."},
+		// The time is the reason the line is drawn, so the label pays for it.
+		{"too narrow for both", running(4*time.Minute + 12*time.Second), 20, "bash: go tes… 4m 12s"},
+		// Under minToolLabel there is no label worth keeping beside it.
+		{"too narrow for a label", running(4*time.Minute + 12*time.Second), 12, "bash: go te…"},
+	}
+	for _, tc := range cases {
+		if got := toolCell(now, tc.in, tc.width); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The tool leads line 2 and the prompt follows on a line of its own.
+func TestRowActivityWithATool(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	base := agent.Agent{
+		Display: "working", CWD: "/p/cattery", Msg: "fix the tab bar",
+		ToolSince: now.Add(-(4*time.Minute + 12*time.Second)),
+	}
+	cases := []struct {
+		name  string
+		tool  string
+		inner int
+		want  []string
+	}{
+		{
+			"a label that fits", "bash: go test ./...", 100,
+			[]string{"bash: go test ./... 4m 12s", "fix the tab bar"},
+		},
+		// The long-running command is the one worth timing, so its label is
+		// what the row cuts to keep the number.
+		{
+			"a label that does not", "bash: go test -race -timeout 5m ./internal/overlay/... -run TestRow", 80,
+			[]string{"bash: go test -race -timeout 5m ./internal/overlay/… 4m 12s", "fix the tab bar"},
+		},
+	}
+	for _, tc := range cases {
+		a := base
+		a.Tool = tc.tool
+		if got := rowActivity(now, a, tc.inner); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The row must hold still as the elapsed time grows.
+func TestRowHeightHoldsAsTheElapsedGrows(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	base := agent.Agent{
+		ID: 1, Kind: "pi", Display: "working", CWD: "/p/cattery",
+		Msg:  "fix the tab bar so the marker survives a reload of the configuration",
+		Tool: "bash: go test -race -timeout 5m ./internal/overlay/...",
+	}
+	m := sampleModel()
+
+	// Straddling "9m 59s" -> "10m 00s", where the number gains a cell, at every
+	// width the wrap can fall differently.
+	for inner := 44; inner <= 120; inner++ {
+		heights := make([]int, 0, 2)
+		for _, age := range []time.Duration{9*time.Minute + 59*time.Second, 10 * time.Minute} {
+			a := base
+			a.ToolSince = now.Add(-age)
+			height := rowHeight(now, a, inner)
+			heights = append(heights, height)
+			if drawn := len(m.renderRow(0, a, inner, true)); drawn != height {
+				t.Fatalf("inner=%d age=%v: rowHeight says %d, renderRow drew %d", inner, age, height, drawn)
+			}
+		}
+		if heights[0] != heights[1] {
+			t.Fatalf("inner=%d: row height changed from %d to %d as the elapsed grew", inner, heights[0], heights[1])
+		}
+	}
+}
+
 // The glyphs stay in step with _AGENT_STATE_STYLE in kitty/cattery_tab.py, so a
 // dot means the same thing in the tab bar and in the picker and only the colour
 // separates a finished agent from a running one. Idle is picker-only, because
@@ -380,6 +472,7 @@ func TestStatusGlyph(t *testing.T) {
 	cases := map[string]string{
 		"working": "●",
 		"blocked": "◆",
+		"stalled": "◐",
 		"done":    "●",
 		"idle":    "·",
 	}
@@ -398,6 +491,9 @@ func TestActivityGlyph(t *testing.T) {
 	cases := map[string]string{
 		"blocked": "◆",
 		"done":    "●",
+		// A steady glyph, not the spinner: an animation claiming progress is
+		// what this state exists to stop saying.
+		"stalled": "◐",
 		// Idle's status glyph repeats the middot separator in front of it, so
 		// the row leaves it out.
 		"idle": "",
@@ -420,6 +516,9 @@ func TestTimeLabel(t *testing.T) {
 		{"blocked", agent.Agent{Display: "blocked", Since: now.Add(-30 * time.Second)}, "waiting 30s"},
 		{"done", agent.Agent{Display: "done", Since: now.Add(-6 * time.Minute)}, "6m ago"},
 		{"blocked unknown", agent.Agent{Display: "blocked"}, "waiting"},
+		// Line 1 times the turn, which stalled does not restart. How long the
+		// one tool call has run is on line 2.
+		{"stalled", agent.Agent{Display: "stalled", Since: now.Add(-11 * time.Minute)}, "11m 00s"},
 	}
 	for _, tc := range cases {
 		if got := timeLabel(now, tc.in); got != tc.want {
@@ -438,6 +537,7 @@ func TestMetaRight(t *testing.T) {
 		{"working", agent.Agent{Display: "working", Since: now.Add(-(13*time.Minute + 41*time.Second))}, "13m 41s"},
 		{"done", agent.Agent{Display: "done", Since: now.Add(-2 * time.Minute)}, "finished 2m ago"},
 		{"done unknown", agent.Agent{Display: "done"}, "finished"},
+		{"stalled", agent.Agent{Display: "stalled", Since: now.Add(-11 * time.Minute)}, "11m 00s"},
 		{"idle has no summary", agent.Agent{Display: "idle", Since: now.Add(-time.Minute)}, ""},
 	}
 	for _, tc := range cases {
@@ -844,7 +944,7 @@ func TestRowWrapsTheActivityText(t *testing.T) {
 			if got := len(lines); got != tc.wantLines {
 				t.Fatalf("row height: got %d lines, want %d:\n%s", got, tc.wantLines, strings.Join(lines, "\n"))
 			}
-			if got := rowHeight(a, tc.inner); got != len(lines) {
+			if got := rowHeight(m.now, a, tc.inner); got != len(lines) {
 				t.Fatalf("rowHeight says %d, renderRow drew %d", got, len(lines))
 			}
 			for i, line := range lines {
@@ -1517,7 +1617,7 @@ func TestViewFilterTabs(t *testing.T) {
 		{
 			name:  "all tabs fit at 120 columns",
 			width: 120, filter: "all",
-			want: []string{"all", "working", "blocked", "done", "idle"},
+			want: []string{"all", "working", "stalled", "blocked", "done", "idle"},
 		},
 		{
 			name:  "idle stays visible when tabs collapse",

@@ -27,11 +27,17 @@ const (
 type Agent struct {
 	ID      int
 	Kind    string // AGENT_KIND, e.g. "pi" or "claude"
-	Display string // blocked, done, working, idle
+	Display string // blocked, stalled, done, working, idle
 	Title   string
 	CWD     string
 	Since   time.Time // from AGENT_SINCE; zero when unknown
 	Msg     string    // AGENT_MSG: the latest user prompt, when published
+
+	// Tool is the tool call the agent is running now, "bash: go test ./...",
+	// and ToolSince is when that call started. Both parsers drop them unless
+	// PublishesTool(Kind, Display).
+	Tool      string
+	ToolSince time.Time
 
 	// Host is where the agent runs: HostKitty or HostTmux.
 	Host string
@@ -41,7 +47,9 @@ type Agent struct {
 	Target string
 
 	// CreatedAt is when the host opened the window, a stable session age. Since
-	// resets on every display transition. Zero when the host does not report it.
+	// restamps on a display change, except between working and stalled, so it
+	// times the current turn rather than the session. Zero when the host does
+	// not report it.
 	CreatedAt time.Time
 
 	// Worktrees of one repository share Project and ProjectKey but differ in
@@ -233,6 +241,60 @@ func projectName(commonDir string) string {
 		return filepath.Base(filepath.Dir(commonDir))
 	}
 	return strings.TrimSuffix(base, ".git")
+}
+
+// UnixSeconds reads an AGENT_* value holding a unix timestamp. An unset one is
+// the empty string, and a zero is not a timestamp either: time.Unix(0, 0) is
+// not IsZero, so it would read as 1970 and any "has this run too long" rule
+// would fire on it at once.
+func UnixSeconds(raw string) time.Time {
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || secs <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(secs, 0)
+}
+
+// KindPi is the only agent kind that publishes the running-tool pair.
+const KindPi = "pi"
+
+// PublishesTool reports whether the tool pair on a window or a pane belongs to
+// the agent reading it now. Two things have to hold.
+//
+// The kind has to be the one that publishes it. A window or a pane outlives its
+// agents, and `cattery state clear` drops the state, the kind and the message
+// and nothing else, so a pi killed mid-call leaves its label standing: without
+// the kind test the Claude started in that window reads as stalled from its
+// first second, with the dead pi's command on the row.
+//
+// And the agent has to be running. An idle or a finished agent's label is its
+// own, but the call is over. "stalled" counts as running: the kitty watcher
+// publishes that one itself, and dropping the label there would take the tool
+// line off the row it exists for.
+func PublishesTool(kind, display string) bool {
+	return kind == KindPi && (display == "working" || display == "stalled")
+}
+
+// StallThreshold is how long one tool call has to run before an agent is shown
+// as stalled rather than working. Ten minutes, not five: pi's subagent calls
+// routinely run several minutes, so a shorter threshold would flag ordinary
+// work. Keep it in step with _STALL_THRESHOLD in kitty/cattery_watcher.py:
+// TestStalled here and test_the_threshold_is_ten_minutes there both write the
+// ages out, so moving one number alone fails one of the two.
+const StallThreshold = 10 * time.Minute
+
+// Stalled reports whether one tool call has run long enough to be worth
+// doubting. No agent publishes it: nothing fires while a tool hangs, so a state
+// the writer set would never arrive. The picker derives it on every reload, and
+// the kitty watcher runs the same rule on a timer for the tab marker.
+//
+// An agent that publishes no tool never reaches it, which is what keeps Claude
+// agents out with no special case.
+func Stalled(a Agent, now time.Time) bool {
+	if a.Display != "working" || a.Tool == "" || a.ToolSince.IsZero() {
+		return false
+	}
+	return now.Sub(a.ToolSince) >= StallThreshold
 }
 
 // Sort groups agents by project and orders each group oldest session first.

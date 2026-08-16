@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
@@ -58,12 +59,21 @@ type Client struct {
 	// exe is the cattery binary a viewer tab runs. The picker is that binary,
 	// so a copy installed anywhere still finds itself.
 	exe string
+
+	// now is the clock the stalled rule reads. A field, so a test can fix it.
+	now func() time.Time
 }
 
 // NewClient wires the composite around a kitty client the caller keeps: save
 // and restore need the same one.
 func NewClient(k *kitty.Client) *Client {
-	return &Client{kitty: k, tmux: tmux.NewClient(), repos: agent.NewResolver(), exe: executable()}
+	return &Client{
+		kitty: k,
+		tmux:  tmux.NewClient(),
+		repos: agent.NewResolver(),
+		exe:   executable(),
+		now:   time.Now,
+	}
 }
 
 func executable() string {
@@ -94,12 +104,28 @@ func (c *Client) ListAgents(ctx context.Context) ([]agent.Agent, error) {
 	// One repository pass over the whole set, then one sort, so agents of both
 	// hosts land in the same project groups.
 	c.repos.Populate(ctx, merged)
+	c.markStalled(merged)
 	agent.Sort(merged)
 
 	if err := errors.Join(wrap("kitty", kittyErr), wrap("tmux", tmuxErr)); err != nil {
 		return merged, err
 	}
 	return merged, nil
+}
+
+// markStalled promotes a working agent whose tool has outlived the threshold.
+//
+// Idempotent: an agent the kitty watcher has already moved to "stalled" is not
+// working any more and is left alone. Deriving it here as well is what shows a
+// stalled tmux pane, which has no watcher at all, and a stalled kitty window in
+// a kitty that has not run `cattery setup` since this version.
+func (c *Client) markStalled(agents []agent.Agent) {
+	now := c.now()
+	for i := range agents {
+		if agent.Stalled(agents[i], now) {
+			agents[i].Display = "stalled"
+		}
+	}
 }
 
 // wrap names the host a failure came from. The picker draws the message with

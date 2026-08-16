@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
@@ -137,7 +139,7 @@ func (f *fakeTmux) MarkSeen(_ context.Context, target string) error {
 }
 
 func newTestClient(k *fakeKitty, tm *fakeTmux) *Client {
-	return &Client{kitty: k, tmux: tm, repos: agent.NewResolver(), exe: "/usr/local/bin/cattery"}
+	return &Client{kitty: k, tmux: tm, repos: agent.NewResolver(), exe: "/usr/local/bin/cattery", now: time.Now}
 }
 
 func TestListAgents(t *testing.T) {
@@ -173,6 +175,41 @@ func TestListAgents(t *testing.T) {
 		// Sorted once, over everything: inside one project the order is by id.
 		if want := []string{"kitty:2", "kitty:4", "tmux:%17"}; !slices.Equal(keys, want) {
 			t.Fatalf("order: got %v, want %v", keys, want)
+		}
+	})
+
+	// Derived here rather than published: nothing fires while a tool hangs, so
+	// a state the writer set would never arrive. Doing it in the merge covers
+	// both hosts, including tmux, which has no watcher at all.
+	t.Run("a tool that has run too long reads as stalled", func(t *testing.T) {
+		now := time.Unix(1700000000, 0)
+		ago := func(d time.Duration) time.Time { return now.Add(-d) }
+		client := newTestClient(
+			&fakeKitty{agents: []agent.Agent{
+				{ID: 1, Host: agent.HostKitty, Display: "working", Tool: "bash: sleep 900", ToolSince: ago(11 * time.Minute)},
+				{ID: 2, Host: agent.HostKitty, Display: "working", Tool: "bash: go test", ToolSince: ago(time.Minute)},
+				// A Claude agent publishes no tool, so it never gets here.
+				{ID: 3, Host: agent.HostKitty, Display: "working"},
+			}},
+			&fakeTmux{agents: []agent.Agent{
+				{ID: 17, Host: agent.HostTmux, Display: "working", Tool: "bash: sleep 900", ToolSince: ago(time.Hour)},
+			}},
+		)
+		client.now = func() time.Time { return now }
+
+		got, err := client.ListAgents(context.Background())
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		displays := map[string]string{}
+		for _, a := range got {
+			displays[a.Key()] = a.Display
+		}
+		want := map[string]string{
+			"kitty:1": "stalled", "kitty:2": "working", "kitty:3": "working", "tmux:%17": "stalled",
+		}
+		if !maps.Equal(displays, want) {
+			t.Fatalf("displays: got %v, want %v", displays, want)
 		}
 	})
 

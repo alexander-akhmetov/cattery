@@ -4,18 +4,24 @@ pi and Claude Code publish into a display state that also knows whether the user
 has looked at the window.
 
 Contract:
-    AGENT_KIND     "pi" | "claude"                    (set by the agent)
-    AGENT_STATE    "working" | "blocked" | "idle"     (set by the agent)
-    AGENT_DISPLAY  "working" | "blocked" | "done" | "idle"
-                   (set here, read by cattery_tab.py and the kittens)
-    AGENT_SINCE    unix seconds of the last AGENT_DISPLAY change
-                   (set here, read by the Go picker)
+    AGENT_KIND        "pi" | "claude"                    (set by the agent)
+    AGENT_STATE       "working" | "blocked" | "idle"     (set by the agent)
+    AGENT_TOOL        the tool call running now          (set by the agent, pi only)
+    AGENT_TOOL_SINCE  unix seconds when that call started (set by the agent)
+    AGENT_DISPLAY     "working" | "stalled" | "blocked" | "done" | "idle"
+                      (set here, read by cattery_tab.py and the kittens)
+    AGENT_SINCE       unix seconds of the last AGENT_DISPLAY change
+                      (set here, read by the Go picker)
 
 Display derivation:
-    working  -> working   (seen state cleared)
+    working  -> working, or stalled when one tool call has run past
+                _STALL_THRESHOLD   (seen state cleared)
     blocked  -> blocked   (seen state cleared)
-    idle     -> done when the agent had been working or blocked and the window
-                has not been focused since, else idle
+    idle     -> done when the agent had been working, stalled or blocked and the
+                window has not been focused since, else idle
+
+Nothing fires while a tool hangs, so a window can sit in "working" until its
+next event. One repeating timer sweeps the working windows for it.
 
 Shared state lives on the `boss` object, so the watcher, cattery_tab.py, and the
 kittens see one view with no state file and no daemon. The tab bar loads
@@ -29,6 +35,8 @@ cattery_tab.py through runpy, which gives it no shared sys.path.
                                         for the transitions, in the order they
                                         registered. cattery_events.py puts them
                                         there.
+    boss._agent_timer  int | None       the id of the stall sweep's timer, so a
+                                        config reload does not start a second
 
 Side effects on a transition:
     * set AGENT_DISPLAY on the window
@@ -39,7 +47,7 @@ Side effects on a transition:
     * one JSON datagram per registered subscriber
 
 Re-entrancy: writing AGENT_DISPLAY fires on_set_user_var again, so every key
-other than AGENT_STATE and AGENT_KIND is ignored.
+other than AGENT_STATE, AGENT_KIND and AGENT_TOOL is ignored.
 """
 
 import errno
@@ -65,20 +73,46 @@ except ImportError:  # kitty older than the notification manager
 # it, which keeps it from surviving as stale state on the window.
 _SEEN_KEY = "AGENT_SEEN"
 
+# The key naming the tool call in flight, and the only agent kind that writes
+# it. AGENT_TOOL_SINCE is deliberately not an input key: the writer sets it
+# first, so reacting to it would apply the new timestamp against the previous
+# label.
+_TOOL_KEY = "AGENT_TOOL"
+_TOOL_KIND = "pi"
+
 # The keys the watcher reacts to. AGENT_DISPLAY is its own output, and ignoring
 # it breaks the feedback loop. Other software's user variables stop here too.
-_INPUT_KEYS = ("AGENT_STATE", "AGENT_KIND", _SEEN_KEY)
+_INPUT_KEYS = ("AGENT_STATE", "AGENT_KIND", _TOOL_KEY, _SEEN_KEY)
+
+# How long one tool call has to run before a working agent reads as stalled, and
+# how often the sweep looks. Ten minutes, not five: pi's subagent calls routinely
+# run several minutes, so a shorter threshold would flag ordinary work. A minute
+# of granularity against that threshold is close enough, so the picker, which
+# reloads every second, can show stalled up to a minute before the tab does. Keep
+# the threshold in step with StallThreshold in internal/agent:
+# test_the_threshold_is_ten_minutes and TestStalled there both write the ages
+# out, so moving one number alone fails one of the two.
+_STALL_THRESHOLD = 600.0
+_SWEEP_INTERVAL = 60.0
 
 # Display states we care about for notifications and the OS-window summary.
-_ATTENTION = ("blocked", "done")
+_ATTENTION = ("blocked", "done", "stalled")
 
 # Displays meaning "this agent has done something", which can turn into "done"
-# when the agent goes idle unseen.
-_WORKED = ("working", "blocked", "done")
+# when the agent goes idle unseen. "stalled" belongs here: without it a run
+# going working -> stalled -> idle finishes with no marker and no notification,
+# which is the agent you most wanted to hear about.
+_WORKED = ("working", "blocked", "done", "stalled")
+
+# The displays that are one turn seen twice. AGENT_SINCE is not restamped when
+# an agent moves between them, or the tab's elapsed minutes would reset to zero
+# exactly when the number starts mattering.
+_TURN = ("working", "stalled")
 
 _TITLE_TPL = {
     "blocked": "Agent needs input",
     "done": "Agent finished",
+    "stalled": "Agent may be stuck",
     "working": "Agent",
     "idle": "Agent",
 }
@@ -109,6 +143,8 @@ def _ensure_state(boss: Boss) -> None:
         boss._agent_titles = {}
     if not hasattr(boss, "_agent_subs"):
         boss._agent_subs = {}
+    if not hasattr(boss, "_agent_timer"):
+        boss._agent_timer = None
 
 
 def _derive_display(
@@ -117,6 +153,7 @@ def _derive_display(
     seen: set,
     is_focused: bool,
     prev: str | None,
+    tool_since: float | None,
 ) -> str | None:
     """
     Compute AGENT_DISPLAY from AGENT_STATE.
@@ -131,11 +168,17 @@ def _derive_display(
     something you have not looked at", so only a state that did work reaches it.
     Agents announce `idle` when they start, as pi does on session_start, and a
     session started in an unfocused window must not claim to have finished.
+
+    `tool_since` is when the tool call in flight started, and None when the
+    agent publishes none. An agent without one never reads as stalled, which is
+    what keeps Claude agents out of that state with no special case.
     """
     if state in ("working", "blocked"):
         # Activity beats "seen". An agent that went back to work should remind
         # the user again when it next finishes.
         seen.discard(window_id)
+        if state == "working" and tool_since is not None and time.time() - tool_since >= _STALL_THRESHOLD:
+            return "stalled"
         return state
     if state == "idle":
         if is_focused:
@@ -370,13 +413,34 @@ def _redraw(boss: Boss, window: Window) -> None:
         tm.mark_tab_bar_dirty()
 
 
+def _tool_since(window: Window) -> float | None:
+    """When the tool call this window is running started, or None.
+
+    Only pi publishes the pair, and only pi clears it. A window outlives its
+    agents and `cattery state clear` drops AGENT_STATE, AGENT_KIND and AGENT_MSG
+    and nothing else, so a pi killed mid-call leaves its label standing: without
+    the kind test the Claude started in that window would go stalled, and
+    notify, inside its first second.
+    """
+    if window.user_vars.get("AGENT_KIND") != _TOOL_KIND:
+        return None
+    if not window.user_vars.get(_TOOL_KEY):
+        return None
+    try:
+        secs = float(window.user_vars.get("AGENT_TOOL_SINCE"))
+    except (TypeError, ValueError):
+        return None
+    # A zero is not a timestamp either, and would read as 1970.
+    return secs if secs > 0 else None
+
+
 def _apply(boss: Boss, window: Window) -> None:
     """Recompute AGENT_DISPLAY for a window and fan out side-effects."""
     _ensure_state(boss)
     state = window.user_vars.get("AGENT_STATE")
     kind = window.user_vars.get("AGENT_KIND", "")
     prev = window.user_vars.get("AGENT_DISPLAY")
-    display = _derive_display(state, window.id, boss._agent_seen, bool(window.is_focused), prev)
+    display = _derive_display(state, window.id, boss._agent_seen, bool(window.is_focused), prev, _tool_since(window))
 
     if display is None:
         # The agent cleared its state, or never had one. Drop this watcher's
@@ -395,8 +459,10 @@ def _apply(boss: Boss, window: Window) -> None:
         # set_user_var fires on_set_user_var again, but the guard there ignores
         # AGENT_DISPLAY and AGENT_SINCE, so this does not recurse.
         window.set_user_var("AGENT_DISPLAY", display)
-        # Wall-clock seconds, read by the tab bar and the picker.
-        window.set_user_var("AGENT_SINCE", str(int(time.time())))
+        # Wall-clock seconds, read by the tab bar and the picker. A _TURN pair
+        # keeps the stamp it has.
+        if not (prev in _TURN and display in _TURN):
+            window.set_user_var("AGENT_SINCE", str(int(time.time())))
         _redraw(boss, window)
         _update_os_title(boss, window.os_window_id)
 
@@ -406,11 +472,63 @@ def _apply(boss: Boss, window: Window) -> None:
         _publish(boss, window, prev, display)
 
 
+def _sweep(boss: Boss) -> None:
+    """Re-derive the display of every window whose agent is working.
+
+    A hung tool call fires no event at all, so without this a window sits in
+    "working" until something else recomputes it.
+
+    Filtered to AGENT_STATE == "working" on purpose. _apply's "no display"
+    branch marks the tab bar dirty and rewrites the OS-window title
+    unconditionally, so an unfiltered sweep would do both for every window in
+    the process, once a minute, forever.
+
+    A timer callback that raises takes the timer with it, so nothing escapes.
+    The guard is per window: kitty can tear one down between the snapshot and
+    the _apply, and one raising window must not skip every window behind it in
+    the iteration order, on this sweep and on all the ones after.
+    """
+    for window in list(boss.window_id_map.values()):
+        try:
+            if window.user_vars.get("AGENT_STATE") == "working":
+                _apply(boss, window)
+        except Exception:
+            continue
+
+
+def _start_sweep(boss: Boss) -> None:
+    """Arm the one repeating timer behind the "stalled" display.
+
+    add_timer is exported by kitty.fast_data_types on 0.48.1 but appears in no
+    documentation page, so the import is guarded the way _write_os_title guards
+    set_os_window_title. Without it the tab marker reaches stalled only when
+    some other event recomputes the window; the picker derives the same rule for
+    itself, so its rows are unaffected either way.
+
+    The id lives on `boss`, never in a module global: a config reload
+    re-executes this module against the same boss, and a module global would
+    leak one timer per reload.
+    """
+    _ensure_state(boss)
+    if boss._agent_timer is not None:
+        return
+    try:
+        from kitty.fast_data_types import add_timer  # type: ignore
+    except ImportError:
+        return
+    try:
+        boss._agent_timer = add_timer(lambda *args: _sweep(boss), _SWEEP_INTERVAL, True)
+    except Exception:
+        boss._agent_timer = None
+
+
 # --- watcher entry points (called by kitty) ----------------------------------
 
 
 def on_load(boss: Boss, data: dict[str, Any]) -> None:
+    # A global watcher, so this runs once per kitty process.
     _ensure_state(boss)
+    _start_sweep(boss)
 
 
 def on_set_user_var(boss: Boss, window: Window, data: dict[str, Any]) -> None:

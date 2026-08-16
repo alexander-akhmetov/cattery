@@ -45,15 +45,18 @@ func TestDisplay(t *testing.T) {
 	}
 }
 
-// pane builds one list-panes row the way listFormat prints it.
-func pane(id, session, index, name, path, title, kind, state, msg, since, worked, seen string) string {
-	return strings.Join([]string{id, session, index, name, path, title, kind, state, msg, since, worked, seen}, fieldSep)
+// pane builds one list-panes row the way listFormat prints it. The tool pair is
+// on the end, where listFormat puts it, and empty unless a case is about it.
+func pane(id, session, index, name, path, title, kind, state, msg, since, worked, seen string, tool ...string) string {
+	fields := []string{id, session, index, name, path, title, kind, state, msg, since, worked, seen, "", ""}
+	copy(fields[fTool:], tool)
+	return strings.Join(fields, fieldSep)
 }
 
 // A kontora agent: one detached window per ticket, named after the ticket, with
 // the worktree as its directory.
-const kontoraPane = "%17\x1fkontora\x1f3\x1fal-67je\x1f/Users/x/.kontora/worktrees/astra-l/al-67je" +
-	"\x1f◐ Run /code-review\x1fclaude\x1fworking\x1frun the review\x1f1700000000\x1f1\x1f"
+var kontoraPane = pane("%17", "kontora", "3", "al-67je", "/Users/x/.kontora/worktrees/astra-l/al-67je",
+	"◐ Run /code-review", "claude", "working", "run the review", "1700000000", "1", "")
 
 func TestListAgents(t *testing.T) {
 	t.Run("a kontora agent", func(t *testing.T) {
@@ -196,6 +199,70 @@ func TestListAgents(t *testing.T) {
 		}
 	})
 
+	// A pane keeps its options after the agent in it dies, and `cattery state
+	// clear` drops only the state, the kind and the message. So the tool a
+	// killed pi was running would otherwise pin a label on the next agent, and
+	// with it an hours-old timestamp that reads as stalled at once.
+	t.Run("the running tool", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			kind      string
+			state     string
+			tool      string
+			since     string
+			wantTool  string
+			wantSince time.Time
+		}{
+			{
+				name: "a working agent", state: "working",
+				tool: "bash: go test ./...", since: "1700000000",
+				wantTool: "bash: go test ./...", wantSince: time.Unix(1700000000, 0),
+			},
+			{name: "an idle agent ignores a stale label", state: "idle", tool: "bash: go test ./...", since: "1700000000"},
+			{
+				// The pane a killed pi left behind. `cattery state clear` drops
+				// the state, the kind and the message and nothing else, so
+				// without the kind test the next agent wears the dead pi's
+				// label and reads as stalled at once.
+				name: "a claude agent in a pane a pi died in", kind: "claude", state: "working",
+				tool: "bash: sleep 900", since: "1700000000",
+			},
+			{name: "no tool published", state: "working"},
+			{
+				name: "a label with no timestamp", state: "working", tool: "bash: go test ./...",
+				wantTool: "bash: go test ./...",
+			},
+			{name: "a zero timestamp is not a timestamp", state: "working", tool: "x", since: "0", wantTool: "x"},
+			{name: "an unparsable timestamp is dropped", state: "working", tool: "x", since: "soon", wantTool: "x"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				kind := tc.kind
+				if kind == "" {
+					// pi is the only kind that publishes a tool, so every case
+					// that is not about the kind is a pi agent.
+					kind = "pi"
+				}
+				row := pane("%1", "work", "0", "w", "/p", "t", kind, tc.state, "", "", "1", "", tc.tool, tc.since)
+				client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+row+"\nEOF")}
+
+				agents, err := client.ListAgents(context.Background())
+				if err != nil {
+					t.Fatalf("list: %v", err)
+				}
+				if len(agents) != 1 {
+					t.Fatalf("got %d agents, want 1", len(agents))
+				}
+				if got := agents[0].Tool; got != tc.wantTool {
+					t.Errorf("tool: got %q, want %q", got, tc.wantTool)
+				}
+				if got := agents[0].ToolSince; !got.Equal(tc.wantSince) {
+					t.Errorf("tool since: got %v, want %v", got, tc.wantSince)
+				}
+			})
+		}
+	})
+
 	t.Run("the query tmux runs", func(t *testing.T) {
 		log := filepath.Join(t.TempDir(), "argv")
 		client := &Client{tmux: fakeTmux(t, `printf '%s\n' "$@" > `+log)}
@@ -208,7 +275,7 @@ func TestListAgents(t *testing.T) {
 		if !slices.Equal(args, want) {
 			t.Fatalf("argv: got %v, want %v", args, want)
 		}
-		for _, option := range []string{optKind, optState, optMsg, optSince, optWorked, optSeen} {
+		for _, option := range []string{optKind, optState, optMsg, optSince, optWorked, optSeen, optTool, optToolSince} {
 			if !strings.Contains(listFormat, "#{"+option+"}") {
 				t.Errorf("format does not ask for %s: %s", option, listFormat)
 			}
