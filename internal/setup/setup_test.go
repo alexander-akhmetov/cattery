@@ -1351,7 +1351,13 @@ func TestPluginManifests(t *testing.T) {
 			market:      claudeMarketplace,
 			kind:        "claude",
 			wantSource:  `"./claude"`,
-			events:      claudeHooks,
+			events: []struct{ Event, State, Matcher string }{
+				{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
+				{Event: "Notification", State: "blocked", Matcher: "permission_prompt"},
+				{Event: "UserPromptSubmit", State: "working"},
+				{Event: "Stop", State: "idle"},
+				{Event: "SessionEnd", State: "clear"},
+			},
 		},
 		{
 			name:           "codex",

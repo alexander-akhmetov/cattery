@@ -20,12 +20,12 @@ import (
 // internal/state. The writer checks the payload's source as well, for a Claude
 // that predates the matcher.
 //
-// The plugin manifest is what Claude reads. This list is what the tests hold it
-// to, and what the removal below looks for in a settings.json an older release
-// merged its hooks into.
+// Notification needs a matcher because idle_prompt fires on an ordinary
+// finished turn with a usable editor. permission_prompt fires only after an
+// approval or question has waited for the user.
 var claudeHooks = []struct{ Event, State, Matcher string }{
 	{Event: "SessionStart", State: "idle", Matcher: "startup|resume|clear"},
-	{Event: "Notification", State: "blocked"},
+	{Event: "Notification", State: "blocked", Matcher: "permission_prompt"},
 	{Event: "UserPromptSubmit", State: "working"},
 	{Event: "Stop", State: "idle"},
 	{Event: "SessionEnd", State: "clear"},
