@@ -136,6 +136,26 @@ files with the embedded ones and warns.
   nothing else. `@AGENT_MSG` carries raw prompt text, so both writers escape a
   trailing ";" as `\;`. Without that escape a prompt ending in ";" loses that
   character, and a prompt that is only ";" drops every update chained behind it.
+- kitty computes `is_self` from `$KITTY_WINDOW_ID` in the calling kitten's own
+  environment, not from the socket the request arrived on: `env
+  KITTY_WINDOW_ID=1 kitten @ ls` marks no window at all. A tmux server inherits
+  the environment of whatever started it, so a pane carries an unrelated
+  window's id, and that window would report itself as the caller. Left alone, a
+  consumer excluding itself would exclude a stranger and type at itself.
+  `agents.Client.markSelf` clears every kitty `Self` when `$TMUX` and
+  `$TMUX_PANE` are set and marks the pane instead, tmux first and kitty's answer
+  not consulted, the order `state.New` picks its transport in.
+- A kitty window can list with `AGENT_DISPLAY` and no `AGENT_STATE`. `cattery
+  state clear` drops the state, and `AGENT_DISPLAY` is the watcher's own output
+  that no writer clears, so a killed agent leaves its marker standing. Anything
+  gating on the raw state has to read that empty word as "no agent", never as
+  "idle". `cattery list --json` reports both words for that reason, and the two
+  also disagree on a live agent: `done` and `stalled` are displays that no agent
+  publishes.
+- `foreground_processes` is a list, and its first entry is the sandbox's log
+  reader for every agent behind `nono run`, the same fact behind the
+  `--use-foreground-process` rule above. `cattery list` publishes all of them
+  with their argv and lets the caller match, rather than picking one.
 - The read-write drawer types at an agent, which reverses what the rest of the
   tmux path is careful about: `cattery attach` is read-only on purpose.
   `send-keys` is a server-side command and is not constrained by that, so the
@@ -371,7 +391,13 @@ files with the embedded ones and warns.
   agent out of the picker rather than showing bad text. The extension strips C0
   and C1 in `setUserVars`, the batched publish path, so every value is covered
   and not only the ones `sanitizeMessage` builds: JavaScript's `\s` matches
-  neither `\x1f` nor `\x1b`.
+  neither `\x1f` nor `\x1b`. A new `listFormat` field goes on the end and its
+  `iota` entry with it, so every existing index keeps its meaning; a placeholder
+  added without that entry makes every row one field too wide and empties every
+  tmux agent out of the picker in silence, which `TestListFormatFieldCount`
+  guards. `#{pane_start_time}` is not a tmux format (checked on 3.7c) and prints
+  empty rather than failing, which is why a tmux agent has no window age to
+  fingerprint with.
 - A number that grows inside wrapped text moves the wrap, which breaks the
   `rowHeight`/`renderRow` agreement above. `ansi.Wrap` eats one space at each
   break, so padding the number to a fixed width does not survive `splitWrap`.

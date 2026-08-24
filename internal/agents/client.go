@@ -62,6 +62,10 @@ type Client struct {
 
 	// now is the clock the stalled rule reads. A field, so a test can fix it.
 	now func() time.Time
+
+	// selfPane is $TMUX_PANE when the caller runs inside tmux, and markSelf's
+	// whole input. A field, so a test can set it.
+	selfPane string
 }
 
 // NewClient wires the composite around a kitty client the caller keeps: save
@@ -73,7 +77,18 @@ func NewClient(k *kitty.Client) *Client {
 		repos: agent.NewResolver(),
 		exe:   executable(),
 		now:   time.Now,
+		// tmux first, and kitty's own answer is not consulted, the order
+		// state.New picks its transport in and for the same reason.
+		selfPane: tmuxPane(),
 	}
+}
+
+// tmuxPane is the pane the caller runs in, empty outside tmux.
+func tmuxPane() string {
+	if os.Getenv("TMUX") == "" {
+		return ""
+	}
+	return os.Getenv("TMUX_PANE")
 }
 
 func executable() string {
@@ -105,6 +120,7 @@ func (c *Client) ListAgents(ctx context.Context) ([]agent.Agent, error) {
 	// hosts land in the same project groups.
 	c.repos.Populate(ctx, merged)
 	c.markStalled(merged)
+	c.markSelf(merged)
 	agent.Sort(merged)
 
 	if err := errors.Join(wrap("kitty", kittyErr), wrap("tmux", tmuxErr)); err != nil {
@@ -125,6 +141,24 @@ func (c *Client) markStalled(agents []agent.Agent) {
 		if agent.Stalled(agents[i], now) {
 			agents[i].Display = "stalled"
 		}
+	}
+}
+
+// markSelf points Self at the window or pane this process runs in.
+//
+// kitty answers is_self from $KITTY_WINDOW_ID in the calling kitten's own
+// environment, not from the socket the request came over. A tmux server
+// inherits the environment of whatever started it, so a pane can carry an
+// unrelated window's KITTY_WINDOW_ID, and that window would report itself as
+// the caller. So a caller inside tmux discards kitty's answer and takes its own
+// pane instead, the order state.New picks its transport in.
+func (c *Client) markSelf(agents []agent.Agent) {
+	if c.selfPane == "" {
+		return
+	}
+	key := agent.HostTmux + ":" + c.selfPane
+	for i := range agents {
+		agents[i].Self = agents[i].Key() == key
 	}
 }
 

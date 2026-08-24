@@ -3,7 +3,9 @@
 //
 //	cattery                  the picker, a full-screen list kitty runs in an
 //	                         overlay window
-//	cattery -print           the same inventory without the TUI
+//	cattery list [-json]     the same inventory without the TUI, as columns
+//	                         or as one JSON object
+//	cattery -print           an alias for `cattery list`
 //	cattery -version         print the version and exit
 //	cattery help [command]   the command list, or one command
 //	cattery setup            install the kitty files and the config they need
@@ -43,7 +45,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/alexander-akhmetov/cattery"
-	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/agents"
 	"github.com/alexander-akhmetov/cattery/internal/events"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
@@ -58,7 +59,7 @@ import (
 // be exhaustive.
 const (
 	cmdPicker  = "picker"
-	cmdPrint   = "print"
+	cmdList    = "list"
 	cmdSetup   = "setup"
 	cmdState   = "state"
 	cmdSave    = "save"
@@ -153,6 +154,40 @@ The picker does this for you on Enter, and "cattery -print" prints the target
 of every tmux agent.`,
 	},
 	{
+		name:    cmdList,
+		summary: "print every agent, as columns or as JSON",
+		details: `Prints one line per agent, the same inventory the picker shows and in the
+same order. -json prints the whole thing as one object instead, with the
+facts the columns have no room for: the resume command, the process
+fingerprint, and which row is the window or pane you ran this from.
+
+Nothing is filtered. Read "state" to decide whether an agent can take input
+and "display" to show what cattery shows, because the two disagree on
+purpose: no agent publishes "done" or "stalled". A finished Claude is state
+idle, display done; a pi whose tool has run past ten minutes is state
+working, display stalled.
+
+A row with a display and no state is a window whose agent was killed:
+"cattery state clear" drops the state, and nothing clears the watcher's own
+display. That empty word means "nothing to type at", never "idle".
+
+The fingerprint differs per host. A kitty row carries the window pid and
+every foreground process with its argv, because the first of those is often
+a wrapper rather than the agent. A tmux row carries the pane pid and the
+pane's current command, which is a name and never argv, and it has no window
+age at all.
+
+"self" is on the window or pane this command ran in, and on nothing when you
+did not start it from an agent.
+
+A host that fails costs only its own rows: the other host's still print, the
+failure goes under "errors" as well as onto stderr, and the exit code is 1.
+A kitty agent appears only once "cattery setup" has installed the watcher
+that derives AGENT_DISPLAY.
+
+"cattery events" is the stream; this is the snapshot.`,
+	},
+	{
 		name:    cmdEvents,
 		summary: "print agent state transitions as JSON lines",
 		details: `Prints one JSON object per agent state change, until you interrupt it or the
@@ -243,12 +278,8 @@ func run(args []string) int {
 		return runAttach(tmux.NewClient(), cmd.args)
 	case cmdEvents:
 		return runEvents(kitty.NewClient(), os.Stdout, cmd.args)
-	case cmdPrint:
-		if err := printAgents(agents.NewClient(kitty.NewClient()), os.Stdout); err != nil {
-			fmt.Fprintln(os.Stderr, "cattery:", err)
-			return 1
-		}
-		return 0
+	case cmdList:
+		return runList(agents.NewClient(kitty.NewClient()), os.Stdout, cmd.args)
 	default:
 		snapshots := kitty.NewClient()
 		program := tea.NewProgram(overlay.New(agents.NewClient(snapshots), snapshots), tea.WithAltScreen())
@@ -294,7 +325,7 @@ func route(args []string) (command, error) {
 	case *showVersion:
 		return command{name: cmdVersion}, nil
 	case *printOnly:
-		return command{name: cmdPrint}, nil
+		return command{name: cmdList}, nil
 	default:
 		return command{name: cmdPicker}, nil
 	}
@@ -436,7 +467,7 @@ func newFlagSet(name string) *flag.FlagSet {
 
 func pickerFlags() (*flag.FlagSet, *bool, *bool) {
 	flags := flag.NewFlagSet("cattery", flag.ContinueOnError)
-	printOnly := flags.Bool("print", false, "list agent windows and exit (no TUI); useful for debugging")
+	printOnly := flags.Bool("print", false, "an alias for `cattery list`: print every agent and exit, without the TUI")
 	showVersion := flags.Bool("version", false, "print the version and exit")
 	return flags, printOnly, showVersion
 }
@@ -451,6 +482,9 @@ func commandFlags(name string) *flag.FlagSet {
 		return flags
 	case cmdRestore:
 		flags, _ := restoreFlags()
+		return flags
+	case cmdList:
+		flags, _ := listFlags()
 		return flags
 	default:
 		return nil
@@ -598,35 +632,6 @@ func flagExit(err error) int {
 		fmt.Fprintln(os.Stderr, "cattery:", err)
 	}
 	return 2
-}
-
-// lister is the inventory `-print` reads, an interface so a test can print
-// without a kitty or a tmux server.
-type lister interface {
-	ListAgents(ctx context.Context) ([]agent.Agent, error)
-}
-
-// printAgents writes the inventory as one line per agent. A tmux row carries
-// the target `cattery attach` takes; a kitty row is reached by window id and
-// has none.
-//
-// A host that failed still returns the other's rows, so they are printed before
-// the error goes back.
-func printAgents(client lister, out io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	agents, err := client.ListAgents(ctx)
-	for _, a := range agents {
-		target := ""
-		if a.Target != "" {
-			target = " target=" + a.Target
-		}
-		// The kind column is 8 wide because "opencode" is, and a kind that
-		// overruns its column shifts the whole rest of that row.
-		fmt.Fprintf(out, "%-16s %-7s %-8s host=%-5s id=%-5d %-24s %s%s\n",
-			a.Project, a.Display, a.Kind, a.Host, a.ID, a.Branch, a.CWD, target)
-	}
-	return err
 }
 
 // exitKittyGone says the kitty that took the subscription has exited. It is

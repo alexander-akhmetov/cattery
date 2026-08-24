@@ -65,8 +65,9 @@ Codex hooks are trust-gated. Open `/hooks` in Codex and trust each
 `cattery-codex@cattery` entry. Until you do, Codex skips them without a word.
 Claude needs no such step.
 
-`cattery -version` prints the release the binary was built from. `cattery help`
-lists the commands, and `cattery help <command>` says what one of them does.
+`cattery -version` prints the release the binary was built from. `cattery list`
+prints every agent without the picker. `cattery help` lists the commands, and
+`cattery help <command>` says what one of them does.
 
 ## Quick start
 
@@ -214,6 +215,114 @@ If an agent does not show up, check what it wrote on its pane:
 ```bash
 tmux list-panes -a -F '#{pane_id} #{@AGENT_STATE} #{@AGENT_KIND} #{@AGENT_TOOL}'
 ```
+
+## Listing agents
+
+`cattery list` prints the inventory the picker shows, one line per agent, in the
+same order. `cattery -print` is an alias for it.
+
+`cattery list --json` prints the whole thing as one object, with the facts the
+columns have no room for: the resume command, the process fingerprint, and which
+row is the window or pane you ran it from. `cattery events` is the stream, and
+this is the snapshot.
+
+```console
+$ cattery list --json
+{
+  "cattery": "0.14.2",
+  "agents": [
+    {
+      "key": "kitty:324",
+      "host": "kitty",
+      "id": 324,
+      "self": true,
+      "kind": "pi",
+      "state": "working",
+      "display": "stalled",
+      "title": "π - cattery",
+      "cwd": "/Users/you/projects/cattery",
+      "msg": "add cattery list",
+      "tool": "bash: go test ./...",
+      "tool_since": 1787562558,
+      "since": 1787562500,
+      "created_at": 1787522022,
+      "resume": "pi --session /Users/you/.pi/agent/sessions/01a0309d.jsonl",
+      "project": "cattery",
+      "branch": "main",
+      "pid": 25636,
+      "foreground_processes": [
+        {"pid": 23053, "cmdline": ["/usr/bin/log", "stream"], "cwd": "/Users/you/projects/cattery"},
+        {"pid": 23051, "cmdline": ["nono", "run", "--", "pi"], "cwd": "/Users/you/projects/cattery"}
+      ]
+    },
+    {
+      "key": "tmux:%17",
+      "host": "tmux",
+      "id": 17,
+      "kind": "claude",
+      "state": "idle",
+      "display": "done",
+      "title": "◐ Run /code-review",
+      "cwd": "/Users/you/.worktrees/myapp/feat-42",
+      "since": 1787562000,
+      "target": "dev:3.%17",
+      "resume": "claude --resume abc-123",
+      "project": "myapp",
+      "branch": "wt/feat-42",
+      "pid": 86369,
+      "command": "claude"
+    }
+  ]
+}
+```
+
+`key`, `host`, `id` and `display` are always there. Every other field is left out
+when it is empty.
+
+| Field | Meaning |
+|---|---|
+| `cattery` | the release that produced this snapshot |
+| `errors` | one string per host that failed, absent when both answered |
+| `key` | unique across hosts and reloads |
+| `host` | `kitty` or `tmux` |
+| `id` | the kitty window id, or the tmux pane id without its `%` |
+| `self` | the window or pane you ran the command in |
+| `kind` | `pi`, `claude`, `codex` or `opencode` |
+| `state` | what the agent itself last published |
+| `display` | what cattery shows for it |
+| `title` | the window or pane title |
+| `cwd` | the agent's directory |
+| `msg` | the prompt the agent is on |
+| `tool` | the tool call it is running, pi and opencode only |
+| `tool_since` | when that call started |
+| `since` | when it entered this state |
+| `created_at` | when the kitty window opened |
+| `target` | tmux only: what `cattery attach` takes |
+| `resume` | the command that reopens the session |
+| `project`, `project_key`, `root`, `branch` | the git grouping |
+| `pid` | the window's own process, or `#{pane_pid}` |
+| `command` | tmux only: `#{pane_current_command}`, a name and never argv |
+| `foreground_processes` | kitty only: every foreground process, with its argv |
+
+Every timestamp is unix seconds, and one nobody set is left out rather than
+written as 0.
+
+Four things to know:
+
+* `state` and `display` disagree on purpose. No agent publishes `done` or
+  `stalled`: `done` means it finished while you were looking elsewhere, and
+  `stalled` means one tool call outran ten minutes. Gate on `state`, show
+  `display`.
+* A row with a `display` and no `state` is a window whose agent was killed.
+  `cattery state clear` drops the state, and nothing clears the display cattery
+  derived from it. Read that empty word as "nothing to type at", never as
+  "idle".
+* The fingerprint is weaker on tmux. A kitty row lists every foreground process
+  with its argv, and the first is often a wrapper rather than the agent. A tmux
+  pane reports a command name, no argv, and no window age at all.
+* A host that fails costs only its own rows. The other host's still print, the
+  failure goes under `errors` as well as onto stderr, and the exit code is 1. A
+  tmux with no server running is not a failure.
 
 ## Events
 

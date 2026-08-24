@@ -186,7 +186,7 @@ func TestListAgents(t *testing.T) {
 		ago := func(d time.Duration) time.Time { return now.Add(-d) }
 		client := newTestClient(
 			&fakeKitty{agents: []agent.Agent{
-				{ID: 1, Host: agent.HostKitty, Display: "working", Tool: "bash: sleep 900", ToolSince: ago(11 * time.Minute)},
+				{ID: 1, Host: agent.HostKitty, Display: "working", State: "working", Tool: "bash: sleep 900", ToolSince: ago(11 * time.Minute)},
 				{ID: 2, Host: agent.HostKitty, Display: "working", Tool: "bash: go test", ToolSince: ago(time.Minute)},
 				// A Claude agent publishes no tool, so it never gets here.
 				{ID: 3, Host: agent.HostKitty, Display: "working"},
@@ -210,6 +210,59 @@ func TestListAgents(t *testing.T) {
 		}
 		if !maps.Equal(displays, want) {
 			t.Fatalf("displays: got %v, want %v", displays, want)
+		}
+		// "stalled" is a display and nothing else: the agent still says it is
+		// working, which is what a caller asking whether it can take input reads.
+		for _, a := range got {
+			if a.Key() == "kitty:1" && a.State != "working" {
+				t.Errorf("stalled agent state: got %q, want working", a.State)
+			}
+		}
+	})
+
+	// kitty answers is_self out of the caller's own environment, so a caller
+	// inside tmux gets whatever window started the tmux server rather than
+	// itself. Only the pane the caller is in may be self.
+	t.Run("self is the caller", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			selfPane string
+			want     string // the key that is self, empty when none is
+		}{
+			{name: "outside tmux, kitty answered", want: "kitty:2"},
+			{name: "in an agent pane", selfPane: "%17", want: "tmux:%17"},
+			{name: "in a pane that is not an agent", selfPane: "%99"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client := newTestClient(
+					&fakeKitty{agents: []agent.Agent{
+						{ID: 2, Host: agent.HostKitty, Display: "working", Self: true},
+						{ID: 4, Host: agent.HostKitty, Display: "idle"},
+					}},
+					&fakeTmux{agents: []agent.Agent{
+						{ID: 17, Host: agent.HostTmux, Display: "working", Target: "dev:3.%17"},
+					}},
+				)
+				client.selfPane = tc.selfPane
+
+				got, err := client.ListAgents(context.Background())
+				if err != nil {
+					t.Fatalf("list: %v", err)
+				}
+				var selves []string
+				for _, a := range got {
+					if a.Self {
+						selves = append(selves, a.Key())
+					}
+				}
+				var want []string
+				if tc.want != "" {
+					want = []string{tc.want}
+				}
+				if !slices.Equal(selves, want) {
+					t.Fatalf("self: got %v, want %v", selves, want)
+				}
+			})
 		}
 	})
 

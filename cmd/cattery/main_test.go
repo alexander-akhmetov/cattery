@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alexander-akhmetov/cattery/internal/agent"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/tmux"
 )
@@ -27,8 +26,9 @@ func TestRoute(t *testing.T) {
 		// The two forms that existed before subcommands.
 		{name: "no arguments opens the picker", args: nil, want: cmdPicker},
 		{name: "empty argument list", args: []string{}, want: cmdPicker},
-		{name: "print", args: []string{"-print"}, want: cmdPrint},
-		{name: "print, long form", args: []string{"--print"}, want: cmdPrint},
+		// -print predates the subcommand and stays an alias for it.
+		{name: "print", args: []string{"-print"}, want: cmdList},
+		{name: "print, long form", args: []string{"--print"}, want: cmdList},
 		{name: "print=false is still the picker", args: []string{"-print=false"}, want: cmdPicker},
 		{name: "version", args: []string{"-version"}, want: cmdVersion},
 		{name: "version, long form", args: []string{"--version"}, want: cmdVersion},
@@ -53,6 +53,9 @@ func TestRoute(t *testing.T) {
 		{name: "attach", args: []string{"attach", "dev:3.%17"}, want: cmdAttach, wantArgs: []string{"dev:3.%17"}},
 		// The target is checked where the attach runs, not here.
 		{name: "attach with no target", args: []string{"attach"}, want: cmdAttach},
+
+		{name: "list", args: []string{"list"}, want: cmdList},
+		{name: "list as JSON", args: []string{"list", "--json"}, want: cmdList, wantArgs: []string{"--json"}},
 
 		{name: "events", args: []string{"events"}, want: cmdEvents},
 
@@ -106,6 +109,7 @@ func TestRouteHelp(t *testing.T) {
 		// place that can answer them.
 		{name: "-h after state", args: []string{"state", "-h"}, wantArgs: []string{"state"}},
 		{name: "-h after attach", args: []string{"attach", "-h"}, wantArgs: []string{"attach"}},
+		{name: "-h after list", args: []string{"list", "-h"}, wantArgs: []string{"list"}},
 
 		{name: "help for an unknown command", args: []string{"help", "install"}, wantErr: true},
 		{name: "help for two commands", args: []string{"help", "save", "restore"}, wantErr: true},
@@ -546,85 +550,6 @@ func TestRunRestore(t *testing.T) {
 			t.Fatalf("exit code: got %d, want 2", code)
 		}
 	})
-}
-
-// --- print ------------------------------------------------------------------
-
-// printLister stands in for the merged inventory.
-type printLister struct {
-	agents []agent.Agent
-	err    error
-}
-
-func (p printLister) ListAgents(context.Context) ([]agent.Agent, error) { return p.agents, p.err }
-
-// A printed row says which host the agent runs in, and a tmux row carries the
-// target `cattery attach` takes. `cattery -print` is how the contract is
-// checked by hand when the picker shows nothing.
-func TestPrintAgents(t *testing.T) {
-	var out strings.Builder
-	err := printAgents(printLister{agents: []agent.Agent{
-		{
-			ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
-			Project: "myapp", Branch: "wt/feat-42",
-			CWD:    "/Users/x/.worktrees/myapp/feat-42",
-			Target: "dev:3.%17",
-		},
-		{
-			ID: 12, Host: agent.HostKitty, Kind: "pi", Display: "idle",
-			Project: "dotfiles", Branch: "main", CWD: "/Users/x/projects/dotfiles",
-		},
-		{
-			ID: 21, Host: agent.HostKitty, Kind: "opencode", Display: "stalled",
-			Project: "cattery", Branch: "main", CWD: "/Users/x/projects/cattery",
-		},
-	}}, &out)
-	if err != nil {
-		t.Fatalf("print: %v", err)
-	}
-
-	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("got %d lines, want 3: %q", len(lines), out.String())
-	}
-	for _, want := range []string{"opencode", "stalled"} {
-		if !strings.Contains(lines[2], want) {
-			t.Errorf("opencode row %q is missing %q", lines[2], want)
-		}
-	}
-	// "opencode" is the longest kind any agent publishes, and a kind that
-	// overruns its column shifts the rest of that row against every other one.
-	for _, field := range []string{"host=", "id="} {
-		if strings.Index(lines[2], field) != strings.Index(lines[1], field) {
-			t.Errorf("%q starts at a different column in\n %q\nand\n %q", field, lines[1], lines[2])
-		}
-	}
-	for _, want := range []string{"host=tmux", "id=17", "target=dev:3.%17", "myapp", "working"} {
-		if !strings.Contains(lines[0], want) {
-			t.Errorf("tmux row %q is missing %q", lines[0], want)
-		}
-	}
-	if !strings.Contains(lines[1], "host=kitty") || strings.Contains(lines[1], "target=") {
-		t.Errorf("kitty row %q should name its host and no target", lines[1])
-	}
-}
-
-// One host can fail while the other answers. Its rows are the whole inventory
-// on a machine with no kitty running, so they print and the failure still comes
-// back for the exit code.
-func TestPrintAgentsPartialFailure(t *testing.T) {
-	var out strings.Builder
-	err := printAgents(printLister{
-		agents: []agent.Agent{{ID: 17, Host: agent.HostTmux, Display: "working", Target: "dev:3.%17"}},
-		err:    errors.New("kitty: no listening socket"),
-	}, &out)
-
-	if err == nil {
-		t.Fatal("expected the lister failure to come back")
-	}
-	if !strings.Contains(out.String(), "host=tmux") {
-		t.Errorf("dropped the rows the working host returned: %q", out.String())
-	}
 }
 
 // --- events -------------------------------------------------------------------

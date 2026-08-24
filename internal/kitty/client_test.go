@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -25,7 +26,13 @@ const sampleLs = `[
             "title": "pi - dotfiles",
             "cwd": "/Users/x/projects/dotfiles",
             "created_at": 1700000000000000000,
-            "user_vars": {"AGENT_DISPLAY": "working", "AGENT_KIND": "pi", "AGENT_STATE": "working", "AGENT_SINCE": "1700000000"}
+            "pid": 25636,
+            "is_self": true,
+            "foreground_processes": [
+              {"pid": 23053, "cmdline": ["/usr/bin/log", "stream"], "cwd": "/Users/x/projects/dotfiles"},
+              {"pid": 23051, "cmdline": ["nono", "run", "--", "pi"], "cwd": "/Users/x/projects/dotfiles"}
+            ],
+            "user_vars": {"AGENT_DISPLAY": "working", "AGENT_KIND": "pi", "AGENT_STATE": "working", "AGENT_SINCE": "1700000000", "AGENT_RESUME": "pi --session /Users/x/.pi/s.jsonl"}
           },
           {
             "id": 200,
@@ -115,6 +122,43 @@ func TestParseAgents(t *testing.T) {
 	}
 	if !agents[1].CreatedAt.IsZero() {
 		t.Errorf("missing created_at should be zero time, got %v", agents[1].CreatedAt)
+	}
+
+	if agents[0].State != "working" || agents[0].Resume != "pi --session /Users/x/.pi/s.jsonl" {
+		t.Errorf("state/resume: got %q / %q", agents[0].State, agents[0].Resume)
+	}
+	if agents[0].PID != 25636 {
+		t.Errorf("pid: got %d, want 25636", agents[0].PID)
+	}
+	// The sandbox's log reader comes first and the agent is behind it, so the
+	// whole list has to survive the parse rather than only its head.
+	wantProcs := []agent.Process{
+		{PID: 23053, Cmdline: []string{"/usr/bin/log", "stream"}, CWD: "/Users/x/projects/dotfiles"},
+		{PID: 23051, Cmdline: []string{"nono", "run", "--", "pi"}, CWD: "/Users/x/projects/dotfiles"},
+	}
+	if !reflect.DeepEqual(agents[0].Procs, wantProcs) {
+		t.Errorf("foreground_processes:\n got %+v\nwant %+v", agents[0].Procs, wantProcs)
+	}
+
+	// The other windows report none of those keys, which must read as zero
+	// values rather than as a parse failure.
+	for _, a := range agents[1:] {
+		if a.State != "" || a.Resume != "" || a.PID != 0 || a.Procs != nil {
+			t.Errorf("window %d should carry no process facts, got %+v", a.ID, a)
+		}
+	}
+
+	selves := 0
+	for _, a := range agents {
+		if a.Self {
+			selves++
+			if a.ID != 119 {
+				t.Errorf("self is window %d, want 119", a.ID)
+			}
+		}
+	}
+	if selves != 1 {
+		t.Errorf("got %d self windows, want 1", selves)
 	}
 }
 

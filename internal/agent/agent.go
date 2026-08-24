@@ -23,8 +23,21 @@ const (
 	HostTmux  = "tmux"
 )
 
+// Process is one process a host reports running in an agent's window. A kitty
+// window has several: a sandboxed agent's first foreground process is the
+// sandbox's log reader, and the agent itself is behind it, which is the same
+// fact that makes kitty's --use-foreground-process useless for snapshots.
+type Process struct {
+	PID     int
+	Cmdline []string
+	CWD     string
+}
+
 // Agent is one running agent, wherever it lives: a kitty window carrying
 // AGENT_DISPLAY, or a tmux pane carrying @AGENT_STATE.
+//
+// It carries a slice, so it is not comparable: compare two with
+// reflect.DeepEqual rather than ==.
 type Agent struct {
 	ID      int
 	Kind    string // AGENT_KIND, e.g. "pi" or "claude"
@@ -33,6 +46,33 @@ type Agent struct {
 	CWD     string
 	Since   time.Time // from AGENT_SINCE; zero when unknown
 	Msg     string    // AGENT_MSG: the latest user prompt, when published
+
+	// State is the word the agent itself published, before Display derived
+	// anything from it. "done" and "stalled" are displays only, so a caller
+	// deciding whether an agent can take input has to read this instead. Empty
+	// on a window whose agent was killed: `cattery state clear` drops the
+	// state, and nothing clears the watcher's own AGENT_DISPLAY.
+	State string
+
+	// Resume is AGENT_RESUME, the command that reopens this session.
+	Resume string
+
+	// Self marks the window or pane the current process runs in. Only
+	// internal/agents may set it: kitty's own is_self is computed from the
+	// caller's $KITTY_WINDOW_ID, which a tmux pane inherits from whatever
+	// started its server.
+	Self bool
+
+	// PID is the window's own process: kitty's window pid, or #{pane_pid}.
+	// Part of the fingerprint a caller re-checks before typing at an agent.
+	PID int
+
+	// Command is #{pane_current_command}, a command name and never argv. tmux
+	// only; the weaker half of the fingerprint.
+	Command string
+
+	// Procs is kitty's foreground_processes, with argv. kitty only.
+	Procs []Process
 
 	// Tool is the tool call the agent is running now, "bash: go test ./...",
 	// and ToolSince is when that call started. Both parsers drop them unless

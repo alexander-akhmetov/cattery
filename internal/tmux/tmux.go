@@ -45,6 +45,7 @@ const (
 	optSeen      = "@AGENT_SEEN"
 	optTool      = "@AGENT_TOOL"
 	optToolSince = "@AGENT_TOOL_SINCE"
+	optResume    = "@AGENT_RESUME"
 )
 
 // listFormat is the row `tmux list-panes -a` prints per pane. The order matches
@@ -55,6 +56,7 @@ var listFormat = strings.Join([]string{
 	"#{" + optKind + "}", "#{" + optState + "}", "#{" + optMsg + "}",
 	"#{" + optSince + "}", "#{" + optWorked + "}", "#{" + optSeen + "}",
 	"#{" + optTool + "}", "#{" + optToolSince + "}",
+	"#{" + optResume + "}", "#{pane_pid}", "#{pane_current_command}",
 }, fieldSep)
 
 // The index of each field in a list-panes row.
@@ -73,6 +75,9 @@ const (
 	fSeen
 	fTool
 	fToolSince
+	fResume
+	fPanePID
+	fPaneCommand
 	fieldCount
 )
 
@@ -226,6 +231,9 @@ func parseAgent(fields []string) (agent.Agent, bool) {
 		Host:    agent.HostTmux,
 		Kind:    fields[fKind],
 		Display: display,
+		State:   fields[fState],
+		Resume:  fields[fResume],
+		Command: fields[fPaneCommand],
 		// The pane title is what agents set for themselves, so the picker's
 		// second line has something to show before @AGENT_MSG exists.
 		Title: fields[fTitle],
@@ -238,6 +246,9 @@ func parseAgent(fields []string) (agent.Agent, bool) {
 		// picker matches when the same agent is picked twice.
 		Target: fields[fSession] + ":" + fields[fWindowIndex] + "." + fields[fPaneID],
 	}
+	// A pid that does not parse is one missing fingerprint, not a missing
+	// agent, so the row keeps its place with PID left at zero.
+	a.PID, _ = strconv.Atoi(fields[fPanePID])
 	a.Since = agent.UnixSeconds(fields[fSince])
 	if agent.PublishesTool(a.Kind, display) {
 		a.Tool = fields[fTool]

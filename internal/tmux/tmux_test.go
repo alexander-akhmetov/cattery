@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,12 +46,24 @@ func TestDisplay(t *testing.T) {
 	}
 }
 
-// pane builds one list-panes row the way listFormat prints it. The tool pair is
-// on the end, where listFormat puts it, and empty unless a case is about it.
-func pane(id, session, index, name, path, title, kind, state, msg, since, worked, seen string, tool ...string) string {
-	fields := []string{id, session, index, name, path, title, kind, state, msg, since, worked, seen, "", ""}
-	copy(fields[fTool:], tool)
+// pane builds one list-panes row the way listFormat prints it. It sizes itself
+// from fieldCount, so a field appended to listFormat leaves every case here
+// valid rather than one short. The variadic tail fills the row from fTool on:
+// the tool pair, then the resume command, the pane pid and the pane command.
+func pane(id, session, index, name, path, title, kind, state, msg, since, worked, seen string, rest ...string) string {
+	fields := make([]string, fieldCount)
+	copy(fields, []string{id, session, index, name, path, title, kind, state, msg, since, worked, seen})
+	copy(fields[fTool:], rest)
 	return strings.Join(fields, fieldSep)
+}
+
+// A field added to listFormat without an entry in the iota block would make
+// every row one field too wide, and parseAgents drops a row of the wrong width
+// without a word: every tmux agent would leave the picker in silence.
+func TestListFormatFieldCount(t *testing.T) {
+	if got := strings.Count(listFormat, fieldSep); got != fieldCount-1 {
+		t.Fatalf("listFormat has %d separators, want %d: the iota block and the format disagree", got, fieldCount-1)
+	}
 }
 
 // A dev agent: one detached window per ticket, named after the ticket, with
@@ -71,17 +84,71 @@ func TestListAgents(t *testing.T) {
 		}
 		want := agent.Agent{
 			ID: 17, Host: agent.HostTmux, Kind: "claude", Display: "working",
+			State:  "working",
 			Title:  "◐ Run /code-review",
 			CWD:    "/Users/x/.worktrees/myapp/feat-42",
 			Msg:    "run the review",
 			Since:  time.Unix(1700000000, 0),
 			Target: "dev:3.%17",
 		}
-		if agents[0] != want {
+		// Agent carries a slice of processes, so == does not build any more.
+		if !reflect.DeepEqual(agents[0], want) {
 			t.Fatalf("agent:\n got %+v\nwant %+v", agents[0], want)
 		}
 		if got := agents[0].Key(); got != "tmux:%17" {
 			t.Errorf("key: got %q, want tmux:%%17", got)
+		}
+	})
+
+	t.Run("the fingerprint fields", func(t *testing.T) {
+		row := pane("%17", "dev", "3", "feat-42", "/w", "t", "claude", "idle", "", "", "1", "",
+			"", "", "claude --resume abc-123", "86369", "claude")
+		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+row+"\nEOF")}
+
+		agents, err := client.ListAgents(context.Background())
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(agents) != 1 {
+			t.Fatalf("got %d agents, want 1: %+v", len(agents), agents)
+		}
+		a := agents[0]
+		if a.Resume != "claude --resume abc-123" || a.PID != 86369 || a.Command != "claude" {
+			t.Errorf("fingerprint: got resume=%q pid=%d command=%q", a.Resume, a.PID, a.Command)
+		}
+		// The agent's own word and cattery's derived one differ here on
+		// purpose: it finished while nobody was attached.
+		if a.State != "idle" || a.Display != "done" {
+			t.Errorf("state/display: got %q / %q, want idle / done", a.State, a.Display)
+		}
+	})
+
+	t.Run("a pid that is not a number keeps its row", func(t *testing.T) {
+		row := pane("%17", "dev", "3", "feat-42", "/w", "t", "claude", "working", "", "", "", "",
+			"", "", "", "not-a-pid", "claude")
+		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+row+"\nEOF")}
+
+		agents, err := client.ListAgents(context.Background())
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(agents) != 1 || agents[0].PID != 0 {
+			t.Fatalf("got %+v, want one agent with PID 0", agents)
+		}
+	})
+
+	t.Run("a row of the wrong width is dropped", func(t *testing.T) {
+		// What a tmux that answered the old format would print: three fields
+		// short. Reading it positionally would put the tool label in @AGENT_MSG.
+		narrow := strings.Join(make([]string, fieldCount-3), fieldSep)
+		client := &Client{tmux: fakeTmux(t, "cat <<'EOF'\n"+narrow+"\nEOF")}
+
+		agents, err := client.ListAgents(context.Background())
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(agents) != 0 {
+			t.Fatalf("got %+v, want no agents", agents)
 		}
 	})
 

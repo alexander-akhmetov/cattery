@@ -233,6 +233,15 @@ type rawWindow struct {
 	UserVars    map[string]string `json:"user_vars"`
 	AtPrompt    bool              `json:"at_prompt"`
 	SessionName string            `json:"session_name"`
+	PID         int               `json:"pid"`
+	IsSelf      bool              `json:"is_self"`
+	Procs       []rawProcess      `json:"foreground_processes"`
+}
+
+type rawProcess struct {
+	PID     int      `json:"pid"`
+	Cmdline []string `json:"cmdline"`
+	CWD     string   `json:"cwd"`
 }
 
 type rawTab struct {
@@ -262,6 +271,19 @@ type Window struct {
 	// AtPrompt is true once the shell has drawn a prompt and is waiting. Restore
 	// uses it to decide when a restored window can be typed into.
 	AtPrompt bool
+
+	// PID is the process kitty started in the window.
+	PID int
+
+	// IsSelf marks the window the calling process runs in. kitty answers it
+	// from $KITTY_WINDOW_ID in the caller's own environment rather than from
+	// the socket, so a caller inside tmux gets whatever window started the tmux
+	// server. internal/agents is where that is corrected.
+	IsSelf bool
+
+	// Procs is every foreground process of the window, with argv. The first is
+	// often a wrapper rather than the agent.
+	Procs []agent.Process
 }
 
 // parseWindows decodes `kitten @ ls` output into every window it reports. It
@@ -284,6 +306,9 @@ func parseWindows(data []byte) ([]Window, error) {
 					UserVars:    w.UserVars,
 					SessionName: w.SessionName,
 					AtPrompt:    w.AtPrompt,
+					PID:         w.PID,
+					IsSelf:      w.IsSelf,
+					Procs:       processes(w.Procs),
 				}
 				if w.CreatedAt > 0 {
 					window.CreatedAt = time.Unix(0, w.CreatedAt)
@@ -293,6 +318,19 @@ func parseWindows(data []byte) ([]Window, error) {
 		}
 	}
 	return windows, nil
+}
+
+// processes copies kitty's foreground process list into the shared type, so
+// the picker's join needs no conversion in the middle of it.
+func processes(raw []rawProcess) []agent.Process {
+	if len(raw) == 0 {
+		return nil
+	}
+	procs := make([]agent.Process, len(raw))
+	for i, p := range raw {
+		procs[i] = agent.Process{PID: p.PID, Cmdline: p.Cmdline, CWD: p.CWD}
+	}
+	return procs
 }
 
 // parseAgents keeps the windows that published an AGENT_DISPLAY value. It never
@@ -314,10 +352,15 @@ func parseAgents(data []byte) ([]agent.Agent, error) {
 			Host:      agent.HostKitty,
 			Kind:      w.UserVars["AGENT_KIND"],
 			Display:   display,
+			State:     w.UserVars["AGENT_STATE"],
+			Resume:    w.UserVars["AGENT_RESUME"],
 			Title:     w.Title,
 			CWD:       w.CWD,
 			Msg:       w.UserVars["AGENT_MSG"],
 			CreatedAt: w.CreatedAt,
+			Self:      w.IsSelf,
+			PID:       w.PID,
+			Procs:     w.Procs,
 		}
 		a.Since = agent.UnixSeconds(w.UserVars["AGENT_SINCE"])
 		if agent.PublishesTool(a.Kind, display) {
