@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KITTY_DIR = REPO_ROOT / "kitty"
@@ -35,6 +36,11 @@ class FakeFg:
 
 class FakeFmt:
     fg = FakeFg()
+
+
+class FakeTab:
+    def __init__(self, active_wd):
+        self.active_wd = active_wd
 
 
 class TabBarTest(unittest.TestCase):
@@ -78,6 +84,43 @@ class TabBarTest(unittest.TestCase):
         module = self.load("cattery_tab.py")
         got = module.draw_title({"fmt": FakeFmt(), "title": "zsh", "index": 2})
         self.assertEqual(got, " 2: <tab>zsh")
+
+    def test_worktree_titles_are_shortened(self):
+        module = self.load("cattery_tab.py")
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory)
+        root = directory / "anywhere" / "project-feature"
+        nested = root / "src" / "client"
+        gitdir = directory / "repo.git" / "worktrees" / "project-feature"
+        nested.mkdir(parents=True)
+        gitdir.mkdir(parents=True)
+        (root / ".git").write_text(f"gitdir: {gitdir}\n")
+        (gitdir / "commondir").write_text("../..\n")
+
+        cases = (
+            (str(root), str(root), "[wt] project-feature"),
+            (str(root), module._abbreviate_path(str(root)), "[wt] project-feature"),
+            (str(nested), module._abbreviate_path(str(nested)), "[wt] project-feature"),
+            (str(root), f"nvim {root}: src/client.py", "nvim [wt] project-feature: src/client.py"),
+        )
+        for cwd, title, want in cases:
+            with self.subTest(title=title):
+                data = {"fmt": None, "title": title, "index": 1, "tab": FakeTab(cwd)}
+                self.assertEqual(module.draw_title(data), f" 1: {want}")
+
+        with mock.patch.object(module.os.path, "expanduser", return_value=str(directory)):
+            title = "~/anywhere/project-feature"
+            data = {"fmt": None, "title": title, "index": 1, "tab": FakeTab(str(root))}
+            self.assertEqual(module.draw_title(data), " 1: [wt] project-feature")
+
+    def test_main_checkout_title_is_unchanged(self):
+        module = self.load("cattery_tab.py")
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory)
+        root = directory / "project"
+        (root / ".git").mkdir(parents=True)
+        data = {"fmt": None, "title": str(root), "index": 1, "tab": FakeTab(str(root))}
+        self.assertEqual(module.draw_title(data), f" 1: {root}")
 
     def test_missing_title_and_index_do_not_raise(self):
         module = self.load("cattery_tab.py")
