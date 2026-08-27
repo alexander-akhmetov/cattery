@@ -9,7 +9,7 @@
     "test": "node --test tests/cattery_extension_test.ts tests/cattery_opencode_test.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.3",
     "@opencode-ai/plugin": "^1.18.15",
     "@types/node": "^26.2.0",
     "typescript": "^5.7.0"
