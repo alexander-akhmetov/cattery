@@ -10,7 +10,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1",
-    "@opencode-ai/plugin": "^1.18.15",
+    "@opencode-ai/plugin": "^1.18.25",
     "@types/node": "^26.2.0",
     "typescript": "^5.7.0"
   }
