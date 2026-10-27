@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alexander-akhmetov/cattery/internal/config"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/shellquote"
 )
@@ -50,16 +51,13 @@ var (
 const envSessionFile = "CATTERY_SESSION_FILE"
 
 // DefaultPath is the snapshot to use when the caller names none:
-// CATTERY_SESSION_FILE, else a file under kitty's own sessions directory.
+// CATTERY_SESSION_FILE, TOML, else a file under kitty's own sessions directory.
 func DefaultPath() (string, error) {
-	if path := os.Getenv(envSessionFile); path != "" {
-		return Abs(path)
-	}
-	home, err := os.UserHomeDir()
+	settings, err := config.Load()
 	if err != nil {
-		return "", fmt.Errorf("no home directory to put a snapshot in: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".local", "share", "kitty", "sessions", "agents.kitty-session"), nil
+	return settings.SessionPath()
 }
 
 // Abs resolves a snapshot path against the directory cattery was run from.

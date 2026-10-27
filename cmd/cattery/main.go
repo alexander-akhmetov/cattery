@@ -46,6 +46,7 @@ import (
 
 	"github.com/alexander-akhmetov/cattery"
 	"github.com/alexander-akhmetov/cattery/internal/agents"
+	"github.com/alexander-akhmetov/cattery/internal/config"
 	"github.com/alexander-akhmetov/cattery/internal/events"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/overlay"
@@ -66,6 +67,7 @@ const (
 	cmdRestore = "restore"
 	cmdAttach  = "attach"
 	cmdEvents  = "events"
+	cmdConfig  = "config"
 	cmdVersion = "version"
 	cmdHelp    = "help"
 )
@@ -88,6 +90,14 @@ type subcommand struct {
 // plain literal on purpose: a closure in here that reached back for a flag set
 // would be an initialization cycle.
 var subcommands = []subcommand{
+	{
+		name:     cmdConfig,
+		operands: "resume-prefix <claude|codex|opencode|pi>",
+		summary:  "print the effective resume prefix as a JSON string",
+		details: `Reads the selected TOML configuration and environment overrides without
+contacting kitty or reading stdin. Invalid arguments exit 2; invalid
+configuration exits 1 with no stdout.`,
+	},
 	{
 		name:    cmdSetup,
 		summary: "install the kitty files and the config they need",
@@ -124,9 +134,9 @@ transcript.`,
 		details: `Writes every kitty tab, its layout, and each agent's resume command to a
 session file that restore can read back.
 
-With no path the snapshot goes to $CATTERY_SESSION_FILE, else to the default
-under kitty's sessions directory. tmux agents are not recorded: a pane
-belongs to whatever started it.`,
+With no path the snapshot uses $CATTERY_SESSION_FILE, then session.file in
+TOML, then the default under kitty's sessions directory. tmux agents are not
+recorded: a pane belongs to whatever started it.`,
 	},
 	{
 		name:     cmdRestore,
@@ -268,6 +278,8 @@ func run(args []string) int {
 		return 0
 	case cmdSetup:
 		return runSetup(cmd.args)
+	case cmdConfig:
+		return runConfig(os.Stdout, os.Stderr, cmd.args)
 	case cmdSave:
 		// Snapshots are kitty's tab tree. A tmux agent belongs to whatever
 		// started it, and restoring one would fork work that is still running.
@@ -281,14 +293,27 @@ func run(args []string) int {
 	case cmdList:
 		return runList(agents.NewClient(kitty.NewClient()), os.Stdout, cmd.args)
 	default:
+		options, err := pickerOptions()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cattery:", err)
+			return 1
+		}
 		snapshots := kitty.NewClient()
-		program := tea.NewProgram(overlay.New(agents.NewClient(snapshots), snapshots), tea.WithAltScreen())
+		program := tea.NewProgram(overlay.New(agents.NewClient(snapshots), snapshots, options), tea.WithAltScreen())
 		if _, err := program.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "cattery:", err)
 			return 1
 		}
 		return 0
 	}
+}
+
+func pickerOptions() (overlay.Options, error) {
+	settings, err := config.Load()
+	if err != nil {
+		return overlay.Options{}, err
+	}
+	return overlay.Options{Preview: settings.Preview()}, nil
 }
 
 // route reads the argv. A first argument that does not start with "-" names a
@@ -583,7 +608,7 @@ func runRestore(client session.Client, out io.Writer, args []string) int {
 // order, because Go's flag package stops at the first argument that is not a
 // flag and `restore path -run` is natural to type.
 //
-// With no path the snapshot comes from CATTERY_SESSION_FILE, else the default
+// With no path the snapshot comes from CATTERY_SESSION_FILE, TOML, or the default
 // under kitty's sessions directory. A given path is used as given, and made
 // absolute: kitty resolves a relative path against directories of its own.
 func parseSessionArgs(flags *flag.FlagSet, args []string) (string, error) {

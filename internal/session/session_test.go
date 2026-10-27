@@ -969,12 +969,46 @@ func TestDefaultPathIsAbsolute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(envSessionFile, "work.kitty-session")
-	got, err := DefaultPath()
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name string
+		file string
+		env  string
+		want string
+		err  bool
+	}{
+		{name: "environment relative", env: "work.kitty-session", want: filepath.Join(cwd, "work.kitty-session")},
+		{name: "file relative", file: "[session]\nfile = 'snapshots/agents.kitty-session'", want: "snapshots/agents.kitty-session"},
+		{name: "file absolute", file: "[session]\nfile = '/tmp/file.kitty-session'", want: "/tmp/file.kitty-session"},
+		{name: "environment over file", env: "work.kitty-session", file: "[session]\nfile = 'file.kitty-session'", want: filepath.Join(cwd, "work.kitty-session")},
+		{name: "invalid config", file: "[session]\nfile = false", err: true},
 	}
-	if want := filepath.Join(cwd, "work.kitty-session"); got != want {
-		t.Fatalf("DefaultPath: got %q, want %q", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("XDG_CONFIG_HOME", dir)
+			t.Setenv(envSessionFile, tc.env)
+			configDir := filepath.Join(dir, "cattery")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(tc.file), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := DefaultPath()
+			if tc.err {
+				if err == nil {
+					t.Fatal("expected configuration error")
+				}
+				return
+			}
+			want := tc.want
+			if !filepath.IsAbs(want) {
+				want = filepath.Join(configDir, want)
+			}
+			if err != nil || got != want {
+				t.Fatalf("DefaultPath: got %q, %v, want %q", got, err, want)
+			}
+		})
 	}
 }

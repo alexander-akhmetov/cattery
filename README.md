@@ -116,15 +116,17 @@ a kitty window you are not looking at and on a tmux pane nobody is attached to.
 The drawer opens read-only, framed in grey. Keys still move the cursor, so you
 can walk down the list and watch each agent in turn.
 
-To open the drawer automatically, add this outside cattery's managed block in
-`~/.config/kitty/kitty.conf`:
+To open the drawer automatically, add this to `~/.config/cattery/config.toml`
+(or the XDG location in [Configuration](#configuration)):
 
-```conf
-env CATTERY_PREVIEW=1
+```toml
+[picker]
+preview = true
 ```
 
-Restart kitty after changing it. Only `1` enables the default preview. Leave the
-variable unset or set it to `0` to start with the drawer closed.
+The next picker opens read-only. Closing the drawer keeps it closed until that
+picker exits. `CATTERY_PREVIEW` overrides the file: only `1` enables preview;
+any other nonempty value closes it.
 
 Press `v` while the drawer is read-only to type at the agent. The frame turns
 red, and every key goes to the agent: `q`, `enter`, `ctrl+c` to interrupt it.
@@ -152,18 +154,102 @@ same from a shell.
 
 The resume command is `claude --resume <id>`, `codex resume <id>`,
 `opencode --session <id>` or `pi --session <file>`. If you start agents through a
-wrapper, export the command cattery should write instead, before the agent
-starts:
+wrapper, set the command prefix in `config.toml`:
 
-```bash
-export CATTERY_RESUME_PREFIX_CLAUDE="claude --profile personal"
+```toml
+[resume]
+claude = "claude --profile personal"
 ```
 
-`CATTERY_RESUME_PREFIX_CODEX`, `CATTERY_RESUME_PREFIX_OPENCODE` and
-`CATTERY_RESUME_PREFIX_PI` do the same for the other three, and
-`CATTERY_RESUME_PREFIX` for all four.
+The environment variables listed under [Configuration](#configuration) override
+these prefixes.
 
 tmux agents are not recorded: a pane belongs to whatever started it.
+
+## Configuration
+
+Cattery reads one TOML file:
+
+- With an absolute, nonempty `XDG_CONFIG_HOME`: `$XDG_CONFIG_HOME/cattery/config.toml`.
+- Otherwise: `$HOME/.config/cattery/config.toml`, including on macOS.
+
+A relative `XDG_CONFIG_HOME` is ignored. A missing selected file uses defaults;
+cattery does not search the fallback or create a configuration file. Files are
+not merged.
+
+All settings are optional:
+
+```toml
+[picker]
+preview = true
+
+[session]
+file = "~/snapshots/agents.kitty-session"
+
+[resume]
+prefix = ""
+claude = "claude --profile personal"
+codex = "codex"
+opencode = "opencode"
+pi = "pi"
+```
+
+Preview defaults to closed. Empty strings mean no override. Without a snapshot
+setting, cattery uses `~/.local/share/kitty/sessions/agents.kitty-session`.
+Without a resume prefix, it uses the agent's executable name.
+
+The first applicable value wins:
+
+| Setting | Highest precedence first |
+|---|---|
+| Preview | Nonempty `CATTERY_PREVIEW`, TOML `picker.preview`, closed |
+| Snapshot | Explicit save/restore operand, nonempty `CATTERY_SESSION_FILE`, TOML `session.file`, default path |
+| Resume prefix | Nonempty agent-specific environment variable, nonempty `CATTERY_RESUME_PREFIX`, agent-specific TOML, TOML `resume.prefix`, executable name |
+
+The agent-specific variables are `CATTERY_RESUME_PREFIX_CLAUDE`,
+`CATTERY_RESUME_PREFIX_CODEX`, `CATTERY_RESUME_PREFIX_OPENCODE`, and
+`CATTERY_RESUME_PREFIX_PI`. Only `CATTERY_PREVIEW=1` enables preview; any other
+nonempty value disables it. An empty environment variable leaves TOML in control.
+
+Explicit snapshot operands and environment paths resolve relative to the caller's
+working directory. TOML paths resolve relative to the configuration directory;
+a leading `~/` expands to the home directory. Paths do not expand environment
+variables or execute shell expressions.
+
+Resume prefixes are shell fragments. Cattery appends the agent's resume argument
+and a shell-quoted session ID or transcript path. Only use trusted prefixes.
+
+Unknown keys, incorrect types, malformed TOML, and control characters in file
+resume prefixes invalidate the entire file. The picker reports the selected
+configuration path and exits before opening its terminal interface. Save and
+restore report configuration errors when resolving their default path; an
+explicit path bypasses that lookup. Agent hooks stay silent and use environment
+or default prefixes instead of invalid file settings.
+
+Pi reads its prefix with `cattery config resume-prefix pi`, which prints one JSON
+string without kitty or stdin. The extension invokes `CATTERY_BIN`, or `cattery`
+on PATH, without a shell. A missing or older binary, invalid configuration,
+malformed response, timeout, or response over 1 MiB silently keeps pi's
+environment/default behavior. Lookup can add up to one second at session startup.
+Pi skips lookup for ephemeral sessions and when an environment prefix already
+sets the result.
+
+Changes take effect at these times:
+
+| Setting | Read again |
+|---|---|
+| Preview | Next picker launch |
+| Snapshot path | Next save or restore |
+| Claude, Codex, opencode prefixes | Next hook publication containing a session ID |
+| Pi prefix | Next `session_start` |
+
+Existing snapshots retain their recorded resume commands. Changing a prefix does
+not rewrite snapshots.
+
+A custom `XDG_CONFIG_HOME` must reach each consuming process. A shell export does
+not change the environment of an already-running kitty. To keep a preview
+environment override in kitty, add `env CATTERY_PREVIEW=1` outside cattery's
+managed block in `kitty.conf`, then restart kitty.
 
 ## Tab markers
 

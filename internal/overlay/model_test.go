@@ -116,7 +116,7 @@ func checkout(id int, kind, display, project, branch string) agent.Agent {
 }
 
 func sampleModel() Model {
-	m := New(&fakeClient{}, &fakeClient{})
+	m := New(&fakeClient{}, &fakeClient{}, Options{})
 	m.preview = previewOff
 	m.loaded = true
 	m.loading = false
@@ -1926,7 +1926,10 @@ func runes(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []r
 // test cannot touch the real one. It puts a snapshot there for restore to read.
 func sessionModel(t *testing.T, client *fakeClient) Model {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "agents.kitty-session")
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	path := filepath.Join(dir, "agents.kitty-session")
 	body := "\nnew_tab\ncd /tmp\nlaunch '--var=AGENT_RESUME=pi --session /tmp/a.jsonl'\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -1953,13 +1956,19 @@ func press(t *testing.T, m Model, key tea.KeyMsg) (Model, tea.Msg) {
 
 func TestSessionKeys(t *testing.T) {
 	cases := []struct {
-		name    string
-		key     tea.KeyMsg
-		action  string
-		summary string
+		name       string
+		key        tea.KeyMsg
+		action     string
+		summary    string
+		configured bool
+		invalid    bool
 	}{
 		{name: "s saves", key: runes('s'), action: "save_as_session", summary: "saved 1 tab, 0 resumable agents"},
 		{name: "R restores", key: runes('R'), action: "goto_session", summary: "restored 1 tab, typed 1 of 1 resume commands"},
+		{name: "s configured", key: runes('s'), action: "save_as_session", summary: "saved 1 tab, 0 resumable agents", configured: true},
+		{name: "R configured", key: runes('R'), action: "goto_session", summary: "restored 1 tab, typed 1 of 1 resume commands", configured: true},
+		{name: "s invalid config", key: runes('s'), configured: true, invalid: true},
+		{name: "R invalid config", key: runes('R'), configured: true, invalid: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1969,6 +1978,21 @@ func TestSessionKeys(t *testing.T) {
 				{ID: 9, SessionName: "agents", AtPrompt: true, UserVars: map[string]string{"AGENT_RESUME": "pi --session /tmp/a.jsonl"}},
 			}}
 			m := sessionModel(t, client)
+			path := os.Getenv("CATTERY_SESSION_FILE")
+			if tc.configured {
+				configDir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "cattery")
+				if err := os.MkdirAll(configDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				content := "[session]\nfile = '../agents.kitty-session'"
+				if tc.invalid {
+					content = "[session]\nfile = 1"
+				}
+				if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CATTERY_SESSION_FILE", "")
+			}
 
 			started, msg := press(t, m, tc.key)
 			if !started.sessionBusy {
@@ -1978,11 +2002,30 @@ func TestSessionKeys(t *testing.T) {
 			if !ok {
 				t.Fatalf("got %T, want a sessionMsg", msg)
 			}
+			if tc.invalid {
+				if result.err == nil || len(client.actions) != 0 {
+					t.Fatalf("error %v, actions %v", result.err, client.actions)
+				}
+				done, _ := started.Update(result)
+				final := done.(Model)
+				if final.noticeLevel != noticeErr || !strings.Contains(final.notice, "config.toml") {
+					t.Fatalf("notice %q, level %v", final.notice, final.noticeLevel)
+				}
+				return
+			}
 			if result.err != nil {
 				t.Fatalf("session failed: %v", result.err)
 			}
 			if len(client.actions) != 1 || !strings.HasPrefix(client.actions[0], tc.action) {
 				t.Fatalf("actions: got %v, want one %s", client.actions, tc.action)
+			}
+
+			if tc.key.Runes[0] == 's' {
+				if _, err := os.Stat(path); err != nil || !strings.Contains(result.summary, path) {
+					t.Fatalf("saved path %q: %v, summary %q", path, err, result.summary)
+				}
+			} else if !strings.Contains(client.actions[0], path) {
+				t.Fatalf("action %q omits path %q", client.actions[0], path)
 			}
 
 			// Delivering the result shows the notice and stops the busy flag.
@@ -2309,7 +2352,7 @@ func TestHintTiersFitWithTheAttachAction(t *testing.T) {
 // previewModel is a picker wide enough for the sidebar, with the client the
 // sidebar will ask for screens.
 func previewModel(client *fakeClient) Model {
-	m := New(client, &fakeClient{})
+	m := New(client, &fakeClient{}, Options{})
 	m.preview = previewOff
 	m.loaded = true
 	m.loading = false
@@ -2388,20 +2431,18 @@ func drain(t *testing.T, m Model, msg tea.Msg) Model {
 }
 
 func TestPreviewDefaultMode(t *testing.T) {
+	t.Setenv("CATTERY_PREVIEW", "1")
 	cases := []struct {
-		value string
-		want  previewMode
+		name    string
+		preview bool
+		want    previewMode
 	}{
-		{"", previewOff},
-		{"0", previewOff},
-		{"1", previewRead},
-		{"true", previewOff},
-		{"invalid", previewOff},
+		{"closed", false, previewOff},
+		{"read only", true, previewRead},
 	}
 	for _, tc := range cases {
-		t.Run(tc.value, func(t *testing.T) {
-			t.Setenv("CATTERY_PREVIEW", tc.value)
-			m := New(&fakeClient{}, &fakeClient{})
+		t.Run(tc.name, func(t *testing.T) {
+			m := New(&fakeClient{}, &fakeClient{}, Options{Preview: tc.preview})
 			if m.preview != tc.want {
 				t.Fatalf("preview mode: got %v, want %v", m.preview, tc.want)
 			}
@@ -2410,7 +2451,6 @@ func TestPreviewDefaultMode(t *testing.T) {
 }
 
 func TestPreviewDefaultStartup(t *testing.T) {
-	t.Setenv("CATTERY_PREVIEW", "1")
 	cases := []struct {
 		name        string
 		width       int
@@ -2426,7 +2466,7 @@ func TestPreviewDefaultStartup(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &fakeClient{screen: "agent screen"}
-			m := New(client, &fakeClient{})
+			m := New(client, &fakeClient{}, Options{Preview: true})
 			var agents []agent.Agent
 			if !tc.empty {
 				agents = []agent.Agent{checkout(3, "pi", "done", "myapp", "main")}

@@ -6,7 +6,6 @@ package overlay
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -260,16 +259,20 @@ type Model struct {
 	quitting bool
 }
 
+type Options struct {
+	Preview bool
+}
+
 // New builds a Model with an initial reload scheduled in Init. client lists and
 // reaches agents of every host; snapshots is kitty alone, for save and restore.
-func New(client Client, snapshots session.Client) Model {
+func New(client Client, snapshots session.Client, options Options) Model {
 	in := textinput.New()
 	in.Prompt = ""
 	in.Placeholder = "search by name, path, branch, prompt…"
 	in.CharLimit = 120
 
 	preview := previewOff
-	if os.Getenv("CATTERY_PREVIEW") == "1" {
+	if options.Preview {
 		preview = previewRead
 	}
 

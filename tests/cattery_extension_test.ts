@@ -14,11 +14,27 @@
  */
 
 import assert from "node:assert/strict";
-import test, { type TestContext } from "node:test";
+import test, { afterEach, beforeEach, type TestContext } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import register, { setRunner } from "../extensions/cattery.ts";
+import register, { resumePrefix, setQueryRunner, setRunner } from "../extensions/cattery.ts";
+
+const defaultQueryRunner = async () => JSON.stringify("pi");
+setQueryRunner(defaultQueryRunner);
+
+let savedEnv: NodeJS.ProcessEnv;
+beforeEach(() => {
+  savedEnv = { ...process.env };
+  delete process.env.CATTERY_BIN;
+  delete process.env.CATTERY_RESUME_PREFIX;
+  delete process.env.CATTERY_RESUME_PREFIX_PI;
+  setQueryRunner(defaultQueryRunner);
+});
+afterEach(() => {
+  process.env = savedEnv;
+  setQueryRunner(defaultQueryRunner);
+});
 
 /** One user variable write. A null value means the variable was deleted. */
 type VarWrite = [key: string, value: string | null];
@@ -89,8 +105,7 @@ function inKittyOnly(): void {
 }
 
 /** Run `fn` with stdout captured, and return the user variables it wrote. */
-async function captured(fn: () => Promise<void> | void): Promise<VarWrite[]> {
-  const written: VarWrite[] = [];
+async function captured(fn: () => Promise<void> | void, written: VarWrite[] = []): Promise<VarWrite[]> {
   const original = process.stdout.write;
   process.stdout.write = ((chunk: string | Uint8Array): boolean => {
     written.push(...parseSetUserVars(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8")));
@@ -171,6 +186,153 @@ async function resumeOn(sessionFile: string | undefined): Promise<VarWrite[]> {
   const written = await fire(pi, "session_start");
   return written.filter(([key]) => key === "AGENT_RESUME");
 }
+
+test("the prefix query sets execFile limits and CATTERY_BIN without a shell", async () => {
+  for (const binary of [undefined, "", "/tmp/cattery bin; literal"]) {
+    if (binary === undefined) delete process.env.CATTERY_BIN;
+    else process.env.CATTERY_BIN = binary;
+    let calls = 0;
+    setQueryRunner(async (file, args, options) => {
+      calls += 1;
+      assert.equal(file, binary || "cattery");
+      assert.deepEqual(args, ["config", "resume-prefix", "pi"]);
+      assert.deepEqual(options, { encoding: "utf8", timeout: 1000, maxBuffer: 1024 * 1024, shell: false });
+      return '  "nono run pi --profile personal"\n';
+    });
+    assert.equal(await resumePrefix(), "nono run pi --profile personal");
+    assert.equal(calls, 1);
+  }
+});
+
+test("query failures silently use the default prefix", async () => {
+  const failures = [
+    new Error("missing binary"),
+    Object.assign(new Error("not found"), { code: "ENOENT" }),
+    Object.assign(new Error("old binary or bad config"), { code: 1, stdout: '"ignored"' }),
+    Object.assign(new Error("timeout"), { killed: true, signal: "SIGTERM" }),
+    Object.assign(new Error("buffer exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }),
+  ];
+  for (const error of failures) {
+    setQueryRunner(async () => {
+      throw error;
+    });
+    assert.equal(await resumePrefix(), "pi", error.message);
+  }
+  setQueryRunner(() => {
+    throw new Error("synchronous failure");
+  });
+  assert.equal(await resumePrefix(), "pi");
+});
+
+test("the query accepts only one nonempty JSON string without control characters", async () => {
+  const malformed = [
+    "",
+    "pi",
+    '"pi" trailing',
+    '"pi"\n"other"',
+    "null",
+    "false",
+    "42",
+    "[]",
+    '{"prefix":"pi"}',
+    JSON.stringify(""),
+    JSON.stringify("\t"),
+    ...[0, 10, 13, 27, 31, 127, 133, 159].map((code) => JSON.stringify(`pi${String.fromCharCode(code)}run`)),
+  ];
+  for (const stdout of malformed) {
+    setQueryRunner(async () => stdout);
+    assert.equal(await resumePrefix(), "pi", JSON.stringify(stdout));
+  }
+  for (const prefix of ["nono run pi", " pi --profile personal ", "   ", "env LABEL='猫' pi"]) {
+    setQueryRunner(async () => JSON.stringify(prefix));
+    assert.equal(await resumePrefix(), prefix);
+  }
+});
+
+test("nonempty environment overrides skip the query, including whitespace", async () => {
+  let calls = 0;
+  setQueryRunner(async () => {
+    calls += 1;
+    throw new Error("must not query");
+  });
+  assert.deepEqual(await resumeWithPrefix("shared pi"), [["AGENT_RESUME", `shared pi --session ${SESSION_FILE}`]]);
+  assert.deepEqual(await resumeWithPrefix("shared pi", "specific pi"), [
+    ["AGENT_RESUME", `specific pi --session ${SESSION_FILE}`],
+  ]);
+  assert.deepEqual(await resumeWithPrefix("shared pi", ""), [["AGENT_RESUME", `shared pi --session ${SESSION_FILE}`]]);
+  assert.deepEqual(await resumeWithPrefix("", " "), [["AGENT_RESUME", `  --session ${SESSION_FILE}`]]);
+  assert.equal(calls, 0);
+});
+
+test("empty environment overrides still query the configured prefix", async () => {
+  let calls = 0;
+  setQueryRunner(async () => {
+    calls += 1;
+    return JSON.stringify("configured pi");
+  });
+  assert.deepEqual(await resumeWithPrefix("", ""), [["AGENT_RESUME", `configured pi --session ${SESSION_FILE}`]]);
+  assert.equal(calls, 1);
+});
+
+test("the configured prefix stays raw and the session path is shell quoted", async () => {
+  setQueryRunner(async () => JSON.stringify("env PROFILE='my profile' nono run pi"));
+  assert.deepEqual(await resumeOn("/tmp/a b'c.jsonl"), [
+    ["AGENT_RESUME", "env PROFILE='my profile' nono run pi --session '/tmp/a b'\\''c.jsonl'"],
+  ]);
+});
+
+test("ephemeral and unreadable session paths skip the query", async () => {
+  let calls = 0;
+  setQueryRunner(async () => {
+    calls += 1;
+    throw new Error("must not query");
+  });
+  for (const file of [undefined, ""]) {
+    assert.deepEqual(await resumeOn(file), [["AGENT_RESUME", null]]);
+  }
+  inKittyOnly();
+  process.env.KITTY_WINDOW_ID = "7";
+  const pi = new FakePi();
+  pi.ctx = {
+    sessionManager: {
+      getSessionFile: () => {
+        throw new Error("unreadable path");
+      },
+    },
+  };
+  register(pi as unknown as ExtensionAPI);
+  const written = await fire(pi, "session_start");
+  assert.deepEqual(written, [
+    ["AGENT_KIND", "pi"],
+    ["AGENT_RESUME", null],
+    ["AGENT_MSG", null],
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
+    ["AGENT_STATE", "idle"],
+  ]);
+  assert.equal(calls, 0);
+});
+
+test("each session start queries again, but run and shutdown events do not", async () => {
+  let calls = 0;
+  setQueryRunner(async () => JSON.stringify(`configured-${++calls}`));
+  const pi = await startedSession();
+  assert.equal(calls, 1);
+  for (const reason of ["new", "resume", "fork", "reload"]) {
+    pi.ctx = context(`/tmp/${reason}.jsonl`);
+    const written = await fire(pi, "session_start", { reason });
+    assert.deepEqual(written[1], ["AGENT_RESUME", `configured-${calls} --session /tmp/${reason}.jsonl`]);
+    assert.equal(written.at(-1)?.[0], "AGENT_STATE");
+  }
+  assert.equal(calls, 5);
+  await fire(pi, "before_agent_start", { prompt: "work" });
+  await fire(pi, "agent_start");
+  await fire(pi, "tool_execution_start", { toolCallId: "c1", toolName: "read" });
+  await fire(pi, "tool_execution_end", { toolCallId: "c1", toolName: "read" });
+  await fire(pi, "agent_settled");
+  await fire(pi, "session_shutdown");
+  assert.equal(calls, 5);
+});
 
 test("session_start publishes the command that resumes this session", async () => {
   assert.deepEqual(await resumeOn(SESSION_FILE), [["AGENT_RESUME", "pi --session /tmp/pi-session.jsonl"]]);
@@ -373,6 +535,136 @@ function start(id: string, toolName: string, args?: Record<string, unknown>): [s
 
 function end(id: string, toolName: string): [string, Record<string, unknown>] {
   return ["tool_execution_end", { toolCallId: id, toolName }];
+}
+
+test("session_start cancels prior tool publication before awaiting the prefix query", async (t) => {
+  const pi = await toolSession(t.mock.timers);
+  await fire(pi, "agent_start");
+  await fireTools(t.mock.timers, pi, [start("old", "bash", { command: "sleep 900" })]);
+  await fire(pi, "tool_execution_start", { toolCallId: "pending", toolName: "read" });
+  await fire(pi, "tool_execution_start", { toolName: "ask_user_question" });
+  await fire(pi, "tool_execution_start", { toolName: "ask_user_question" });
+  pi.ctx = context("/tmp/new session.jsonl");
+
+  let resolveQuery!: (stdout: string) => void;
+  const query = new Promise<string>((resolve) => {
+    resolveQuery = resolve;
+  });
+  const written: VarWrite[] = [];
+  let calls = 0;
+  setQueryRunner(() => {
+    calls += 1;
+    assert.deepEqual(written, []);
+    return query;
+  });
+  await captured(async () => {
+    const starting = pi.emit("session_start", {});
+    assert.equal(calls, 1);
+    assert.deepEqual(written, []);
+    t.mock.timers.tick(PAST_DEBOUNCE_MS);
+    await Promise.resolve();
+    assert.deepEqual(written, [], "neither the prior tool nor the new session may publish during lookup");
+    resolveQuery(JSON.stringify("configured pi"));
+    await starting;
+    t.mock.timers.tick(PAST_DEBOUNCE_MS);
+  }, written);
+
+  assert.deepEqual(written, [
+    ["AGENT_KIND", "pi"],
+    ["AGENT_RESUME", "configured pi --session '/tmp/new session.jsonl'"],
+    ["AGENT_MSG", null],
+    ["AGENT_TOOL_SINCE", null],
+    ["AGENT_TOOL", null],
+    ["AGENT_STATE", "idle"],
+  ]);
+  assert.deepEqual(await fireTools(t.mock.timers, pi, [end("old", "bash"), end("pending", "read")]), []);
+  assert.deepEqual(await fire(pi, "agent_start"), [["AGENT_STATE", "working"]]);
+  await fire(pi, "tool_execution_start", { toolName: "ask_user_question" });
+  assert.deepEqual(await fire(pi, "tool_execution_end", { toolName: "ask_user_question" }), [
+    ["AGENT_STATE", "working"],
+  ]);
+});
+
+for (const host of ["kitty", "tmux"]) {
+  test(`${host}: prefix lookup preserves prompts, tools, and state published during startup`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const pi = host === "kitty" ? await startedSession() : inPane().pi;
+    if (host === "tmux") await firePane(pi, "session_start");
+    for (const phase of ["prompt", "working", "pending tool", "published tool", "blocked", "settled"]) {
+      pi.ctx = context(`/tmp/${phase}.jsonl`);
+      let resolveQuery!: (stdout: string) => void;
+      setQueryRunner(() => new Promise((resolve) => {
+        resolveQuery = resolve;
+      }));
+      await capturedHost(host, async () => {
+        const starting = pi.emit("session_start", {});
+        await pi.emit("before_agent_start", { prompt: "new request" });
+        if (phase !== "prompt") await pi.emit("agent_start", {});
+        if (phase.includes("tool")) {
+          await pi.emit(...start("current", "bash", { command: "sleep 900" }));
+          if (phase === "published tool") t.mock.timers.tick(PAST_DEBOUNCE_MS);
+        }
+        if (phase === "blocked") {
+          await pi.emit("tool_execution_start", { toolName: "ask_user_question" });
+        }
+        if (phase === "settled") await pi.emit("agent_settled", {});
+        const completion = await capturedHost(host, async () => {
+          resolveQuery(JSON.stringify("configured pi"));
+          await starting;
+        });
+        assert.ok(completion.some(([key, value]) => key === "AGENT_RESUME" && value?.includes("configured pi")));
+        assert.deepEqual(completion.filter(([key]) => key === "AGENT_MSG"), [["AGENT_MSG", "new request"]], phase);
+        if (phase !== "prompt") {
+          assert.deepEqual(completion.filter(([key]) => key === "AGENT_STATE" || key === "AGENT_WORKED"), [], phase);
+        }
+        if (phase === "published tool") {
+          assert.deepEqual(completion.filter(([key]) => key.startsWith("AGENT_TOOL")), []);
+        }
+        if (phase === "pending tool") {
+          const delayed = await capturedHost(host, () => t.mock.timers.tick(PAST_DEBOUNCE_MS));
+          assert.ok(delayed.some(([key, value]) => key === "AGENT_TOOL" && value === "bash: sleep 900"));
+        }
+        if (phase === "blocked") {
+          const reply = await capturedHost(host, () => pi.emit("tool_execution_end", { toolName: "ask_user_question" }));
+          assert.ok(reply.some(([key, value]) => key === "AGENT_STATE" && value === "working"));
+        }
+      });
+    }
+  });
+
+  test(`${host}: superseded prefix queries cannot publish after replacement or shutdown`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    for (const replacement of ["same runtime", "new runtime", "shutdown only"]) {
+      const pi = host === "kitty" ? await startedSession() : inPane().pi;
+      if (host === "tmux") await firePane(pi, "session_start");
+      let resolveOld!: (stdout: string) => void;
+      setQueryRunner(() => new Promise((resolve) => {
+        resolveOld = resolve;
+      }));
+      await capturedHost(host, async () => {
+        pi.ctx = context("/tmp/old.jsonl");
+        const oldStart = pi.emit("session_start", {});
+        if (replacement !== "same runtime") await pi.emit("session_shutdown", {});
+        if (replacement !== "shutdown only") {
+          const current = replacement === "new runtime" ? new FakePi() : pi;
+          if (current !== pi) register(current as unknown as ExtensionAPI);
+          current.ctx = context("/tmp/current.jsonl");
+          setQueryRunner(defaultQueryRunner);
+          await current.emit("session_start", {});
+          await current.emit("before_agent_start", { prompt: "current request" });
+          await current.emit("agent_start", {});
+          await current.emit(...start("current", "bash", { command: "sleep 900" }));
+          t.mock.timers.tick(PAST_DEBOUNCE_MS);
+        }
+        const stale = await capturedHost(host, async () => {
+          resolveOld(JSON.stringify("old pi"));
+          await oldStart;
+          t.mock.timers.tick(PAST_DEBOUNCE_MS);
+        });
+        assert.deepEqual(stale, [], replacement);
+      });
+    }
+  });
 }
 
 test("a running tool is published with the second it started", async (t) => {
@@ -579,6 +871,25 @@ async function capturedRuns(fn: () => Promise<void> | void): Promise<TmuxRun[]> 
   return runs;
 }
 
+async function capturedHost(host: string, fn: () => Promise<void> | void): Promise<VarWrite[]> {
+  if (host === "kitty") return captured(fn);
+  const writes: VarWrite[] = [];
+  for (const args of await capturedRuns(fn)) {
+    let command: string[] = [];
+    for (const arg of [...args, ";"]) {
+      if (arg !== ";") {
+        command.push(arg);
+        continue;
+      }
+      const key = command.findIndex((value) => value.startsWith("@"));
+      assert.ok(key >= 0);
+      writes.push([command[key]!.slice(1), command.includes("-u") ? null : command[key + 1]!]);
+      command = [];
+    }
+  }
+  return writes;
+}
+
 /** Fire one pi event in a pane and return the tmux command lines it ran. */
 async function firePane(pi: FakePi, event: string, payload: Record<string, unknown> = {}): Promise<TmuxRun[]> {
   return capturedRuns(() => pi.emit(event, payload));
@@ -615,6 +926,47 @@ test("in a pane the extension publishes options, not escapes", async () => {
   // same command line, so a state change costs one process.
   assert.deepEqual(runs[5]!.slice(0, 7), ["set", "-p", "-t", "%17", "@AGENT_STATE", "idle", ";"]);
   assert.deepEqual(options(runs[5]!), ["@AGENT_STATE", "@AGENT_SINCE"]);
+});
+
+test("a pane publishes nothing until the prefix query resolves, then publishes state last", async (t) => {
+  const { pi } = inPane();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await firePane(pi, "session_start");
+  await firePane(pi, "agent_start");
+  await firePane(pi, "tool_execution_start", { toolCallId: "old", toolName: "bash" });
+  let resolveQuery!: (stdout: string) => void;
+  const query = new Promise<string>((resolve) => {
+    resolveQuery = resolve;
+  });
+  setQueryRunner(() => query);
+  const runs: TmuxRun[] = [];
+  setRunner((file, args) => {
+    assert.equal(file, "tmux");
+    runs.push(args);
+  });
+
+  const written = await captured(async () => {
+    const starting = pi.emit("session_start", {});
+    assert.deepEqual(runs, []);
+    t.mock.timers.tick(PAST_DEBOUNCE_MS);
+    await Promise.resolve();
+    assert.deepEqual(runs, []);
+    resolveQuery(JSON.stringify("nono run pi"));
+    await starting;
+    t.mock.timers.tick(PAST_DEBOUNCE_MS);
+  });
+
+  assert.deepEqual(written, []);
+  assert.equal(runs.length, 6);
+  assert.equal(runs[1]!.at(-1), `nono run pi --session ${SESSION_FILE}`);
+  assert.deepEqual(runs.map(options), [
+    ["@AGENT_KIND"],
+    ["@AGENT_RESUME"],
+    ["-u @AGENT_WORKED"],
+    ["-u @AGENT_MSG"],
+    ["-u @AGENT_TOOL_SINCE", "-u @AGENT_TOOL"],
+    ["@AGENT_STATE", "@AGENT_SINCE"],
+  ]);
 });
 
 // tmux ends a command at any argument ending in ";", so a prompt ending in one

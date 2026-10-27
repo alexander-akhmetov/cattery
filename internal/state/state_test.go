@@ -565,6 +565,20 @@ func TestClearKeepsTheResumeCommand(t *testing.T) {
 	assertVars(t, rec.sent(), []Var{del(varKind), del(varMsg), del(varState)})
 }
 
+func stateConfigFile(t *testing.T, content string) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	configDir := filepath.Join(dir, "cattery")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // New reads the override from the environment, where a shell wrapper sets it.
 // A per-agent name wins, because the three agents append different arguments to
 // the same prefix. An exported CATTERY_RESUME_PREFIX aimed at one agent would
@@ -577,6 +591,7 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 		claude       string
 		codex        string
 		opencode     string
+		file         string
 		want         string
 		wantResumeIn string
 	}{
@@ -597,7 +612,7 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 			name:         "an empty value is not an override",
 			shared:       "",
 			claude:       "",
-			want:         "",
+			want:         "claude",
 			wantResumeIn: "claude --resume abc",
 		},
 		{
@@ -621,7 +636,7 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 			name:         "the Claude name does not reach a Codex writer",
 			kind:         "codex",
 			claude:       "nono run claude",
-			want:         "",
+			want:         "codex",
 			wantResumeIn: "codex resume abc",
 		},
 		{
@@ -639,9 +654,17 @@ func TestNewReadsTheResumePrefix(t *testing.T) {
 			want:         "nono run",
 			wantResumeIn: "nono run --session abc",
 		},
+		{name: "Claude file", file: "[resume]\nclaude = 'file claude'", want: "file claude", wantResumeIn: "file claude --resume abc"},
+		{name: "Codex file", kind: "codex", file: "[resume]\ncodex = 'file codex'", want: "file codex", wantResumeIn: "file codex resume abc"},
+		{name: "opencode file", kind: "opencode", file: "[resume]\nopencode = 'file opencode'", want: "file opencode", wantResumeIn: "file opencode --session abc"},
+		{name: "shared file", file: "[resume]\nprefix = 'shared file'", want: "shared file", wantResumeIn: "shared file --resume abc"},
+		{name: "shared environment over file", shared: "env claude", file: "[resume]\nclaude = 'file claude'", want: "env claude", wantResumeIn: "env claude --resume abc"},
+		{name: "invalid file discards partial settings", file: "[resume]\nclaude = 'file claude'\n[other]\nunknown = true", want: "claude", wantResumeIn: "claude --resume abc"},
+		{name: "invalid file retains environment", claude: "env claude", file: "[resume]\nclaude = 1", want: "env claude", wantResumeIn: "env claude --resume abc"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			stateConfigFile(t, tc.file)
 			t.Setenv("KITTY_WINDOW_ID", "7")
 			t.Setenv(envResumePrefix, tc.shared)
 			t.Setenv(envResumePrefixClaude, tc.claude)
@@ -845,6 +868,7 @@ func TestRunWithoutAState(_ *testing.T) {
 // New picks the transport from the environment. tmux comes first, then the
 // terminal, then the remote-control socket behind it.
 func TestNewPicksTheTransport(t *testing.T) {
+	stateConfigFile(t, "")
 	cases := []struct {
 		name     string
 		tmux     string

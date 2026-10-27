@@ -66,7 +66,7 @@
  * "stalled".
  */
 
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync, type ExecFileOptionsWithStringEncoding } from "node:child_process";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -107,6 +107,20 @@ let runner: Runner = (file, args) => {
  */
 export function setRunner(next: Runner): void {
   runner = next;
+}
+
+type QueryRunner = (file: string, args: string[], options: ExecFileOptionsWithStringEncoding) => Promise<string>;
+
+let queryRunner: QueryRunner = (file, args, options) =>
+  new Promise((resolve, reject) => {
+    execFile(file, args, options, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+
+export function setQueryRunner(next: QueryRunner): void {
+  queryRunner = next;
 }
 
 /** One variable update. A null value deletes the variable. */
@@ -396,8 +410,24 @@ function shellQuote(value: string): string {
 // An empty value counts as unset, as it does in the Go writer. An
 // exported-but-cleared variable would otherwise publish a command with no
 // program in front of it.
-function resumePrefix(): string {
-  return process.env.CATTERY_RESUME_PREFIX_PI || process.env.CATTERY_RESUME_PREFIX || "pi";
+export async function resumePrefix(): Promise<string> {
+  const override = process.env.CATTERY_RESUME_PREFIX_PI || process.env.CATTERY_RESUME_PREFIX;
+  if (override) return override;
+  try {
+    const stdout = await queryRunner(process.env.CATTERY_BIN || "cattery", ["config", "resume-prefix", "pi"], {
+      encoding: "utf8",
+      timeout: 1000,
+      maxBuffer: 1024 * 1024,
+      shell: false,
+    });
+    const prefix: unknown = JSON.parse(stdout);
+    if (typeof prefix === "string" && prefix !== "" && prefix.search(CONTROL_CHARS) === -1) {
+      return prefix;
+    }
+  } catch {
+    // Older binaries do not have the configuration query.
+  }
+  return "pi";
 }
 
 // The command that brings this session back, or null when there is none.
@@ -406,7 +436,7 @@ function resumePrefix(): string {
 // Only the session path is quoted. The prefix is a raw command fragment,
 // because an override adds a wrapper of several words that the session cannot
 // guess, such as a sandbox or a profile flag.
-function resumeCommand(ctx: ExtensionContext): string | null {
+async function resumeCommand(ctx: ExtensionContext): Promise<string | null> {
   let sessionFile: string | undefined;
   try {
     sessionFile = ctx.sessionManager.getSessionFile();
@@ -416,29 +446,37 @@ function resumeCommand(ctx: ExtensionContext): string | null {
     return null;
   }
   if (sessionFile === undefined || sessionFile === "") return null;
-  return `${resumePrefix()} --session ${shellQuote(sessionFile)}`;
+  return `${await resumePrefix()} --session ${shellQuote(sessionFile)}`;
 }
 
 export default function (pi: ExtensionAPI) {
   if (!published()) return;
 
+  let sessionGeneration = 0;
+  let sessionMessage: string | null = null;
+
   // session_start fires for startup, new, resume, fork, and reload, so /new and
   // /fork repoint AGENT_RESUME at the session actually in the window.
   pi.on("session_start", async (_event, ctx) => {
+    const generation = ++sessionGeneration;
+    sessionMessage = null;
+    // A prior tool timer must not publish while the configuration query waits.
+    cancelToolPublish();
+    openTools.clear();
+    publishedTool = null;
+    blockedDepth = 0;
+    lastState = null;
+    const resume = await resumeCommand(ctx);
+    if (generation !== sessionGeneration) return;
     // AGENT_KIND is the agent identity; never changes during a session.
     setUserVar("AGENT_KIND", "pi");
     // Publish the resume command, or clear one a prior agent left behind.
-    setUserVar("AGENT_RESUME", resumeCommand(ctx));
-    // Reset bookkeeping for the new session.
-    blockedDepth = 0;
-    lastState = null;
-    clearPaneWork();
-    // Drop a stale message and a stale tool from a prior agent that ran here.
-    setUserVar("AGENT_MSG", null);
-    openTools.clear();
-    cancelToolPublish();
-    clearTool();
-    emit("idle");
+    setUserVar("AGENT_RESUME", resume);
+    // A prompt or turn can start while lookup waits. Preserve its live state.
+    if (lastState === null) clearPaneWork();
+    setUserVar("AGENT_MSG", sessionMessage);
+    if (publishedTool === null) clearTool();
+    if (lastState === null) emit("idle");
   });
 
   // Every prompt overwrites the last. The picker draws this beside a live
@@ -447,6 +485,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     const msg = sanitizeMessage(event.prompt ?? "");
     if (msg === "") return;
+    sessionMessage = msg;
     setUserVar("AGENT_MSG", msg);
   });
 
@@ -495,6 +534,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    sessionGeneration += 1;
     // Clear AGENT_STATE so the tab bar drops the marker at once. Keep
     // AGENT_KIND so a quick `/resume` keeps its tag; the watcher tolerates a
     // kind with no state.

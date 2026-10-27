@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/alexander-akhmetov/cattery/internal/config"
 	"github.com/alexander-akhmetov/cattery/internal/kitty"
 	"github.com/alexander-akhmetov/cattery/internal/shellquote"
 )
@@ -71,13 +72,12 @@ type kind struct {
 	// as a positional argument of a "resume" subcommand, Claude after a
 	// "--resume" flag, opencode after "--session".
 	resumeArg string
-	prefixEnv string
 }
 
 var kinds = map[string]kind{
-	kindClaude:   {name: kindClaude, resumeArg: "--resume", prefixEnv: envResumePrefixClaude},
-	kindCodex:    {name: kindCodex, resumeArg: "resume", prefixEnv: envResumePrefixCodex},
-	kindOpencode: {name: kindOpencode, resumeArg: "--session", prefixEnv: envResumePrefixOpencode},
+	kindClaude:   {name: kindClaude, resumeArg: "--resume"},
+	kindCodex:    {name: kindCodex, resumeArg: "resume"},
+	kindOpencode: {name: kindOpencode, resumeArg: "--session"},
 }
 
 // resolveKind reads a --kind value, falling back to Claude. An unknown word
@@ -200,7 +200,7 @@ func parseArgs(args []string) (state, kindName string) {
 	return state, kindName
 }
 
-// New builds the writer for this process from its environment.
+// New builds the writer for this process from configuration and environment.
 func New(kindName string) Writer {
 	k := resolveKind(kindName)
 	w := Writer{
@@ -369,14 +369,13 @@ func (w Writer) resumeCommand(sessionID string) string {
 	return prefix + " " + k.resumeArg + " " + shellquote.Quote(sessionID)
 }
 
-// resumePrefix reads the override, the agent's own name first. An empty value
-// counts as unset: an exported-but-cleared variable would otherwise publish a
-// command with no program in front of it.
+// resumePrefix reads the override, the agent's own name first, and the file after
+// the environment. An empty value counts as unset: an exported-but-cleared
+// variable would otherwise publish a command with no program in front of it.
 func resumePrefix(k kind) string {
-	if prefix := os.Getenv(k.prefixEnv); prefix != "" {
-		return prefix
-	}
-	return os.Getenv(envResumePrefix)
+	// Hooks must publish even when the configuration file is invalid.
+	settings, _ := config.Load()
+	return settings.ResumePrefix(k.name)
 }
 
 // readHook reads the agent's hook payload from stdin. It skips a character

@@ -37,9 +37,11 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 		name string
 		// argv is everything after `cattery state`, so a case can carry the
 		// --kind flag the Codex plugin passes.
-		argv  string
-		stdin string
-		want  []string // what the fake kitten saw, or nothing when it must not run
+		argv   string
+		stdin  string
+		file   string
+		prefix string
+		want   []string // what the fake kitten saw, or nothing when it must not run
 	}{
 		{
 			// AGENT_STATE comes last in every batch: writing it is what wakes
@@ -112,6 +114,28 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 				"AGENT_KIND", "AGENT_MSG", "AGENT_STATE"},
 		},
 		{
+			name:  "file prefix publishes silently",
+			argv:  "working",
+			stdin: `{"session_id":"s1"}`,
+			file:  "[resume]\nclaude = 'file claude'",
+			want:  []string{"@", "set-user-vars", "--match", "id:7", "AGENT_KIND=claude", "AGENT_RESUME=file claude --resume s1", "AGENT_STATE=working"},
+		},
+		{
+			name:  "invalid config publishes silently with defaults",
+			argv:  "working",
+			stdin: `{"session_id":"s1"}`,
+			file:  "[resume]\nclaude = 'partial'\n[bad]\nkey = true",
+			want:  []string{"@", "set-user-vars", "--match", "id:7", "AGENT_KIND=claude", "AGENT_RESUME=claude --resume s1", "AGENT_STATE=working"},
+		},
+		{
+			name:   "invalid config retains environment silently",
+			argv:   "working",
+			stdin:  `{"session_id":"s1"}`,
+			file:   "[resume]\nclaude = 1",
+			prefix: "env claude",
+			want:   []string{"@", "set-user-vars", "--match", "id:7", "AGENT_KIND=claude", "AGENT_RESUME=env claude --resume s1", "AGENT_STATE=working"},
+		},
+		{
 			name:  "an unrecognised kind publishes claude",
 			argv:  "working --kind gpt",
 			stdin: `{"session_id":"s1"}`,
@@ -122,6 +146,13 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
+			configDir := filepath.Join(dir, "cattery")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(tc.file), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			argv := filepath.Join(dir, "argv")
 			writeFakeKitten(t, dir, `printf '%s\n' "$@" > "$`+argvFile+`"`)
 
@@ -132,6 +163,9 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 				subprocessState + "=" + tc.argv,
 				argvFile + "=" + argv,
 				"PATH=" + dir,
+				"HOME=" + dir,
+				"XDG_CONFIG_HOME=" + dir,
+				"CATTERY_RESUME_PREFIX=" + tc.prefix,
 				"KITTY_WINDOW_ID=7",
 				"KITTY_LISTEN_ON=unix:/tmp/kitty-test",
 			}
@@ -152,6 +186,9 @@ func TestPublishFromAProcessWithoutATerminal(t *testing.T) {
 			}
 			if len(stdout) > 0 {
 				t.Errorf("the hook wrote to stdout: %q", stdout)
+			}
+			if stderr.Len() != 0 && !strings.Contains(stderr.String(), "GOCOVERDIR") {
+				t.Errorf("the hook wrote to stderr: %s", &stderr)
 			}
 			recorded, readErr := os.ReadFile(argv)
 			if len(tc.want) == 0 {

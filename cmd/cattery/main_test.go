@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -58,6 +59,7 @@ func TestRoute(t *testing.T) {
 		{name: "list as JSON", args: []string{"list", "--json"}, want: cmdList, wantArgs: []string{"--json"}},
 
 		{name: "events", args: []string{"events"}, want: cmdEvents},
+		{name: "config query", args: []string{"config", "resume-prefix", "pi"}, want: cmdConfig, wantArgs: []string{"resume-prefix", "pi"}},
 
 		{name: "unknown subcommand", args: []string{"install"}, wantErr: true},
 		{name: "unknown flag", args: []string{"-nope"}, wantErr: true},
@@ -110,6 +112,7 @@ func TestRouteHelp(t *testing.T) {
 		{name: "-h after state", args: []string{"state", "-h"}, wantArgs: []string{"state"}},
 		{name: "-h after attach", args: []string{"attach", "-h"}, wantArgs: []string{"attach"}},
 		{name: "-h after list", args: []string{"list", "-h"}, wantArgs: []string{"list"}},
+		{name: "config help", args: []string{"config", "--help"}, wantArgs: []string{"config"}},
 
 		{name: "help for an unknown command", args: []string{"help", "install"}, wantErr: true},
 		{name: "help for two commands", args: []string{"help", "save", "restore"}, wantErr: true},
@@ -280,13 +283,15 @@ func TestRouteStillPrefersTheExistingEntryPoints(t *testing.T) {
 
 func TestParseSessionArgs(t *testing.T) {
 	cases := []struct {
-		name    string
-		args    []string
-		env     string
-		want    string
-		wantRel string // expected path, relative to the test's own directory
-		wantRun bool
-		wantErr bool
+		name          string
+		args          []string
+		env           string
+		file          string
+		want          string
+		wantConfigRel string
+		wantRel       string // expected path, relative to the test's own directory
+		wantRun       bool
+		wantErr       bool
 	}{
 		{
 			name: "an explicit path wins over the environment",
@@ -321,14 +326,17 @@ func TestParseSessionArgs(t *testing.T) {
 			env:     "work.kitty-session",
 			wantRel: "work.kitty-session",
 		},
+		{name: "configured relative path", file: "[session]\nfile = 'snapshots/agents.kitty-session'", wantConfigRel: "snapshots/agents.kitty-session"},
+		{name: "environment over file", env: "/tmp/env.kitty-session", file: "[session]\nfile = 'file.kitty-session'", want: "/tmp/env.kitty-session"},
+		{name: "invalid configuration", file: "[session]\nfile = 1", wantErr: true},
+		{name: "explicit bypasses invalid config", args: []string{"/tmp/explicit.kitty-session"}, file: "[session]\nfile = 1", want: "/tmp/explicit.kitty-session"},
 		{name: "two paths", args: []string{"/tmp/a", "/tmp/b"}, wantErr: true},
 		{name: "an unknown flag", args: []string{"-nope"}, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.env != "" {
-				t.Setenv("CATTERY_SESSION_FILE", tc.env)
-			}
+			configPath := configFile(t, tc.file)
+			t.Setenv("CATTERY_SESSION_FILE", tc.env)
 			flags := flag.NewFlagSet("test", flag.ContinueOnError)
 			flags.SetOutput(io.Discard)
 			run := flags.Bool("run", false, "")
@@ -348,6 +356,9 @@ func TestParseSessionArgs(t *testing.T) {
 			// files: cattery's, kitty's working directory, and kitty's
 			// configuration directory.
 			want := tc.want
+			if tc.wantConfigRel != "" {
+				want = filepath.Join(filepath.Dir(configPath), tc.wantConfigRel)
+			}
 			if tc.wantRel != "" {
 				cwd, err := os.Getwd()
 				if err != nil {
@@ -368,7 +379,7 @@ func TestParseSessionArgs(t *testing.T) {
 // With no path and no environment variable, the snapshot goes under kitty's own
 // sessions directory, where `goto_session <dir>` looks for one.
 func TestDefaultSnapshotPath(t *testing.T) {
-	t.Setenv("CATTERY_SESSION_FILE", "")
+	configFile(t, "")
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Skip("no home directory")
@@ -425,6 +436,31 @@ func (c *cliClient) Windows(context.Context) ([]kitty.Window, error) {
 }
 
 func TestRunSave(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(fmt.Sprintf("configured path invalid=%v", invalid), func(t *testing.T) {
+			content := "[session]\nfile = 'snapshots/agents.kitty-session'"
+			if invalid {
+				content = "[session]\nfile = 1"
+			}
+			configPath := configFile(t, content)
+			client := &cliClient{}
+			var out strings.Builder
+			code := runSave(client, &out, nil)
+			if invalid {
+				if code != 2 || len(client.actions) != 0 || out.Len() != 0 {
+					t.Fatalf("exit %d, actions %v, output %q", code, client.actions, &out)
+				}
+				return
+			}
+			path := filepath.Join(filepath.Dir(configPath), "snapshots", "agents.kitty-session")
+			if code != 0 || !strings.Contains(out.String(), path) {
+				t.Fatalf("exit %d, output %q", code, &out)
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 	t.Run("writes the snapshot and prints one summary line", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "agents.kitty-session")
 		client := &cliClient{}
@@ -460,6 +496,7 @@ func TestRunSave(t *testing.T) {
 	})
 
 	t.Run("uses the environment path when none is given", func(t *testing.T) {
+		configFile(t, "")
 		path := filepath.Join(t.TempDir(), "work.kitty-session")
 		t.Setenv("CATTERY_SESSION_FILE", path)
 		var out strings.Builder
@@ -487,6 +524,21 @@ func TestRunSave(t *testing.T) {
 }
 
 func TestRunRestore(t *testing.T) {
+	t.Run("configured path preserves recorded resume prefix", func(t *testing.T) {
+		configPath := configFile(t, "[session]\nfile = 'agents.kitty-session'\n[resume]\npi = 'changed pi'")
+		path := filepath.Join(filepath.Dir(configPath), "agents.kitty-session")
+		if err := os.WriteFile(path, []byte(cliNative), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		client := &cliClient{}
+		var out strings.Builder
+		if code := runRestore(client, &out, nil); code != 0 {
+			t.Fatalf("exit %d: %s", code, &out)
+		}
+		if !slices.Equal(client.sent, []string{"pi --session /tmp/a.jsonl"}) {
+			t.Fatalf("typed %q", client.sent)
+		}
+	})
 	// snapshot writes a file runRestore can read back.
 	snapshot := func(t *testing.T) string {
 		t.Helper()
