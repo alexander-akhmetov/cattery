@@ -6,6 +6,7 @@ package overlay
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -219,7 +220,7 @@ type Model struct {
 	sessionBusy bool
 	sessionVerb string
 
-	// The preview drawer, opened with "v". previewKey is the agent screen
+	// The preview drawer. previewKey is the agent screen
 	// belongs to, so a result for an agent the cursor has left is discarded,
 	// and previewGeneration drops a result the debounce has superseded.
 	preview           previewMode
@@ -267,6 +268,11 @@ func New(client Client, snapshots session.Client) Model {
 	in.Placeholder = "search by name, path, branch, prompt…"
 	in.CharLimit = 120
 
+	preview := previewOff
+	if os.Getenv("CATTERY_PREVIEW") == "1" {
+		preview = previewRead
+	}
+
 	return Model{
 		client:           client,
 		snapshots:        snapshots,
@@ -274,6 +280,7 @@ func New(client Client, snapshots session.Client) Model {
 		search:           in,
 		loading:          true,
 		reloadGeneration: 1,
+		preview:          preview,
 		now:              time.Now(),
 	}
 }
@@ -522,6 +529,7 @@ func (m Model) applyAgents(agents []agent.Agent) (tea.Model, tea.Cmd) {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		wasWide := previewFits(m.width)
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeSearch()
 		// Typing into a drawer the view no longer draws is typing blind at an
@@ -529,6 +537,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// back before it takes the drawer away.
 		if m.previewWriting() && !previewFits(m.width) {
 			m.stopWriting()
+		}
+		if !wasWide && previewFits(m.width) {
+			cmd := m.schedulePreview()
+			return m, cmd
 		}
 		return m, nil
 	case tickMsg:

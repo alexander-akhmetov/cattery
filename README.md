@@ -116,9 +116,19 @@ a kitty window you are not looking at and on a tmux pane nobody is attached to.
 The drawer opens read-only, framed in grey. Keys still move the cursor, so you
 can walk down the list and watch each agent in turn.
 
-Press `v` again to type at the agent. The frame turns red, and every key goes to
-the agent: `q`, `enter`, `ctrl+c` to interrupt it. `esc` is the exception, so
-`ctrl+]` sends a literal escape.
+To open the drawer automatically, add this outside cattery's managed block in
+`~/.config/kitty/kitty.conf`:
+
+```conf
+env CATTERY_PREVIEW=1
+```
+
+Restart kitty after changing it. Only `1` enables the default preview. Leave the
+variable unset or set it to `0` to start with the drawer closed.
+
+Press `v` while the drawer is read-only to type at the agent. The frame turns
+red, and every key goes to the agent: `q`, `enter`, `ctrl+c` to interrupt it.
+`esc` is the exception, so `ctrl+]` sends a literal escape.
 
 `esc` walks back out one step at a time:
 
@@ -128,9 +138,10 @@ the agent: `q`, `enter`, `ctrl+c` to interrupt it. `esc` is the exception, so
 | read-only (grey frame) | closes the drawer |
 | no drawer | closes the picker |
 
-The drawer needs about 91 columns, and says so instead of opening when the
-terminal is narrower. It shows the left-hand columns of a wider screen, so boxes
-are cut off on the right, and there is no cursor.
+The drawer needs at least 91 columns. In a narrower terminal, `v` reports that
+there is not enough room. The default preview stays hidden until you widen the
+terminal. The drawer shows the left-hand columns of a wider screen, so boxes are
+cut off on the right, and there is no cursor.
 
 ### Snapshots
 

@@ -534,7 +534,7 @@ func previewWidths(inner int) (list, preview int, ok bool) {
 // key handler asks before it opens one, and the fetchers ask before they spawn
 // a process for a column nobody can see.
 func previewFits(width int) bool {
-	_, _, ok := previewWidths(viewWidth(width) - 4)
+	_, _, ok := previewWidths(width - 4)
 	return ok
 }
 

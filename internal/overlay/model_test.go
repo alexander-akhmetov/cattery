@@ -117,6 +117,7 @@ func checkout(id int, kind, display, project, branch string) agent.Agent {
 
 func sampleModel() Model {
 	m := New(&fakeClient{}, &fakeClient{})
+	m.preview = previewOff
 	m.loaded = true
 	m.loading = false
 	// Project order, the way ListAgents delivers them.
@@ -1010,11 +1011,18 @@ func TestPreviewWidths(t *testing.T) {
 			t.Fatalf("inner %d: sidebar %d is not wider than the list %d", inner, preview, list)
 		}
 	}
-	if previewFits(90) {
-		t.Error("the sidebar should not open at 90 columns")
-	}
-	if !previewFits(91) {
-		t.Error("the sidebar should open at 91 columns")
+	for _, tc := range []struct {
+		width int
+		want  bool
+	}{
+		{-1, false},
+		{0, false},
+		{90, false},
+		{91, true},
+	} {
+		if got := previewFits(tc.width); got != tc.want {
+			t.Errorf("previewFits(%d): got %v, want %v", tc.width, got, tc.want)
+		}
 	}
 }
 
@@ -2302,6 +2310,7 @@ func TestHintTiersFitWithTheAttachAction(t *testing.T) {
 // sidebar will ask for screens.
 func previewModel(client *fakeClient) Model {
 	m := New(client, &fakeClient{})
+	m.preview = previewOff
 	m.loaded = true
 	m.loading = false
 	m.agents = []agent.Agent{
@@ -2376,6 +2385,99 @@ func drain(t *testing.T, m Model, msg tea.Msg) Model {
 		}
 	}
 	return m
+}
+
+func TestPreviewDefaultMode(t *testing.T) {
+	cases := []struct {
+		value string
+		want  previewMode
+	}{
+		{"", previewOff},
+		{"0", previewOff},
+		{"1", previewRead},
+		{"true", previewOff},
+		{"invalid", previewOff},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("CATTERY_PREVIEW", tc.value)
+			m := New(&fakeClient{}, &fakeClient{})
+			if m.preview != tc.want {
+				t.Fatalf("preview mode: got %v, want %v", m.preview, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreviewDefaultStartup(t *testing.T) {
+	t.Setenv("CATTERY_PREVIEW", "1")
+	cases := []struct {
+		name        string
+		width       int
+		agentsFirst bool
+		empty       bool
+	}{
+		{name: "size first", width: 140},
+		{name: "inventory first", width: 140, agentsFirst: true},
+		{name: "narrow size first", width: 90},
+		{name: "narrow inventory first", width: 90, agentsFirst: true},
+		{name: "empty inventory", width: 140, empty: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeClient{screen: "agent screen"}
+			m := New(client, &fakeClient{})
+			var agents []agent.Agent
+			if !tc.empty {
+				agents = []agent.Agent{checkout(3, "pi", "done", "myapp", "main")}
+			}
+			size := tea.WindowSizeMsg{Width: tc.width, Height: 40}
+			inventory := agentsMsg{generation: m.reloadGeneration, agents: agents}
+			messages := []tea.Msg{size, inventory}
+			if tc.agentsFirst {
+				messages = []tea.Msg{inventory, size}
+			}
+			for _, msg := range messages {
+				m = drain(t, m, msg)
+			}
+			if m.preview != previewRead || m.notice != "" {
+				t.Fatalf("startup: mode %v, notice %q", m.preview, m.notice)
+			}
+			var wantCaptured []string
+			if tc.width >= 91 && !tc.empty {
+				wantCaptured = []string{"kitty:3"}
+			}
+			if !slices.Equal(client.previewed, wantCaptured) {
+				t.Fatalf("captured: got %v, want %v", client.previewed, wantCaptured)
+			}
+			if len(wantCaptured) > 0 && !strings.Contains(ansi.Strip(m.View()), client.screen) {
+				t.Fatal("the default preview did not show the agent's screen")
+			}
+			if tc.width < 91 {
+				m = drain(t, m, tea.WindowSizeMsg{Width: 140, Height: 40})
+				if m.previewKey != "kitty:3" {
+					t.Fatalf("preview after widening: got %q, want kitty:3", m.previewKey)
+				}
+			}
+
+			if !tc.empty {
+				typing, _ := press(t, m, runes('v'))
+				if !typing.previewWriting() {
+					t.Fatal("v did not enter read-write from the default preview")
+				}
+			}
+			closed, _ := press(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+			closed = drain(t, closed, inventory)
+			closed = drain(t, closed, tea.WindowSizeMsg{Width: 80, Height: 40})
+			closed = drain(t, closed, size)
+			if closed.previewOpen() || closed.quitting {
+				t.Fatal("esc did not keep the drawer closed after a reload and resize")
+			}
+			if len(client.typed) != 0 || len(client.marked) != 0 {
+				t.Fatalf("preview changed the agent: typed %v, marked %v", client.typed, client.marked)
+			}
+		})
+	}
 }
 
 func TestPreviewToggle(t *testing.T) {
